@@ -266,6 +266,13 @@ change, inspect the diff and restore the lockfile from Git rather than deleting
 it. Keep `master` clean for upstream synchronization; make dependency-policy or
 other non-doc changes on a dedicated branch.
 
+For the routine update path, switch to a clean `master` and run
+`scripts/update-from-upstream.sh`. It verifies the branch/worktree/remotes,
+fetches `origin/master` and `upstream/master`, accepts fast-forwards only, pushes
+the synchronized `master` to `origin`, then runs `sfw npm ci` (which triggers the
+root `prepare`/`build:dist`). Any divergence stops for manual review; the script
+never merges, rebases, stashes, deletes the lockfile, or updates feature branches.
+
 ## Git & PR workflow
 - **Docs-only changes may be pushed straight to `master`, no PR** (maintainer standing rule). Applies to pure documentation edits — `*.md` (README, AGENTS.md, CONTRIBUTING, CHANGELOG prose), doc comments, and similar non-code text. Anything that touches code, tests, CI/workflows, or `package.json` still goes through a PR. When unsure whether a change is "docs-only," open a PR.
 - **Always open PRs with base `master`** (`gh pr create --base master`). **Never stack a PR on another feature branch.** If issue B builds on still-unmerged issue A, you may branch B off A's branch *locally* to develop, but the PR's base must still be `master` (wait for A to merge + rebase B, or accept the noisier diff) — never `--base feat/<A>`.
@@ -280,6 +287,7 @@ npm test              # vitest run (all tests)
 npx tsc --project tsconfig.json --noEmit   # type-check
 npm run lint          # same as type-check
 npm run build         # emit JS from TS; run before tests after source changes if stale JS may be present
+scripts/update-from-upstream.sh   # clean master only: fast-forward upstream → origin, then sfw npm ci/build:dist
 node scripts/smoke-tools.mjs [--install] [--step2] [--verbose] [lang ...]   # live tool-smoke (#209, opt-in/nightly): installs + runs each tool through the REAL dispatch path against tests/fixtures/tool-smoke/<lang>/; --step2 also asserts a parseable diagnostic. Add --lsp for the LSP-handshake layer, --format for the formatter pipeline, or --autofix for the pipeline safe-autofix phase. Not a per-PR gate, not shipped in the tarball.
 #   --lsp fixtures support two optional per-fixture fields (#530): `setup` (string/argv command run in the COPIED temp workspace before touchFile — e.g. `typescript7`/`typescript7-clean` run `npm install typescript@7 --no-save --no-audit --no-fund` there, since typescript-go's per-platform native binary can't be a committed static fixture; setup failure reports a distinct `setup-failed` status, never a false pass, bounded by a 120s timeout) and `expectLaunchVariant` (asserts the live `getCapabilitySnapshots(file)` `launchVariant` — e.g. `"native-ts7"` — so a silent fallback to the classic `typescript-language-server` FAILS even though a diagnostic arrived; the native and classic servers share the same `"typescript"` server id, so the diagnostic alone can't distinguish them). Both fixtures verified live 2026-07: typescript@7.0.2 installs from npm, its `tsc --lsp --stdio` genuinely speaks LSP framing (`\r\n\r\n` Content-Length headers over stdio, confirmed via a hand-rolled initialize), and PR #526's assumed invocation is correct.
 #   --format drives getFormattersForFile→formatFile via FormatService (what runFormatPhase uses; the lint path NEVER runs formatters): asserts the expected formatter is selected (config-gated ones ship the config their detect() needs — .prettierrc/gleam.toml/Gemfile/pyproject[tool.black]/stylua.toml/.cljfmt.edn/.php-cs-fixer.php/.editorconfig) and that it actually reformats a mis-formatted fixture (changed===true). Covers 28/31 formatters (tests/fixtures/format-smoke/<lang>/); only nixfmt/ocamlformat/swiftformat remain (no Windows toolchain). Plain-command formatters (stylua/cljfmt/php-cs-fixer/google-java-format/clang-format) need their binary ON PATH or formatFile reports changed=false; managed-dir ones (taplo/shfmt/ktlint) don't.
