@@ -246,6 +246,26 @@ a *second host adapter* alongside `index.ts`. Design rationale + progress: `mcp.
 ## Package scope
 All pi packages are `@earendil-works/*` (migrated from `@mariozechner/*` in 0.74.0). Peer dep: `@earendil-works/pi-coding-agent`. Runtime dep: `@earendil-works/pi-tui`.
 
+**npm 12 install-script policy.** `package.json#allowScripts` permits only the
+reviewed `@ast-grep/cli` postinstall, pinned to its installed version; that script
+links/copies the platform-native binary into the CLI package and avoids the
+runtime-resolution fallback on every invocation. `@google/genai` is explicitly
+denied because its preinstall is a no-op, and `protobufjs` is denied because its
+postinstall only checks a dependent's version-range style. After a fresh install,
+if `ast-grep --version` still reports that postinstall did not run, execute
+`npm rebuild @ast-grep/cli` and verify the warning is gone.
+
+**Dependency refresh after Git updates.** Keep the committed
+`package-lock.json`; never delete and regenerate it merely to update the
+checkout. After pulling or fast-forwarding, run `npm ci` so `node_modules` is
+recreated from the exact committed dependency graph without rewriting the
+lockfile. Use `npm install` only when intentionally changing dependencies in
+`package.json`, and commit the resulting `package-lock.json` in the same change.
+If an install rewrites only lockfile metadata without an intended dependency
+change, inspect the diff and restore the lockfile from Git rather than deleting
+it. Keep `master` clean for upstream synchronization; make dependency-policy or
+other non-doc changes on a dedicated branch.
+
 ## Git & PR workflow
 - **Docs-only changes may be pushed straight to `master`, no PR** (maintainer standing rule). Applies to pure documentation edits — `*.md` (README, AGENTS.md, CONTRIBUTING, CHANGELOG prose), doc comments, and similar non-code text. Anything that touches code, tests, CI/workflows, or `package.json` still goes through a PR. When unsure whether a change is "docs-only," open a PR.
 - **Always open PRs with base `master`** (`gh pr create --base master`). **Never stack a PR on another feature branch.** If issue B builds on still-unmerged issue A, you may branch B off A's branch *locally* to develop, but the PR's base must still be `master` (wait for A to merge + rebase B, or accept the noisier diff) — never `--base feat/<A>`.
