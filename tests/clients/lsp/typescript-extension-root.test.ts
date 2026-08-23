@@ -30,6 +30,8 @@ afterEach(() => {
 function makeFakeExtensionsTree(opts: {
 	parentPackageJson: boolean;
 	extensionPackageJson: boolean;
+	/** Write an explicit agent-level tsconfig.json (TypeScript project authority). */
+	agentTsconfig?: boolean;
 }): { extFile: string; extDir: string; agentDir: string } {
 	// Build .../<tmp>/.pi/agent/extensions/myext/src/index.ts inside a tmp dir
 	// so we don't touch the user's real ~/.pi/agent/extensions.
@@ -52,6 +54,15 @@ function makeFakeExtensionsTree(opts: {
 		fs.writeFileSync(
 			path.join(extDir, "package.json"),
 			'{"name":"my-extension"}',
+		);
+	}
+	if (opts.agentTsconfig) {
+		fs.writeFileSync(
+			path.join(agentDir, "tsconfig.json"),
+			JSON.stringify({
+				compilerOptions: { types: ["bun", "node"] },
+				include: ["extensions/**/*.ts"],
+			}),
 		);
 	}
 	return { extFile, extDir, agentDir };
@@ -89,6 +100,42 @@ describe("TypeScriptRoot — extension files (#123)", () => {
 		// The chosen root must NOT escape the extensions boundary — i.e. it
 		// must contain `.pi/agent/extensions/` somewhere in its path so the
 		// LSP doesn't workspace-scan all of pi.
+		expect(path.resolve(root as string).replace(/\\/g, "/")).toContain(
+			"/.pi/agent/extensions/",
+		);
+	});
+
+	// An explicit agent-level tsconfig.json is TypeScript project authority —
+	// it decides which files are checked and with which types. It must not be
+	// treated like the generic #123 package.json marker.
+	it("honors an explicit agent-level tsconfig.json as the LSP root", async () => {
+		const { extFile, agentDir } = makeFakeExtensionsTree({
+			parentPackageJson: true,
+			extensionPackageJson: false,
+			agentTsconfig: true,
+		});
+		const root = await getTypeScriptServer().root(extFile);
+		expect(root && path.resolve(root)).toBe(path.resolve(agentDir));
+	});
+
+	it("a nested extension-local root still wins over an agent-level tsconfig.json", async () => {
+		const { extFile, extDir } = makeFakeExtensionsTree({
+			parentPackageJson: true,
+			extensionPackageJson: true,
+			agentTsconfig: true,
+		});
+		const root = await getTypeScriptServer().root(extFile);
+		expect(root && path.resolve(root)).toBe(path.resolve(extDir));
+	});
+
+	it("an agent-level package.json alone still keeps the per-file fallback inside extensions", async () => {
+		const { extFile } = makeFakeExtensionsTree({
+			parentPackageJson: true,
+			extensionPackageJson: false,
+			agentTsconfig: false,
+		});
+		const root = await getTypeScriptServer().root(extFile);
+		expect(root).toBeDefined();
 		expect(path.resolve(root as string).replace(/\\/g, "/")).toContain(
 			"/.pi/agent/extensions/",
 		);

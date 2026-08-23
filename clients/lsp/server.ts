@@ -2327,6 +2327,23 @@ async function hasAgentLevelProjectMarker(
 	return false;
 }
 
+/**
+ * An explicit tsconfig.json in the agent dir (the parent of the matched
+ * extensions root key) is TypeScript project authority: it decides which files
+ * tsserver checks and with which types. Files under .pi/agent/extensions that
+ * it includes must type-check against it instead of a synthetic inferred
+ * project (e.g. bun:test types). Narrow by design — only an explicit
+ * tsconfig.json counts here, never jsconfig.json or generic tooling markers,
+ * and never any walk above the agent dir.
+ */
+async function findAgentTsconfigRoot(
+	extensionRootKey: string,
+): Promise<string | undefined> {
+	const agentDir = path.dirname(extensionRootKey);
+	if (!agentDir || agentDir === extensionRootKey) return undefined;
+	return (await markerExists(agentDir, "tsconfig.json")) ? agentDir : undefined;
+}
+
 const TypeScriptRoot: RootFunction = withRootMarkers(
 	DenoExcludeRoot(async (file) => {
 		const extensionRootKey = piAgentExtensionsRootKey(file);
@@ -2339,6 +2356,11 @@ const TypeScriptRoot: RootFunction = withRootMarkers(
 			// package.json at ~/.pi/agent/ (the #123 setup), the previous code
 			// returned undefined and the LSP silently failed to start. Fall
 			// back to a per-file scope so the LSP at least runs.
+			// Before that fallback: an explicit agent-level tsconfig.json governs
+			// these files — honor it as the root rather than stranding tsserver in
+			// an inferred project. A generic package.json alone does NOT qualify.
+			const agentTsconfigRoot = await findAgentTsconfigRoot(extensionRootKey);
+			if (agentTsconfigRoot) return agentTsconfigRoot;
 			if (await hasAgentLevelProjectMarker(extensionRootKey)) {
 				return FileDirRoot(file);
 			}
