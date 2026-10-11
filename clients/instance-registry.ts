@@ -63,6 +63,7 @@ import {
 	type ProcessTableOptions,
 	readProcessStart,
 } from "./process-snapshot.js";
+import { queueRegistryMutation } from "./instance-registry-tail.js";
 import { getProcessSingleton } from "./process-singletons.js";
 import { getSubagentIdentity, isSubagentSession } from "./subagent-mode.js";
 
@@ -157,6 +158,17 @@ export interface InstanceEntry {
 	 * {@link getInstanceRoots} folds back to `[projectRoot]`.
 	 */
 	projectRoots?: string[];
+	/**
+	 * Who holds each root (#3849), one record per holder: each record lists
+	 * exactly the roots THAT holder registered. `host` is this process's own
+	 * `registerInstance` and always lists `projectRoot`; every declined
+	 * secondary activation is a holder of its own. Only the holder's own
+	 * shutdown, or pruning (whole-entry removal, root or holder cap
+	 * eviction), removes a record, and a root stays in `projectRoots` while
+	 * any record lists it. Absent on pre-#3849 entries, which
+	 * {@link readRootHolders} reads as `host` holding every root.
+	 */
+	projectRootHolders?: Record<string, string[]>;
 	lspChildren: LspChildEntry[];
 	lspChildCount: number;
 	rssBytes: number;
@@ -415,6 +427,73 @@ export function mergeInstanceRoots(
 	return roots;
 }
 
+/** The holder record of this process's own `registerInstance` calls (#3849). */
+const HOST_ROOT_HOLDER = "host";
+
+/**
+ * Bound on the secondary holder records in one entry (#3849). A holder that
+ * never reaches its shutdown keeps its record until the entry goes, so the
+ * count needs its own bound beside the root cap: twice the root cap, oldest
+ * record evicted first. The host record is never evicted.
+ */
+const ROOT_HOLDER_CAP = 2 * INSTANCE_ROOT_CAP;
+
+/**
+ * The holder records of `entry` (#3849). A pre-#3849 entry has none, and
+ * reads as the host holding every root: no secondary's shutdown can then
+ * free a root whose holders were never recorded.
+ */
+function readRootHolders(entry: InstanceEntry): Record<string, string[]> {
+	const raw: unknown = entry.projectRootHolders;
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+		return { [HOST_ROOT_HOLDER]: getInstanceRoots(entry) };
+	}
+	const holders: Record<string, string[]> = {};
+	for (const [holder, listed] of Object.entries(raw)) {
+		if (!Array.isArray(listed)) continue;
+		holders[holder] = listed.filter(
+			(root): root is string => typeof root === "string" && root.length > 0,
+		);
+	}
+	return holders;
+}
+
+/**
+ * The SINGLE settle of the ownership rule (#3849), run by every writer of
+ * an entry's roots in the same locked write. Records keep only roots in
+ * `roots` (so a root the cap evicted leaves every record with it), the
+ * host record keeps the primary, the oldest secondary records beyond
+ * `ROOT_HOLDER_CAP` go, and a root stays only while some record lists it.
+ */
+function settleRootHolders(
+	roots: readonly string[],
+	holders: Readonly<Record<string, readonly string[]>>,
+): { roots: string[]; holders: Record<string, string[]> } {
+	const primary = roots[0];
+	const settled: Record<string, string[]> = {};
+	for (const [holder, listed] of Object.entries(holders)) {
+		const kept = roots.filter((root) => listed.includes(root));
+		if (kept.length > 0) settled[holder] = kept;
+	}
+	if (primary !== undefined) {
+		settled[HOST_ROOT_HOLDER] = roots.filter(
+			(root) =>
+				root === primary || holders[HOST_ROOT_HOLDER]?.includes(root) === true,
+		);
+	}
+	const secondaries = Object.keys(settled).filter(
+		(holder) => holder !== HOST_ROOT_HOLDER,
+	);
+	for (const holder of secondaries.slice(
+		0,
+		Math.max(0, secondaries.length - ROOT_HOLDER_CAP),
+	)) {
+		delete settled[holder];
+	}
+	const listed = new Set(Object.values(settled).flat());
+	return { roots: roots.filter((root) => listed.has(root)), holders: settled };
+}
+
 /**
  * Register `projectRoot` for this process, ADDITIVELY (#2130).
  *
@@ -492,14 +571,25 @@ async function registerInstanceNow(
 								[normalizedRoot],
 							)
 					: mergeInstanceRoots(existingRoots, normalizedRoot);
+			// #3849: the host holds what it registers; the settle prunes every
+			// record to the capped set in this same write.
+			const holders = existing ? readRootHolders(existing) : {};
+			const settled = settleRootHolders(roots, {
+				...holders,
+				[HOST_ROOT_HOLDER]: [
+					...(holders[HOST_ROOT_HOLDER] ?? []),
+					normalizedRoot,
+				],
+			});
 			const namespace = ownPidNamespace();
 			others.push({
 				pid,
 				...(selfStart === undefined ? {} : { processStart: selfStart }),
 				...(namespace === undefined ? {} : { pidNamespace: namespace }),
 				startedAt: existing?.startedAt ?? now,
-				projectRoot: roots[0] ?? normalizedRoot,
-				projectRoots: roots,
+				projectRoot: settled.roots[0] ?? normalizedRoot,
+				projectRoots: settled.roots,
+				projectRootHolders: settled.holders,
 				lspChildren: existing?.lspChildren ?? [],
 				lspChildCount: existing?.lspChildren?.length ?? 0,
 				rssBytes: process.memoryUsage().rss,
@@ -531,15 +621,29 @@ async function registerInstanceNow(
  * so this returns quietly instead. The next `registerInstance` re-creates the
  * entry with the real root pinned.
  *
+ * `holder` is the declined activation's own id (#3849): the root joins that
+ * holder's record, and only `deregisterInstanceRoot` with the same id, or
+ * pruning, ends that hold. A root another record also lists outlives this
+ * holder's record, and the primary is the host's alone: adding it records
+ * nothing.
+ *
  * Shares the serialization tail with every other same-process registry
  * mutation, so it cannot interleave its read-modify-write with a concurrent
  * `registerInstance` and silently revert it (#1724).
  */
-export function registerInstanceRoot(projectRoot: string): Promise<void> {
-	return queueRegistryMutation(() => registerInstanceRootNow(projectRoot));
+export function registerInstanceRoot(
+	projectRoot: string,
+	holder: string,
+): Promise<void> {
+	return queueRegistryMutation(() =>
+		registerInstanceRootNow(projectRoot, holder),
+	);
 }
 
-async function registerInstanceRootNow(projectRoot: string): Promise<void> {
+async function registerInstanceRootNow(
+	projectRoot: string,
+	holder: string,
+): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const normalizedRoot = normalizeFilePath(projectRoot);
 	const selfStart = await ownProcessStart(startReadOptions());
@@ -548,19 +652,31 @@ async function registerInstanceRootNow(projectRoot: string): Promise<void> {
 		const idx = file.instances.findIndex((entry) =>
 			isOwnEntry(entry, selfStart),
 		);
-		if (idx === -1) return;
 		const current = file.instances[idx];
+		if (current === undefined) return;
 		const priorRoots = getInstanceRoots(current);
-		const roots = mergeInstanceRoots(priorRoots, normalizedRoot);
+		// The host's record already holds its primary: nothing to add.
+		if (priorRoots[0] === normalizedRoot) return;
+		const holders = readRootHolders(current);
+		const settled = settleRootHolders(
+			mergeInstanceRoots(priorRoots, normalizedRoot),
+			{
+				...holders,
+				[holder]: [...(holders[holder] ?? []), normalizedRoot],
+			},
+		);
 		if (
-			roots.length === priorRoots.length &&
-			roots.every((root, index) => root === priorRoots[index])
+			settled.roots.length === priorRoots.length &&
+			settled.roots.every((root, index) => root === priorRoots[index]) &&
+			JSON.stringify(settled.holders) ===
+				JSON.stringify(current.projectRootHolders)
 		)
 			return;
 		file.instances[idx] = {
 			...current,
-			projectRoot: roots[0] ?? current.projectRoot,
-			projectRoots: roots,
+			projectRoot: settled.roots[0] ?? current.projectRoot,
+			projectRoots: settled.roots,
+			projectRootHolders: settled.holders,
 		};
 		await writeRegistryAsync(file);
 	});
@@ -584,10 +700,28 @@ export interface HeartbeatPatch {
 }
 
 /** Update this process's heartbeat/rss (and, since #620, host CPU% + live
- *  LSP children's rss/CPU%). Cheap — safe to call every turn end. */
+ *  LSP children's rss/CPU%). Cheap — safe to call every turn end.
+ *
+ * #3602: runs on the SAME tail as `registerInstance`/`registerInstanceRoot`/
+ * `deregisterInstance` (`queueRegistryMutation`) rather than taking the
+ * registry lock directly. Before this, a heartbeat queued behind a
+ * still-in-flight `registerInstance` (session_start's `void
+ * registerInstance(...)`, not awaited) could win the race to the lock: it
+ * would read the registry before that registration's write landed, find no
+ * own entry, and — because `registerInstanceNow` had already set the
+ * repair-intent root via `rememberRegistrationRoot` BEFORE its write — record
+ * a spurious `instance-registry-registration-missing` on an ordinary first
+ * turn and queue a redundant re-register. Sharing the tail makes the two
+ * mutations' submission order (session_start's registration, then
+ * turn_end's/agent_settled's heartbeat) their EXECUTION order too, so a
+ * heartbeat can never observe that half-registered state again. */
 export async function updateHeartbeat(
 	patch: HeartbeatPatch = {},
 ): Promise<void> {
+	return queueRegistryMutation(() => updateHeartbeatNow(patch));
+}
+
+async function updateHeartbeatNow(patch: HeartbeatPatch): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const pid = process.pid;
 	const selfStart = await ownProcessStart(startReadOptions());
@@ -658,46 +792,6 @@ export interface RecordLspChildInput {
 		startedAt: string;
 		rootSource?: "session-cwd" | "service-cwd" | "lsp-fallback";
 	};
-}
-
-// Every mutation routed through this tail (`registerInstance`,
-// `registerInstanceRoot`, `recordLspChild`, `removeLspChild`) reads the WHOLE
-// registry file, edits this process's own entry, and writes the whole
-// file back. Two such mutations from the SAME process — e.g. a client-ceiling
-// eviction's `removeLspChild(victimPid)` racing the replacement spawn's
-// `recordLspChild(newChild)` that follows it — are ordinary concurrent async
-// calls with no ordering guarantee between them. Without serialization, the
-// later WRITE can be built from a read taken before the earlier write landed,
-// silently reverting it (last-writer-wins losing a same-process update, not
-// just the already-accepted cross-process one — see the module docstring).
-// #1724: this is why a forced LSP shutdown's deregistration could get
-// clobbered by a concurrent respawn's registration. One shared tail
-// serializes every same-process registry mutation of this shape so "record"
-// and "remove" can never interleave their read-modify-write against each
-// other — the single seam both the forced-shutdown and self-crash
-// deregistration paths route through.
-//
-// #2146: the tail must be the PROCESS's one serialization point, and module
-// scope did not deliver that. pi evaluates the pi-lens module graph up to nine
-// times per process, so this module had up to nine tails, each serializing only
-// its own callers. The dogfood run measured the consequence directly: three
-// `instance-registry-corrupt` records inside nine seconds, with two project
-// roots and one live instance's entry lost from `instances.json` — exactly the
-// torn read-modify-write this tail exists to prevent, reintroduced by
-// duplication rather than by a missing await. Keying it on `globalThis` makes
-// every evaluation queue onto the same tail.
-const REGISTRY_TAIL_FAMILY = "instance-registry.mutation-tail";
-/** Bump when the tail cell's shape changes. */
-const REGISTRY_TAIL_VERSION = 1;
-
-function registryTailState(): { tail: Promise<void> } {
-	return getProcessSingleton(
-		REGISTRY_TAIL_FAMILY,
-		REGISTRY_TAIL_VERSION,
-		() => ({
-			tail: Promise.resolve(),
-		}),
-	);
 }
 
 /**
@@ -777,25 +871,9 @@ function rememberRegistrationRoot(root: string | undefined): void {
 	intent.target = root === undefined ? undefined : registryPath();
 }
 
-function queueRegistryMutation(op: () => Promise<void>): Promise<void> {
-	const state = registryTailState();
-	const run = state.tail.then(op);
-	state.tail = run.catch(() => {});
-	return run;
-}
-
-/**
- * Test-only: resolve once every registry mutation queued so far has landed.
- *
- * Several production call sites fire registry writes and deliberately do not
- * await them (`void registerInstance(...)` in the session_start handler), so a
- * test that reads the file straight afterwards races them. Queuing an empty op
- * on the same tail joins the queue rather than sleeping on it, which keeps the
- * wait exact instead of timing-dependent.
- */
-export function _settleRegistryMutationsForTests(): Promise<void> {
-	return queueRegistryMutation(async () => {});
-}
+// The tail lives in a dependency leaf so the shared test setup can join it
+// without loading this module's import graph (#3703).
+export { _settleRegistryMutationsForTests } from "./instance-registry-tail.js";
 
 /** Append/replace (by pid) an LSP child under this process's entry. */
 export function recordLspChild(entry: RecordLspChildInput): Promise<void> {
@@ -965,9 +1043,9 @@ export function deregisterInstance(): void {
 		return true;
 	});
 	if (removed) return;
-	// #3498: the lock was not free for the whole sync wait. The holder may be
-	// this process's own heartbeat or registration, which cannot release while
-	// the sync wait blocks the event loop. The process may live on through a
+	// #3498: the sync removal did not get the lock. A peer held it for the whole
+	// sync wait, or this process's own heartbeat or registration holds it, which
+	// the sync path does not wait on. The process may live on through a
 	// session replacement, so queue the removal behind the holder instead of
 	// dropping it and leaving the ended session's root in the registry.
 	incrementDegradationCount({
@@ -1025,11 +1103,13 @@ function withoutOwnEntry(
  * {@link deregisterInstance}, for a worktree this host stops serving while the
  * host itself keeps running.
  *
- * SYNC fs inside, matching `deregisterInstance`'s `session_shutdown` contract
- * (#234: no child spawns at teardown; this function spawns none). Removing the
- * LAST root removes the whole entry — a host serving no root is not a peer any
- * caller should find. Removing the primary promotes the next root to
- * `projectRoot` rather than leaving a stale scalar behind.
+ * The operation runs on the registry tail and uses async filesystem calls.
+ * It ends `holder`'s own hold on the root and nothing else (#3849): the
+ * root leaves the entry only when no other record (the host's included)
+ * lists it. A holder whose hold already ended (a whole-entry removal at a
+ * primary reload, a cap eviction, or an add that found no entry) writes
+ * nothing, so it can never free the root a later holder registered. The
+ * host's record always lists the primary, so this never removes it.
  *
  * QUEUED, unlike `deregisterInstance` (#2130 round 2). The two look alike but
  * run at opposite ends of a process's life. `deregisterInstance` runs as the
@@ -1046,63 +1126,120 @@ function withoutOwnEntry(
  * teardown paths may fire and forget it — the tail still orders the write —
  * but they can no longer read the file straight afterwards and expect the
  * removal to be visible.
+ *
+ * The single lock below waits through the lease for a peer or own prior
+ * holder, on this tail slot, before giving the next queued op its turn.
  */
-export function deregisterInstanceRoot(projectRoot: string): Promise<void> {
+export function deregisterInstanceRoot(
+	projectRoot: string,
+	holder: string,
+): Promise<void> {
 	const generation = registrationGeneration().capture();
 	return queueRegistryMutation(async () =>
-		deregisterInstanceRootNow(projectRoot, generation),
+		deregisterInstanceRootNow(projectRoot, holder, generation),
 	);
 }
 
-function deregisterInstanceRootNow(
-	projectRoot: string,
+/**
+ * The write this root removal must make (or none), plus the intent-cell side
+ * effect, from a fresh read (#3587). The single lease-waiting lock path calls
+ * this once under the lock, so a holder cannot force a second, stale decision.
+ * Keys the entry through `isOwnEntry`, exactly as `deregisterInstance` does
+ * (#3498).
+ */
+type RootRemovalPlan = {
+	file: RegistryFile;
+	outcome: "kept" | "freed";
+};
+
+/** The `instance-registry-deregister-landed` reason for each decision. */
+const ROOT_REMOVAL_REASONS: Readonly<
+	Record<RootRemovalPlan["outcome"] | "none", string>
+> = {
+	kept: "holder left; another holder keeps the root",
+	freed: "last holder left; root freed",
+	none: "the queued removal took the lock; there was nothing left to remove",
+};
+
+function planRootRemoval(
+	file: RegistryFile,
+	normalizedRoot: string,
+	holder: string,
+	selfStart: string | undefined,
 	generation: GenerationHandle,
-): void {
+): RootRemovalPlan | undefined {
+	const idx = file.instances.findIndex((entry) => isOwnEntry(entry, selfStart));
+	const current = file.instances[idx];
+	if (current === undefined) {
+		// Entry already gone (e.g. a dropped registration): still stop a
+		// heartbeat from re-registering the root this host just left.
+		const intent = registrationIntent();
+		if (
+			intent.root !== undefined &&
+			normalizeFilePath(intent.root) === normalizedRoot
+		)
+			rememberRegistrationRoot(undefined);
+		return undefined;
+	}
+	const prior = settleRootHolders(
+		getInstanceRoots(current),
+		readRootHolders(current),
+	);
+	const held = prior.holders[holder];
+	// #3849: no hold of this holder's own on the root, nothing to end.
+	if (!held?.includes(normalizedRoot)) return undefined;
+	const next = settleRootHolders(prior.roots, {
+		...prior.holders,
+		[holder]: held.filter((root) => root !== normalizedRoot),
+	});
+	// Keep a heartbeat re-registration on a root the host still serves,
+	// unless the host session ended since this removal was queued (#3498):
+	// its roots are no longer served, and the intent must stay clear.
+	if (generation.isCurrent()) rememberRegistrationRoot(next.roots[0]);
+	return {
+		file: {
+			instances: file.instances.map((entry, i) =>
+				i === idx
+					? {
+							...current,
+							projectRoot: next.roots[0] ?? current.projectRoot,
+							projectRoots: next.roots,
+							projectRootHolders: next.holders,
+						}
+					: entry,
+			),
+		},
+		outcome: next.roots.includes(normalizedRoot) ? "kept" : "freed",
+	};
+}
+
+async function deregisterInstanceRootNow(
+	projectRoot: string,
+	holder: string,
+	generation: GenerationHandle,
+): Promise<void> {
 	if (!isInstanceRegistryEnabled()) return;
 	const normalizedRoot = normalizeFilePath(projectRoot);
-	const selfStart = ownProcessStartIfKnown();
-	withInstanceRegistryLockSync(registryPath(), () => {
-		const file = readRegistrySync();
-		const idx = file.instances.findIndex((entry) =>
-			isOwnEntry(entry, selfStart),
-		);
-		if (idx === -1) {
-			// Entry already gone (e.g. a dropped registration): still stop a
-			// heartbeat from re-registering the root this host just left.
-			const intent = registrationIntent();
-			if (
-				intent.root !== undefined &&
-				normalizeFilePath(intent.root) === normalizedRoot
-			)
-				rememberRegistrationRoot(undefined);
-			return;
-		}
-		const current = file.instances[idx];
-		const remainingRoots = getInstanceRoots(current).filter(
-			(root) => root !== normalizedRoot,
-		);
-		if (remainingRoots.length === getInstanceRoots(current).length) return;
-		if (remainingRoots.length === 0) {
-			// The host serves no root: a heartbeat must not bring it back.
-			rememberRegistrationRoot(undefined);
-			writeRegistrySync({
-				instances: file.instances.filter(
-					(entry) => !isOwnEntry(entry, selfStart),
-				),
+	const selfStart = await ownProcessStart(startReadOptions());
+	await withInstanceRegistryLock(
+		registryPath(),
+		async () => {
+			const next = planRootRemoval(
+				await readRegistryAsync(),
+				normalizedRoot,
+				holder,
+				selfStart,
+				generation,
+			);
+			if (next) await writeRegistryAsync(next.file);
+			incrementDegradationCount({
+				kind: "instance-registry-deregister-landed",
+				subject: String(process.pid),
+				reason: ROOT_REMOVAL_REASONS[next?.outcome ?? "none"],
 			});
-			return;
-		}
-		file.instances[idx] = {
-			...current,
-			projectRoot: remainingRoots[0],
-			projectRoots: remainingRoots,
-		};
-		// Keep a heartbeat re-registration on a root the host still serves,
-		// unless the host session ended since this removal was queued (#3498):
-		// its roots are no longer served, and the intent must stay clear.
-		if (generation.isCurrent()) rememberRegistrationRoot(remainingRoots[0]);
-		writeRegistrySync(file);
-	});
+		},
+		LOCK_WAIT_THROUGH_LEASE_MS,
+	);
 }
 
 /**

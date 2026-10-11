@@ -15,7 +15,7 @@ import {
 	getLSPService,
 	groupFilesByPrimaryServer,
 	runPerServerGroups,
-} from "../clients/lsp/index.js";
+} from "../clients/lsp/capabilities.js";
 import {
 	buildScopeKey,
 	createWorkspaceDiagnosticsCacheContext,
@@ -24,7 +24,13 @@ import {
 import {
 	getServersForFileWithConfig,
 	primaryServerId,
+	resolveLspCwdForFile,
 } from "../clients/lsp/config.js";
+import {
+	describeRootFallback,
+	type LspRootFallback,
+} from "../clients/lsp/server.js";
+import { isAuxiliary } from "../clients/lsp/server-traits.js";
 import { mapWithConcurrency } from "../clients/map-with-concurrency.js";
 import {
 	combineAbortSignals,
@@ -161,6 +167,12 @@ type FileDiagnosticResult = {
 	 * purposes, but the reason differs and the rendered text should say so.
 	 */
 	timedOut?: boolean;
+	/**
+	 * #3750: set when `confirmation === "unconfirmed"` because the primary
+	 * server's root fell back (`lsp:server-root-fallback`) and its empty answer
+	 * would otherwise have read as clean.
+	 */
+	rootFallback?: LspRootFallback;
 	/**
 	 * The file's actual language server (e.g. "typescript"), as opposed to a
 	 * cross-cutting auxiliary scanner (ast-grep, opengrep, ...). Used to split
@@ -470,7 +482,11 @@ export function createLspDiagnosticsTool(
 				}
 				// Preserve input order (including duplicate entries); normalize each
 				// path before grouping so Windows separators and dot segments cannot
-				// change cache/group identity. Explicit lists never enter the walker.
+				// change cache/group identity. `paths` is documented as "Files or
+				// directories to filter", so directory entries expand through the
+				// scalar `path` route's own bounded walk (#3965) — reaching the
+				// per-file collector verbatim counted a `failed` outcome for the
+				// directory and silently dropped its whole subtree.
 				// #3160/#3182: `path.resolve(cwd, entry)` folds dot segments (and
 				// separators) structurally — it ignores `cwd` whenever `entry` is
 				// already absolute, so the old `path.isAbsolute` ternary is
@@ -482,19 +498,41 @@ export function createLspDiagnosticsTool(
 				// stays required for the relative→absolute step: `normalizeMapKey`
 				// folds dot segments itself since #3184, but never resolves against
 				// `cwd` (a cwd fold there broke every monorepo, #2490).
-				const absPaths = rawPaths.map((entry) =>
-					normalizeMapKey(path.resolve(cwd, entry)),
+				const expanded = await expandPathsToFiles(cwd, rawPaths);
+				if (expanded.files.length === 0) {
+					// A requested directory with no eligible file (empty, unreadable,
+					// or fully excluded) is a real "nothing to check" answer, not a
+					// per-file failure — the same sentence the scalar directory route
+					// renders for it.
+					const { listed, text } = describeDirectoriesWithoutFiles(
+						expanded.directoriesWithoutFiles,
+					);
+					return {
+						content: [{ type: "text" as const, text }],
+						details: {
+							mode: "batch",
+							severity,
+							filesChecked: 0,
+							directoriesWithoutFiles: listed,
+						},
+					};
+				}
+				return runBatchFileDiagnostics(
+					expanded.files,
+					severity,
+					lspService,
+					{
+						concurrency,
+						waitMs,
+						signal,
+						onProgress,
+						nextWriteIndex,
+						serverScope,
+						cwd,
+						onConfirmedNoBlockers,
+					},
+					expanded,
 				);
-				return runBatchFileDiagnostics(absPaths, severity, lspService, {
-					concurrency,
-					waitMs,
-					signal,
-					onProgress,
-					nextWriteIndex,
-					serverScope,
-					cwd,
-					onConfirmedNoBlockers,
-				});
 			}
 
 			const rawPath = typedParams.path;
@@ -830,6 +868,23 @@ async function classifyEmptyResult(
 	}
 }
 
+/**
+ * #3750: did the primary server's project root fall back for this file? The
+ * answer comes from `resolveLspServerCwd`, the seam that records the
+ * `lsp:server-root-fallback` degradation, not from a second marker check. A
+ * server in that state is hosted at the file's own directory and may analyse
+ * nothing, so its empty answer cannot be reported as clean.
+ */
+async function primaryRootFallback(
+	file: string,
+	cwd: string,
+): Promise<LspRootFallback | undefined> {
+	const seen: LspRootFallback[] = [];
+	await resolveLspCwdForFile(file, cwd, (fallback) => seen.push(fallback));
+	// Only a server that needs a project is demoted; see `requiresProjectRoot`.
+	return seen.find((fallback) => fallback.requiresProjectRoot);
+}
+
 // --- #611/#707: tier-3 silent escape hatch (typescript.tsserverRequest sync
 // commands) — implementation extracted to clients/lsp/tsserver-sync.ts and
 // re-used from there by the per-edit dispatch path (#707). ---
@@ -968,7 +1023,7 @@ function coveredSourcesForCheck(
 		return [];
 	}
 	for (const server of servers) {
-		const auxiliary = server.role === "auxiliary";
+		const auxiliary = isAuxiliary(server);
 		if (auxiliary && serverScope === "primary") continue;
 		if (unconfirmed.has(server.id)) continue;
 		// The dispatch runner tags the primary language server's findings `lsp`;
@@ -1350,6 +1405,11 @@ async function collectFileDiagnosticResult(
 	// re-cementing path). "unknown"/true bindings leave the verdict untouched.
 	const boundMismatch = binding?.boundToCurrentDisk === false;
 	if (boundMismatch) confirmation = "unconfirmed";
+	// #3750: a clean verdict from a server whose root fell back is unconfirmed.
+	// Before the aux-gap demotion below so the primary's reason is the one named.
+	const rootFallback =
+		confirmation === "clean" ? await primaryRootFallback(file, cwd) : undefined;
+	if (rootFallback) confirmation = "unconfirmed";
 	// #1470/#1493: an auxiliary that never reported — cut off by the aux grace timer,
 	// or silent with nothing published for this content — contributed no evidence
 	// about this file, so a "clean" verdict computed from the merged result would
@@ -1439,6 +1499,7 @@ async function collectFileDiagnosticResult(
 		unavailable: lspUnavailableMessage(file, health),
 		confirmation,
 		timedOut: confirmation === "unconfirmed" ? timedOut : undefined,
+		...(rootFallback && { rootFallback }),
 		...(skipReason !== undefined && { skipReason }),
 		primaryServerId: primaryServerId(file),
 		diagnosticsUnsupported: diagnosticsUnsupportedServerIds.length > 0,
@@ -1542,6 +1603,13 @@ async function runFileDiagnostics(
 	// longer "definitionally confirmed". "unknown"/true bindings are unchanged.
 	const boundMismatch = binding?.boundToCurrentDisk === false;
 	if (boundMismatch) confirmation = "unconfirmed";
+	// #3750: a clean verdict from a server whose root fell back is unconfirmed.
+	// Before the aux-gap narrowing below so the primary's reason is the one named.
+	const rootFallback =
+		confirmation === "clean"
+			? await primaryRootFallback(absPath, cwd)
+			: undefined;
+	if (rootFallback) confirmation = "unconfirmed";
 	// #1470/#1493: NARROWED, not collapsed. An auxiliary that never reported — the aux
 	// grace timer cut it off, or it stayed silent with nothing published for this
 	// content — makes the FILE-level verdict unconfirmed. The merged result is missing
@@ -1616,6 +1684,13 @@ async function runFileDiagnostics(
 				"Primary LSP: check timed out — NOT the same as 0 diagnostics; the " +
 				"file may still have errors that just hadn't been reported yet. " +
 				"Re-check after the server settles, or increase waitMs."
+			);
+		}
+		if (rootFallback) {
+			return (
+				`Primary LSP${primaryId ? ` (${primaryId})` : ""}: unconfirmed — ` +
+				`${describeRootFallback(rootFallback)}. NOT the same as 0 diagnostics; ` +
+				"check the file from inside its project and re-run."
 			);
 		}
 		// #1470: a file demoted ONLY because an auxiliary was cut off must not render
@@ -1708,6 +1783,9 @@ async function runFileDiagnostics(
 			navigationOnlyFiles:
 				diagnosticsUnsupportedServerIds.length > 0 ? 1 : undefined,
 			...(skipReason !== undefined && { skipReason }),
+			...(rootFallback && {
+				rootFallbackReason: describeRootFallback(rootFallback),
+			}),
 			// #1470: which servers this result does NOT speak for. Absent when it
 			// speaks for all of them.
 			...(unconfirmedServerIds.length > 0 && {
@@ -1731,12 +1809,14 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 	clean: number;
 	unconfirmed: number;
 	timedOut: number;
+	rootFallbackReasons: string[];
 	navigationOnly: number;
 	tooLarge: number;
 } {
 	let clean = 0;
 	let unconfirmed = 0;
 	let timedOut = 0;
+	const rootFallbackReasons = new Set<string>();
 	let navigationOnly = 0;
 	let tooLarge = 0;
 	for (const result of results) {
@@ -1754,11 +1834,22 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 			// #570: timed-out checks are a subset of "unconfirmed" — tallied
 			// separately so the aggregate text can say WHY, not just THAT.
 			if (result.timedOut) timedOut += 1;
-		} else {
+			if (result.rootFallback) {
+				rootFallbackReasons.add(describeRootFallback(result.rootFallback));
+			}
+		} else if (classifyBatchFileOutcome(result) === "clean") {
+			// Unsupported, unavailable and failed files were never checked.
 			clean += 1;
 		}
 	}
-	return { clean, unconfirmed, timedOut, navigationOnly, tooLarge };
+	return {
+		clean,
+		unconfirmed,
+		timedOut,
+		rootFallbackReasons: [...rootFallbackReasons],
+		navigationOnly,
+		tooLarge,
+	};
 }
 
 function classifyBatchFileOutcome(
@@ -1805,7 +1896,13 @@ function inconclusiveBatchResult(
 function unconfirmedReasonClause(
 	unconfirmed: number,
 	timedOut: number,
+	rootFallbackReasons: readonly string[] = [],
 ): string {
+	// #3750: a third, disjoint reason — the file's server root fell back, so its
+	// empty answer was demoted (`primaryRootFallback`). Named per server.
+	if (rootFallbackReasons.length > 0) {
+		return `${rootFallbackReasons.join("; ")} (${unconfirmed} unconfirmed in all).`;
+	}
 	const silent = unconfirmed - timedOut;
 	if (timedOut > 0 && silent > 0) {
 		return (
@@ -1855,6 +1952,7 @@ async function collectBatchDiagnostics(
 	clean: number;
 	unconfirmed: number;
 	timedOut: number;
+	rootFallbackReasons: string[];
 	outcomeCounts: Record<BatchFileOutcome, number>;
 	incompleteFiles: number;
 }> {
@@ -1973,7 +2071,8 @@ async function collectBatchDiagnostics(
 	const total = allDiags.length;
 	const truncated = total > MAX_DIAGNOSTICS;
 	const display = truncated ? allDiags.slice(0, MAX_DIAGNOSTICS) : allDiags;
-	const { clean, unconfirmed, timedOut } = tallyConfirmation(results);
+	const { clean, unconfirmed, timedOut, rootFallbackReasons } =
+		tallyConfirmation(results);
 	for (const result of results) {
 		result.outcome = classifyBatchFileOutcome(result);
 	}
@@ -2018,9 +2117,90 @@ async function collectBatchDiagnostics(
 		clean,
 		unconfirmed,
 		timedOut,
+		rootFallbackReasons,
 		outcomeCounts,
 		incompleteFiles: Math.max(0, files.length - results.length),
 	};
+}
+
+/**
+ * #3965: resolve a `paths` entry list into the concrete files a batch check
+ * scans. A directory entry expands through the scalar `path` route's own
+ * bounded walk ({@link collectDirectoryScanFiles}) — same exclusions, same
+ * scan-language decision; a file entry keeps its exact existing semantics
+ * (input order preserved, explicit duplicates kept, a nonexistent entry kept
+ * so the per-file collector's `path not found` failure survives). A file
+ * named explicitly anywhere in the list is never re-added by a directory that
+ * contains it, so overlapping entries check each file once.
+ *
+ * `directoriesWithoutFiles` carries the requested directories that yielded no
+ * eligible file (empty, unreadable, or fully excluded): the caller renders
+ * them as "no supported source files", not as per-file failures.
+ */
+async function expandPathsToFiles(
+	cwd: string,
+	rawPaths: string[],
+): Promise<{
+	files: string[];
+	directoriesWithoutFiles: string[];
+	capped: boolean;
+}> {
+	const explicitFiles: string[] = [];
+	const directories: string[] = [];
+	const seenFileKeys = new Set<string>();
+	for (const entry of rawPaths) {
+		const abs = normalizeMapKey(path.resolve(cwd, entry));
+		let stat: fs.Stats | undefined;
+		try {
+			stat = fs.statSync(abs);
+		} catch {
+			// Nonexistent on disk. Kept as a file entry below so the per-file
+			// collector still reports `path not found` — a caller that names a
+			// path must never read its absence as a clean answer.
+		}
+		if (stat?.isDirectory()) {
+			directories.push(abs);
+		} else {
+			explicitFiles.push(abs);
+			seenFileKeys.add(abs);
+		}
+	}
+
+	const files = [...explicitFiles];
+	const directoriesWithoutFiles: string[] = [];
+	let capped = false;
+	for (const directory of directories) {
+		// The budget is shared across the whole request: a directory expands only
+		// into what is left of MAX_FILES, so a list of directories cannot exceed
+		// the single-directory route's own bound. Files an earlier entry already
+		// covers are dropped BEFORE the budget is spent, so overlapping or
+		// duplicate entries neither truncate early nor read as capped.
+		const collected = await collectDirectoryScanFiles(
+			directory,
+			MAX_FILES - files.length,
+			seenFileKeys,
+		);
+		capped ||= collected.capped;
+		// Only a directory that held NO eligible file is "without files"; one
+		// fully covered by an earlier entry, or starved by the shared budget,
+		// held files and is not an empty answer.
+		if (collected.eligible === 0) directoriesWithoutFiles.push(directory);
+		for (const file of collected.files) {
+			const key = normalizeMapKey(file);
+			seenFileKeys.add(key);
+			files.push(key);
+		}
+	}
+	if (capped) {
+		// Bounded, once per workspace: the request asked for more eligible files
+		// than the walk bound admits. The rendered result discloses the same cap.
+		recordDegradationOnce({
+			kind: "lsp-diagnostics-paths-cap",
+			subject: cwd,
+			reason: `paths directory expansion reached the ${MAX_FILES}-file cap; later entries were not checked`,
+		});
+	}
+	return { files, directoriesWithoutFiles, capped };
 }
 
 async function runBatchFileDiagnostics(
@@ -2028,7 +2208,17 @@ async function runBatchFileDiagnostics(
 	severity: string,
 	lspService: NonNullable<ReturnType<typeof getLSPService>>,
 	options: BatchOptions,
+	// #3965: what directory expansion left out of the scan. `capped` is true
+	// when it hit the MAX_FILES population bound; `directoriesWithoutFiles`
+	// are requested directories that held no eligible file. A bounded scan
+	// whose truncation or omission is invisible reads as a full answer
+	// (AGENTS.md shape 10), so the render names both.
+	scan: {
+		capped: boolean;
+		directoriesWithoutFiles: string[];
+	} = { capped: false, directoriesWithoutFiles: [] },
 ) {
+	const { capped, directoriesWithoutFiles } = scan;
 	if (absPaths.length === 0) {
 		return {
 			content: [{ type: "text" as const, text: "No file paths provided." }],
@@ -2049,6 +2239,7 @@ async function runBatchFileDiagnostics(
 		clean,
 		unconfirmed,
 		timedOut,
+		rootFallbackReasons,
 		outcomeCounts,
 		incompleteFiles,
 	} = await collectBatchDiagnostics(absPaths, severity, lspService, options);
@@ -2063,7 +2254,7 @@ async function runBatchFileDiagnostics(
 	);
 
 	const lines: string[] = [
-		`Files checked: ${results.length}`,
+		`Files checked: ${results.length}${capped ? ` (capped at ${MAX_FILES})` : ""}`,
 		`Total diagnostics: ${total}`,
 		`Concurrency: ${options.concurrency}`,
 	];
@@ -2074,6 +2265,10 @@ async function runBatchFileDiagnostics(
 			.map(([outcome, count]) => `${outcome}=${count}`)
 			.join(", ")}`,
 	);
+	// One bounded line, however many requested directories held no file.
+	const { listed: emptyListed, text: emptyText } =
+		describeDirectoriesWithoutFiles(directoriesWithoutFiles);
+	if (directoriesWithoutFiles.length > 0) lines.push("", emptyText);
 	const notConfirmed =
 		outcomeCounts.inconclusive +
 		outcomeCounts.unavailable +
@@ -2120,7 +2315,7 @@ async function runBatchFileDiagnostics(
 		lines.push(
 			"",
 			`${clean} file${clean === 1 ? "" : "s"} confirmed clean, ${unconfirmed} unconfirmed: ` +
-				`${unconfirmedReasonClause(unconfirmed, timedOut)} NOT the same as 0 diagnostics.`,
+				`${unconfirmedReasonClause(unconfirmed, timedOut, rootFallbackReasons)} NOT the same as 0 diagnostics.`,
 		);
 	}
 	if (display.length === 0) {
@@ -2153,6 +2348,10 @@ async function runBatchFileDiagnostics(
 			severity,
 			serverScope: options.serverScope ?? "all",
 			filesChecked: results.length,
+			...(capped ? { capped: true } : {}),
+			...(directoriesWithoutFiles.length > 0
+				? { directoriesWithoutFiles: emptyListed }
+				: {}),
 			concurrency: options.concurrency,
 			waitMs: options.waitMs,
 			diagnostics: display,
@@ -2222,31 +2421,81 @@ export async function resolveDirectoryScanExtensions(
 	return undefined;
 }
 
+/**
+ * #3965: the bounded directory collection the scalar `path` route
+ * ({@link runDirectoryDiagnostics}) and the `paths` batch's directory
+ * expansion ({@link expandPathsToFiles}) both use — ONE walker with the one
+ * exclusion rule (`projectIgnorePredicate`) and the one scan-language decision
+ * (`resolveDirectoryScanExtensions`), never a second traversal. `maxFiles`
+ * bounds the returned list (the caller owns the budget across a multi-entry
+ * `paths` request); `capped` reports that the directory held more eligible
+ * files than that bound, so the caller discloses the truncation instead of
+ * silently narrowing the scan (AGENTS.md shape 10).
+ */
+async function collectDirectoryScanFiles(
+	absPath: string,
+	maxFiles: number,
+	// Files the caller already covers (the `paths` batch's earlier entries),
+	// keyed by `normalizeMapKey`. They are dropped before `maxFiles` is applied.
+	seen: ReadonlySet<string> = new Set(),
+): Promise<{ files: string[]; capped: boolean; eligible: number }> {
+	const isIgnored = projectIgnorePredicate(absPath);
+	let collectedFiles: string[] = [];
+	await resolveDirectoryScanExtensions(async (exts) => {
+		collectedFiles = await collectFiles(
+			absPath,
+			[...exts],
+			// At most `seen.size` collected files can be dropped below, so this
+			// walk still sees `maxFiles + 1` new files when the directory has them.
+			maxFiles + seen.size + 1,
+			isIgnored,
+		);
+		return collectedFiles.length > 0;
+	});
+	const fresh = collectedFiles.flatMap((file) =>
+		seen.has(normalizeMapKey(file)) ? [] : [file],
+	);
+	return {
+		files: fresh.slice(0, maxFiles),
+		capped: fresh.length > maxFiles,
+		// Raw count: a directory whose files are all `seen` is not empty.
+		eligible: collectedFiles.length,
+	};
+}
+
+/**
+ * The "no supported source files" sentence for requested directories that held
+ * no eligible file — one site for the scalar route, the all-empty `paths`
+ * request, and the mixed `paths` request. At most five are named and the rest
+ * counted, so the line stays bounded.
+ */
+function describeDirectoriesWithoutFiles(directories: string[]): {
+	listed: string[];
+	text: string;
+} {
+	const listed = directories.slice(0, 5);
+	const more = directories.length - listed.length;
+	return {
+		listed,
+		text: `No supported source files found in: ${listed.join(", ")}${more > 0 ? ` (+${more} more)` : ""}`,
+	};
+}
+
 async function runDirectoryDiagnostics(
 	absPath: string,
 	severity: string,
 	lspService: NonNullable<ReturnType<typeof getLSPService>>,
 	options: BatchOptions,
 ) {
-	let collectedFiles: string[] = [];
+	const { files: filesToProcess, capped: wasCapped } =
+		await collectDirectoryScanFiles(absPath, MAX_FILES);
 
-	const isIgnored = projectIgnorePredicate(absPath);
-	await resolveDirectoryScanExtensions(async (exts) => {
-		collectedFiles = await collectFiles(
-			absPath,
-			[...exts],
-			MAX_FILES + 1,
-			isIgnored,
-		);
-		return collectedFiles.length > 0;
-	});
-
-	if (collectedFiles.length === 0) {
+	if (filesToProcess.length === 0) {
 		return {
 			content: [
 				{
 					type: "text" as const,
-					text: `No supported source files found in: ${absPath}`,
+					text: describeDirectoriesWithoutFiles([absPath]).text,
 				},
 			],
 			details: {
@@ -2258,8 +2507,6 @@ async function runDirectoryDiagnostics(
 		};
 	}
 
-	const wasCapped = collectedFiles.length > MAX_FILES;
-	const filesToProcess = collectedFiles.slice(0, MAX_FILES);
 	const {
 		results,
 		fileErrors,
@@ -2272,6 +2519,7 @@ async function runDirectoryDiagnostics(
 		clean,
 		unconfirmed,
 		timedOut,
+		rootFallbackReasons,
 		outcomeCounts,
 	} = await collectBatchDiagnostics(
 		filesToProcess,
@@ -2309,7 +2557,7 @@ async function runDirectoryDiagnostics(
 		const cleanLine =
 			unconfirmed > 0
 				? `${clean} clean · ${unconfirmed} unconfirmed: ` +
-					`${unconfirmedReasonClause(unconfirmed, timedOut)} NOT the same as 0 diagnostics.`
+					`${unconfirmedReasonClause(unconfirmed, timedOut, rootFallbackReasons)} NOT the same as 0 diagnostics.`
 				: "No diagnostics found.";
 		text = [
 			`Directory: ${absPath}`,
@@ -2343,7 +2591,11 @@ async function runDirectoryDiagnostics(
 				? [
 						"",
 						`${clean} other file${clean === 1 ? "" : "s"} confirmed clean, ${unconfirmed} unconfirmed: ` +
-							unconfirmedReasonClause(unconfirmed, timedOut),
+							unconfirmedReasonClause(
+								unconfirmed,
+								timedOut,
+								rootFallbackReasons,
+							),
 					]
 				: []),
 			"",

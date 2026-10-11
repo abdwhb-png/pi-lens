@@ -74,6 +74,8 @@ interface DeleteFileOp {
 interface AppliedWorkspaceFileDetail {
 	filePath: string;
 	range?: { start: number; end: number };
+	ranges?: Array<{ start: number; end: number }>;
+	authorshipUnknown?: boolean;
 	importsChanged?: boolean;
 }
 
@@ -119,6 +121,23 @@ export interface ApplyWorkspaceEditOptions {
  * edit's turn in pi's mutation queue. Thrown by the preflight, before any write.
  */
 export class StaleWorkspaceEditContentError extends Error {}
+
+/**
+ * #3541/#3601: refuse an edit whose content cannot be shown to be what it was
+ * computed from. One ledger count and one {@link StaleWorkspaceEditContentError}
+ * naming the file, for the preflight's own mismatch and for a caller that
+ * refuses a file it cannot bind (`lsp_navigation`'s rename).
+ */
+export function refuseStaleWorkspaceEdit(filePath: string, why: string): never {
+	incrementDegradationCount({
+		kind: "lsp-edit-stale-content",
+		subject: filePath,
+		reason: `${why}; the edit was not applied`,
+	});
+	throw new StaleWorkspaceEditContentError(
+		`stale text document content for ${filePath}: ${why}`,
+	);
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -719,6 +738,16 @@ export function workspaceEditDiskPaths(edit: {
 	return plannedDiskPaths(planWorkspaceEdit(edit));
 }
 
+/** #3601: the on-disk path of every file `edit` writes TEXT to (the only files the content preflight compares). */
+export function workspaceEditTextPaths(edit: {
+	changes?: Record<string, unknown[]>;
+	documentChanges?: unknown[];
+}): string[] {
+	return planWorkspaceEdit(edit).flatMap((op) =>
+		op.kind === "text" ? [uriToDiskPath(op.uri)] : [],
+	);
+}
+
 function planWorkspaceEdit(
 	edit: { changes?: Record<string, unknown[]>; documentChanges?: unknown[] },
 	trackOrigins = false,
@@ -1211,14 +1240,9 @@ async function preflightWorkspaceEdit(
 			await fs.realpath(physicalPath),
 		);
 		if (expected !== undefined && expected !== content) {
-			incrementDegradationCount({
-				kind: "lsp-edit-stale-content",
-				subject: filePath,
-				reason:
-					"the file changed after the edit was computed from it; the edit was not applied",
-			});
-			throw new StaleWorkspaceEditContentError(
-				`stale text document content for ${filePath}: it changed after the edit was computed`,
+			refuseStaleWorkspaceEdit(
+				filePath,
+				"the file changed after the edit was computed from it",
 			);
 		}
 		state.content = content;
@@ -1483,15 +1507,40 @@ export async function applyWorkspaceEdit(
 					}
 					const content = await fs.readFile(diskPath, "utf-8");
 					const updated = applyTextEditsToString(content, edits, "utf-16");
+					const changesLineCount = edits.some((edit) => {
+						const removedLines = edit.range.end.line - edit.range.start.line;
+						const insertedLines = (edit.newText.match(/\r\n|\r|\n/g) ?? [])
+							.length;
+						return removedLines !== insertedLines;
+					});
 					await fs.writeFile(diskPath, updated, "utf-8");
 					const start = Math.min(
 						...edits.map((item) => item.range.start.line + 1),
 					);
-					const end = Math.max(...edits.map((item) => item.range.end.line + 1));
+					const end = Math.max(
+						...edits.map(
+							(item) =>
+								item.range.end.line +
+								(item.range.end.character === 0 &&
+								item.range.end.line > item.range.start.line
+									? 0
+									: 1),
+						),
+					);
 					touchedFiles.add(filePath);
 					fileDetails.push({
 						filePath,
 						range: { start, end },
+						ranges: edits.map((item) => ({
+							start: item.range.start.line + 1,
+							end:
+								item.range.end.line +
+								(item.range.end.character === 0 &&
+								item.range.end.line > item.range.start.line
+									? 0
+									: 1),
+						})),
+						authorshipUnknown: changesLineCount,
 						importsChanged:
 							importsSignature(content) !== importsSignature(updated),
 					});
@@ -1511,6 +1560,7 @@ export async function applyWorkspaceEdit(
 					fileDetails.push({
 						filePath,
 						range: { start: 1, end: 1 },
+						authorshipUnknown: true,
 						importsChanged: false,
 					});
 					markApplied(op);
@@ -1532,11 +1582,13 @@ export async function applyWorkspaceEdit(
 						{
 							filePath: oldPath,
 							range: { start: 1, end: 1 },
+							authorshipUnknown: true,
 							importsChanged: true,
 						},
 						{
 							filePath: newPath,
 							range: { start: 1, end: 1 },
+							authorshipUnknown: true,
 							importsChanged: true,
 						},
 					);
@@ -1555,6 +1607,7 @@ export async function applyWorkspaceEdit(
 					fileDetails.push({
 						filePath,
 						range: { start: 1, end: 1 },
+						authorshipUnknown: true,
 						importsChanged: true,
 					});
 					markApplied(op);

@@ -29,7 +29,10 @@ import {
 	applyFindingPolicy,
 	loadProjectRulePolicyMap,
 } from "../clients/dispatch/finding-policy.js";
-import { gateFindingsByPathFreshness } from "../clients/advisory-provenance.js";
+import {
+	gateFindingsByPathFreshness,
+	parseScannedAtMs,
+} from "../clients/advisory-provenance.js";
 import {
 	formatCacheAgeLabel,
 	markUnreconciledFindings,
@@ -49,14 +52,14 @@ import {
 	normalizeMapKey,
 	realpathOrResolve,
 } from "../clients/path-utils.js";
-import { getLSPService } from "../clients/lsp/index.js";
+import { getLSPService } from "../clients/lsp/capabilities.js";
 import { retireInlineBlockerAndResyncGuard } from "../clients/git-guard.js";
 import {
 	primaryServerId,
 	resolveLspCwdForFile,
 } from "../clients/lsp/config.js";
 import type { LSPDiagnostic } from "../clients/lsp/client.js";
-import type { LSPWorkspaceUnconfirmedReason } from "../clients/lsp/index.js";
+import type { LSPWorkspaceUnconfirmedReason } from "../clients/lsp/capabilities.js";
 import { getFullScanWallClockMs } from "../clients/lsp/workspace-sweep-hold.js";
 import { demoteInferredProjectSweepResults } from "../clients/lsp/inferred-project.js";
 import {
@@ -957,7 +960,10 @@ function filterDeltaReportDispositions(
 				d.filePath,
 			).length === 1,
 	);
-	const policyKept = applyRulePolicy(kept, policyMap);
+	const policyKept = applyRulePolicy(kept, policyMap, {
+		root: cwd,
+		filePath: cwd,
+	});
 	if (policyKept.length === report.diagnostics.length) return report;
 	return { ...report, diagnostics: policyKept };
 }
@@ -1195,6 +1201,7 @@ function formatDeltaMode(
 				warnings: applyRulePolicy(
 					applyCachedDispositions(file.warnings ?? [], cwd, file.filePath),
 					policyMap,
+					{ root: cwd, filePath: file.filePath },
 				),
 			}))
 			.filter((file) => file.warnings.length > 0);
@@ -1323,6 +1330,7 @@ function formatDeltaMode(
 				diagnostics: applyRulePolicy(
 					applyCachedDispositions(f.diagnostics, cwd, f.filePath),
 					policyMap,
+					{ root: cwd, filePath: f.filePath },
 				),
 			}))
 			.filter((f) => f.diagnostics.length > 0);
@@ -1542,11 +1550,15 @@ function filterProjectDiagnosticsDeltaReport(
 function applyProjectRulePolicy<T extends { diagnostics: ProjectDiagnostic[] }>(
 	value: T | undefined,
 	policyMap: ReturnType<typeof rulePolicyMapFromConfig>,
+	root: string,
 ): T | undefined {
 	if (!value) return undefined;
 	return {
 		...value,
-		diagnostics: applyRulePolicy(value.diagnostics, policyMap),
+		diagnostics: applyRulePolicy(value.diagnostics, policyMap, {
+			root,
+			filePath: value.diagnostics[0]?.filePath ?? root,
+		}),
 	};
 }
 
@@ -1649,6 +1661,13 @@ function projectDiagnosticToWidget(
 		rule: diagnostic.rule ?? diagnostic.code,
 		tool: diagnostic.runner || diagnostic.tool,
 		uri: widgetDiagnosticUri(filePath, diagnostic.line, diagnostic.column),
+		// #3600: carry the analyzer's own read stamp through the #1888
+		// correlated commit, which otherwise re-stamps the row with the project
+		// scan's `scannedAt` or the fold's `Date.now()`. Absent for the cheap
+		// scan's rows, whose freshness is settled by a content fingerprint.
+		...(diagnostic.observedAt !== undefined && {
+			observedAt: diagnostic.observedAt,
+		}),
 	};
 }
 
@@ -2043,17 +2062,33 @@ function mergeDiagnosticsWithWidgetSummaries(
 		}
 	}
 
+	// #3600: the delta report's own `generatedAt`, never the fold's `now`. A row
+	// that already carries its own `observedAt` keeps it; the report stamp is
+	// only a fallback for rows the delta writer did not stamp. An unparseable
+	// `generatedAt` is recorded rather than silently widened to `Date.now()`.
+	const deltaDiagnostics = projectDelta?.diagnostics ?? [];
+	const deltaObservedAt = parseScannedAtMs(projectDelta?.generatedAt);
+	if (deltaDiagnostics.length > 0 && deltaObservedAt === undefined) {
+		recordDegradationOnce({
+			kind: "project-delta-generatedat-unparseable",
+			subject: String(projectDelta?.generatedAt),
+			reason:
+				"projectDelta rows fell back to the fold time because generatedAt could not be parsed",
+		});
+	}
 	for (const diagnostic of projectSnapshot?.diagnostics ?? []) {
 		addDiagnostic(
 			path.resolve(diagnostic.filePath),
 			projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
 		);
 	}
-	for (const diagnostic of projectDelta?.diagnostics ?? []) {
-		addDiagnostic(
-			path.resolve(diagnostic.filePath),
-			projectDiagnosticToWidget(diagnostic, diagnostic.filePath),
-		);
+	for (const diagnostic of deltaDiagnostics) {
+		const widget = projectDiagnosticToWidget(diagnostic, diagnostic.filePath);
+		const observedAt = widget.observedAt ?? deltaObservedAt;
+		addDiagnostic(path.resolve(diagnostic.filePath), {
+			...widget,
+			...(observedAt !== undefined && { observedAt }),
+		});
 	}
 
 	return [...byFile.values()];
@@ -2089,7 +2124,10 @@ async function applyInlineSuppressionsToSummaries(
 				// Inline suppression/disposition remains fail-open when the file cannot
 				// be read, but project policy does not depend on content and must still
 				// be applied so a fresh full-mode result cannot bypass `disable`/`select`.
-				const policyKept = applyRulePolicy(summary.diagnostics, policyMap);
+				const policyKept = applyRulePolicy(summary.diagnostics, policyMap, {
+					root: cwd,
+					filePath: summary.filePath,
+				});
 				return policyKept.length === summary.diagnostics.length
 					? summary
 					: summarizeDiagnostics(
@@ -2534,6 +2572,7 @@ async function formatFullMode(
 	const projectSnapshot = applyProjectRulePolicy(
 		foldedProjectSnapshot,
 		policyMap,
+		cwd,
 	);
 	const projectDelta = applyProjectRulePolicy(
 		filterProjectDiagnosticsDeltaReport(
@@ -2541,6 +2580,7 @@ async function formatFullMode(
 			includeFile,
 		),
 		policyMap,
+		cwd,
 	);
 	// #630: only the CONFIRMED LSP results contribute diagnostics to the merge
 	// — an unconfirmed (timed-out/errored) file's placeholder `[]` must not be
@@ -3233,7 +3273,10 @@ async function formatAllMode(
 		: summaries.map((s) => {
 				const diagnostics = s.diagnostics ?? [];
 				const kept = applyCachedDispositions(diagnostics, cwd, s.filePath);
-				const policyKept = applyRulePolicy(kept, policyMap);
+				const policyKept = applyRulePolicy(kept, policyMap, {
+					root: cwd,
+					filePath: s.filePath,
+				});
 				if (
 					policyKept.length === kept.length &&
 					kept.length === diagnostics.length

@@ -52,11 +52,18 @@ const ERROR = {
 	},
 };
 
-function makeServer(id: string, ext: string, root: string) {
+type TestServer = Omit<
+	import("../../../clients/lsp/server.js").LSPServerInfo,
+	"spawn"
+> & { spawn: ReturnType<typeof vi.fn> };
+
+function makeServer(id: string, ext: string, root: string): TestServer {
 	return {
 		id,
 		name: id,
 		extensions: [ext],
+		idleEviction: "transparent",
+		role: "language",
 		root: async () => root,
 		spawn: vi.fn(async () => ({ process: {}, source: "test" })),
 	};

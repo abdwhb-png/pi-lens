@@ -6,11 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import {
-	renderMutationMarkdown,
-	renderStaleMarkdown,
-	STICKY_MARKER,
-} from "../../scripts/lib/mutation-report-render.mjs";
+import { renderMutationMarkdown } from "../../scripts/lib/mutation-report-render.mjs";
 
 describe("renderMutationMarkdown", () => {
 	it("never reads a 0-mutant run as a clean pass, and states the reason", () => {
@@ -31,6 +27,30 @@ describe("renderMutationMarkdown", () => {
 		expect(markdown).toContain("not a clean pass");
 		expect(markdown).toContain("no PR-changed lines fall under");
 		expect(markdown).not.toMatch(/score/i);
+	});
+
+	it("renders excluded tests and their reasons on the delivered scored summary", () => {
+		// Recurrence (#3625 F3): metadata-only exclusions made the scored report
+		// look as though the entire related population had been evaluated.
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				base: "origin/master",
+				headSha: "abc1234567890",
+				zeroMutants: null,
+				counts: { Killed: 1 },
+				score: "100.00",
+				testsExcluded: [
+					{
+						file: "tests/mcp/server.smoke.test.ts",
+						reason: "real stdio scheduling",
+					},
+				],
+			},
+		});
+		expect(markdown).toContain("Excluded tests:");
+		expect(markdown).toContain("tests/mcp/server.smoke.test.ts");
+		expect(markdown).toContain("real stdio scheduling");
 	});
 
 	it("round 4 R3-1: renders 0/no-zeroMutants/no-partial as not a clean pass, backstopping a driver branch that failed to set either", () => {
@@ -321,10 +341,324 @@ describe("renderMutationMarkdown", () => {
 		expect(markdown).toContain("deadbeef0000".slice(0, 12));
 	});
 
-	it("carries the sticky-comment marker so the workflow can find and update its own comment", () => {
-		expect(
-			renderMutationMarkdown({ files: {}, piLensMutationDiff: {} }),
-		).toContain(STICKY_MARKER);
+	it("discloses a truncated test population on scored, partial, and zero reports", () => {
+		// Recurrence M3648-2: a bounded test population must not render as a
+		// complete score or an unexplained zero/partial result in the PR comment.
+		const testSelection = {
+			mode: "coverage",
+			pool: 155,
+			covering: 60,
+			kept: 47,
+			dropped: 13,
+			own: 2,
+			unknown: 0,
+		};
+		const scored = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection,
+			},
+		});
+		const partial = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				partial: { evaluated: 1, total: 2, reason: "budget expired" },
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection,
+			},
+		});
+		const zero = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				zeroMutants: { reason: "no mutable lines" },
+				testSelection,
+			},
+		});
+		for (const markdown of [scored, partial, zero]) {
+			expect(markdown).toContain("13 covering test(s) dropped by the test cap");
+			expect(markdown).toContain("truncated test population");
+		}
+	});
+
+	it("reports related -> covering -> kept on every report kind, and names the truncation only when a test was dropped (S12)", () => {
+		// Recurrence S12: the note must not appear when nothing was dropped (a
+		// complete population is not "truncated"), and kept < covering is not the
+		// trigger -- an own test that covers nothing is kept regardless.
+		const whole = {
+			mode: "coverage",
+			pool: 72,
+			covering: 16,
+			kept: 16,
+			dropped: 0,
+			own: 3,
+			unknown: 0,
+		};
+		const scored = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: whole,
+			},
+		});
+		const zero = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				zeroMutants: { reason: "no mutable lines" },
+				testSelection: whole,
+			},
+		});
+		for (const markdown of [scored, zero]) {
+			expect(markdown).toContain(
+				"**Test selection:** related 72 → covering 16 → kept 16 (3 own)",
+			);
+			expect(markdown).not.toContain("truncated test population");
+			expect(markdown).not.toContain("dropped by the test cap");
+		}
+		const ownExtra = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: { ...whole, covering: 13, kept: 16 },
+			},
+		});
+		expect(ownExtra).not.toContain("truncated test population");
+	});
+
+	it("says coverage was unavailable when the kept set came from the import graph alone, and names probe failures", () => {
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: {
+					mode: "import-graph",
+					pool: 30,
+					covering: null,
+					kept: 30,
+					dropped: 0,
+					own: 0,
+					unknown: 2,
+				},
+			},
+		});
+		expect(markdown).toContain(
+			"related 30 → covering coverage unavailable (import-graph ranking) → kept 30 (2 probe failed)",
+		);
+		const truncated = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: {
+					mode: "import-graph",
+					pool: 72,
+					covering: null,
+					kept: 47,
+					dropped: 25,
+					own: 0,
+					unknown: 0,
+				},
+			},
+		});
+		expect(truncated).toContain("25 related test(s) dropped by the test cap");
+	});
+
+	// Recurrence (#4092): the runtime cap drops tests the count cap never
+	// does (the window's own tests), and a report that dropped them without a
+	// word would read a truncated test population as the whole one.
+	it("discloses tests dropped by the runtime cap, on its own and beside the count cap", () => {
+		const render = (extra: Record<string, number>) =>
+			renderMutationMarkdown({
+				files: {},
+				piLensMutationDiff: {
+					counts: { Killed: 1 },
+					score: "100.00",
+					testSelection: {
+						mode: "coverage",
+						pool: 122,
+						covering: 100,
+						kept: 90,
+						dropped: 0,
+						overBudget: 0,
+						estimatedSeconds: 239.4,
+						own: 80,
+						unknown: 0,
+						...extra,
+					},
+				},
+			});
+		expect(render({ overBudget: 32 })).toContain(
+			"Bounded evidence: 32 test(s) dropped by the runtime cap (~239 s of estimated test time kept) (90 kept). The score is from a truncated test population.",
+		);
+		expect(render({ overBudget: 32 })).toMatch(
+			/^- \*\*Test selection:\*\* .* kept 90 \(80 own, 32 over the runtime cap, ~239 s kept\)$/m,
+		);
+		expect(render({ dropped: 25, overBudget: 32 })).toContain(
+			"Bounded evidence: 25 covering test(s) dropped by the test cap; 32 test(s) dropped by the runtime cap (~239 s of estimated test time kept) (90 kept).",
+		);
+		// An uncapped report (and a pre-#4092 report with no such field) says nothing.
+		expect(render({})).not.toContain("Bounded evidence");
+		const old = render({});
+		expect(old).not.toContain("runtime cap");
+	});
+
+	it("renders the exact selection line: bare without extras, comma-joined with both", () => {
+		const render = (extra: { own?: number; unknown?: number }) =>
+			renderMutationMarkdown({
+				files: {},
+				piLensMutationDiff: {
+					counts: { Killed: 1 },
+					score: "100.00",
+					testSelection: {
+						mode: "coverage",
+						pool: 72,
+						covering: 16,
+						kept: 16,
+						dropped: 0,
+						own: 0,
+						unknown: 0,
+						...extra,
+					},
+				},
+			});
+		expect(render({})).toMatch(
+			/^- \*\*Test selection:\*\* related 72 → covering 16 → kept 16$/m,
+		);
+		expect(render({ own: 3, unknown: 2 })).toMatch(
+			/^- \*\*Test selection:\*\* .* kept 16 \(3 own, 2 probe failed\)$/m,
+		);
+	});
+
+	it.each([
+		["pool", { pool: "72" }],
+		["kept", { kept: "16" }],
+		["dropped", { dropped: "0" }],
+		["covering", { covering: "16" }],
+	])("ignores a selection whose %s is not a number", (_field, bad) => {
+		// Each of the four fields is validated on its own: a selection that is
+		// well-formed except for one must not render NaN or "undefined".
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: {
+					pool: 72,
+					covering: 16,
+					kept: 16,
+					dropped: 4,
+					own: 0,
+					unknown: 0,
+					...bad,
+				},
+			},
+		});
+		expect(markdown).not.toContain("Test selection");
+		expect(markdown).not.toContain("dropped by the test cap");
+	});
+
+	it("needs both reuse counts to claim a count, and says so when only one is a number", () => {
+		const render = (incremental: {
+			state: string;
+			reused?: number | null;
+			total?: number | null;
+		}) =>
+			renderMutationMarkdown({
+				files: {},
+				piLensMutationDiff: {
+					counts: { Killed: 1 },
+					score: "100.00",
+					incremental,
+				},
+			});
+		const unavailable = "restored cache accepted (reuse count unavailable)";
+		expect(render({ state: "warm", reused: 5, total: null })).toContain(
+			unavailable,
+		);
+		expect(render({ state: "warm", reused: null, total: 6 })).toContain(
+			unavailable,
+		);
+	});
+
+	it("names the inputs that made the cache cold, five at most", () => {
+		const render = (changed: unknown) =>
+			renderMutationMarkdown({
+				files: {},
+				piLensMutationDiff: {
+					counts: { Killed: 1 },
+					score: "100.00",
+					incremental: { state: "cold-inputs-changed", changed },
+				},
+			});
+		const plain =
+			"- **Incremental:** cold (a kept test or another changed file differs from the cached run)";
+		expect(render(["node", "tests/a.test.ts"])).toContain(
+			`${plain}: \`node\`, \`tests/a.test.ts\``,
+		);
+		const six = ["a", "b", "c", "d", "e", "f"];
+		expect(render(six)).toMatch(/: `a`, `b`, `c`, `d`, `e` and 1 more$/m);
+		expect(render(["a", "b", "c", "d", "e"])).toMatch(/`d`, `e`$/m);
+		expect(render(["a", 7, null])).toMatch(/: `a`$/m);
+		for (const none of [[], undefined, "node", [7]]) {
+			expect(render(none).split("\n")).toContain(plain);
+		}
+	});
+
+	it("does not name changed inputs for a state that is not cold-inputs-changed", () => {
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				incremental: { state: "cold-no-cache", changed: ["node"] },
+			},
+		});
+		expect(markdown).toContain("**Incremental:** cold (no restored cache)");
+		expect(markdown).not.toContain("`node`");
+	});
+
+	it("ignores a malformed test selection instead of rendering NaN", () => {
+		const markdown = renderMutationMarkdown({
+			files: {},
+			piLensMutationDiff: {
+				counts: { Killed: 1 },
+				score: "100.00",
+				testSelection: { pool: "many", kept: 1, dropped: 2 },
+			},
+		});
+		expect(markdown).not.toContain("Test selection");
+		expect(markdown).not.toContain("dropped by the test cap");
+	});
+
+	it("reports the incremental cache state, with the reuse count only for a warm run", () => {
+		const render = (incremental: unknown) =>
+			renderMutationMarkdown({
+				files: {},
+				piLensMutationDiff: {
+					counts: { Killed: 1 },
+					score: "100.00",
+					incremental,
+				},
+			});
+		expect(render({ state: "warm", reused: 41, total: 57 })).toContain(
+			"**Incremental:** 41 of 57 mutant result(s) reused from the previous push",
+		);
+		expect(render({ state: "warm", reused: null, total: null })).toContain(
+			"restored cache accepted (reuse count unavailable)",
+		);
+		expect(render({ state: "cold-no-cache" })).toContain(
+			"**Incremental:** cold (no restored cache)",
+		);
+		expect(render({ state: "cold-inputs-changed" })).toContain(
+			"cold (a kept test or another changed file differs from the cached run)",
+		);
+		expect(render({ state: "mystery" })).not.toContain("Incremental");
+		expect(render(null)).not.toContain("Incremental");
 	});
 
 	it("round 2 S2: labels a partial (budget-killed) run distinctly, alongside whatever DID run", () => {
@@ -350,7 +684,7 @@ describe("renderMutationMarkdown", () => {
 				headSha: "abc1234",
 				zeroMutants: null,
 				partial: {
-					// round 3 R2-4: describePartialInterruptCause's shape -- never
+					// round 3 R2-4: describePartialMutationOutcome's shape -- never
 					// "no mutants evaluated" under a "6 of 9 evaluated" banner.
 					reason:
 						"mutation diff: the 0.55-minute mutation budget expired before Stryker produced a result",
@@ -363,7 +697,9 @@ describe("renderMutationMarkdown", () => {
 		});
 
 		expect(markdown).toContain("Partial run");
-		expect(markdown).toContain("6 of 9 mutant(s) evaluated");
+		expect(markdown).toContain(
+			"**Partial run** -- 6 of 9 mutant(s) evaluated before the interrupt.",
+		);
 		expect(markdown).toContain("budget expired");
 		// Recurrence (round 3 R2-4): the reason sits right under "6 of 9
 		// evaluated" -- it must never itself say the run evaluated nothing.
@@ -611,67 +947,43 @@ describe("renderMutationMarkdown", () => {
 	});
 });
 
-describe("renderStaleMarkdown (#3531 round 2 T6, round 3/4 R2-4 wording)", () => {
-	it("names the head that produced no report, and carries the sticky marker so a later run finds and updates it", () => {
-		const markdown = renderStaleMarkdown({
-			headSha: "deadbeef00001234",
-			runUrl: undefined,
-		});
-
-		expect(markdown).toContain(STICKY_MARKER);
-		expect(markdown).toContain("Stale");
-		expect(markdown).toContain("deadbeef0000");
-		expect(markdown).toContain("no longer reflects this PR's current head");
-		// Recurrence (round 3 R2-4): the PATCH this very call produces
-		// OVERWRITES the comment with this notice -- "left over" implied no
-		// action was taken, when the update is happening right now.
-		expect(markdown).not.toContain("left over");
-		// Recurrence (round 4, cosmetic): the neutral cause clause used to
-		// read "produced no mutation report -- it did not produce one (…)",
-		// a doubled sentence.
-		expect(markdown).not.toContain("it did not produce one");
+describe("renderMutationMarkdown bounded survivors (#4005)", () => {
+	const survivor = (index: number, original = "a") => ({
+		status: "Survived",
+		mutatorName: "ConditionalExpression",
+		original,
+		replacement: "b",
+		location: { start: { line: index + 1 } },
+	});
+	const report = (mutants: unknown[]) => ({
+		files: { "clients/x.js": { mutants } },
+		piLensMutationDiff: { counts: { Survived: mutants.length }, partial: null },
 	});
 
-	it("links the job run when a run URL is given", () => {
-		const markdown = renderStaleMarkdown({
-			headSha: "abc123",
-			runUrl: "https://github.com/apmantza/pi-lens/actions/runs/123",
-		});
-
-		expect(markdown).toContain(
-			"[Job run](https://github.com/apmantza/pi-lens/actions/runs/123)",
+	// Recurrence: an issue body over GitHub's 65536-character limit failing the
+	// nightly's only write. Unbounded stays the default for every other caller.
+	it("keeps the full count in the heading, shows only maxSurvivors rows and points at the artifact", () => {
+		const markdown = renderMutationMarkdown(
+			report(Array.from({ length: 9 }, (_, i) => survivor(i))),
+			{ maxSurvivors: 3 },
 		);
+		expect(markdown).toContain("#### Survivors (9)");
+		expect(markdown.match(/^\| `clients\/x\.js:/gm)).toHaveLength(3);
+		expect(markdown).toContain("Showing the first 3 of 9 survivors");
+		expect(
+			renderMutationMarkdown(
+				report(Array.from({ length: 9 }, (_, i) => survivor(i))),
+			).match(/^\| `clients\/x\.js:/gm),
+		).toHaveLength(9);
 	});
 
-	it("renders without throwing when given no context at all", () => {
-		expect(() => renderStaleMarkdown()).not.toThrow();
-		expect(renderStaleMarkdown()).toContain(STICKY_MARKER);
-	});
-
-	it("names BOTH possible causes of a 'cancelled' upstream result -- a superseding push or the job's own time limit", () => {
-		// Recurrence (round 4): `needs.mutation.result` reads "cancelled" both
-		// when the workflow's own per-PR concurrency group supersedes a run
-		// AND when the job runs past its `timeout-minutes` -- this job cannot
-		// tell those two apart, so naming only "superseded" would misattribute
-		// a genuine timeout to a push that never happened.
-		const markdown = renderStaleMarkdown({
-			headSha: "abc123",
-			upstreamResult: "cancelled",
-		});
-
-		expect(markdown).toContain(
-			"cancelled: a newer push superseded it, or the job hit its time limit",
+	it("clips a long replaced expression so one row cannot be the whole budget", () => {
+		const markdown = renderMutationMarkdown(
+			report([survivor(0, "x".repeat(5000))]),
+			{ maxSurvivors: 5 },
 		);
-		expect(markdown).not.toContain("crash");
-	});
-
-	it("words it neutrally (not a specific crash/cancellation claim) when the upstream result is unknown or a genuine failure", () => {
-		const markdown = renderStaleMarkdown({
-			headSha: "abc123",
-			upstreamResult: "failure",
-		});
-
-		expect(markdown).not.toContain("superseded");
+		expect(markdown).toContain(`${"x".repeat(160)}...`);
+		expect(markdown).not.toContain("x".repeat(161));
 	});
 });
 

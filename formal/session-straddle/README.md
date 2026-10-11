@@ -14,35 +14,38 @@ session-1 strays), #3568 (the handler's capture at entry).
 - **Replacement in the same cwd** (`/new`, fork, or resume into the same
   cwd). pi caches the extension module per cwd (`loader.js`
   `loadExtensionModule`, `useExtensionCacheCwd`), so the module-level
-  `runtime` (`index.ts:566`) is one object for both sessions.
+  `runtime` (`index.ts` `runtime`) is one object for both sessions.
 - **session_start, split at its awaits.**
-  1. The admission key is set first (`index.ts:2077`).
+  1. The process-lifetime admission key is reserved first (`clients/session-scope.ts`
+     `reserveSessionStart`), keyed by session id (or file), reason, and previous
+     session file; `session_shutdown` releases it.
   2. The pre-handler resets run.
   3. Then it awaits `configureWarmAttach` and `ensureLSPConfigInitialized`.
   4. Only then does `handleSessionStart` clear the tier-3 touch registry and
-     bump the generation, in one tick (`runtime-session.ts:2407-2408`). The
-     bump also clears the cascade state (`runtime-coordinator.ts:434-443`).
+     bump the generation, in one tick (`runtime-session.ts` `handleSessionStart`). The
+     bump also clears the cascade state (`runtime-coordinator.ts` `resetForSession`).
 - **The session-1 quiet window.** It is fire-and-forget from `agent_settled`
-  (`index.ts:3568`). `runQuietWindow` runs its tasks in sequence and captures
-  the session generation as each task starts (`quiet-window.ts:174`), at the
+  (`index.ts` `runQuietWindow`). `runQuietWindow` runs its tasks in sequence and captures
+  the session generation as each task starts (`quiet-window.ts`), at the
   same instant the task snapshots its state:
-  - `cascade_carry_over_settle` (`quiet-window.ts:225`) calls
+  - `cascade_carry_over_settle` (`quiet-window.ts`) calls
     `settleCascadeRuns`. That takes `_pendingCascadeRuns`, awaits up to
     `PI_LENS_QUIET_WINDOW_WAIT_MS` (15 s), then appends the settled runs and
-    re-parks the rest (`runtime-coordinator.ts:1025-1092`).
-  - The cascade-tier reconcile (`cascade-tier.ts:479`) drains the touch
+    re-parks the rest (`runtime-coordinator.ts` `settleCascadeRuns`).
+  - The cascade-tier reconcile (`clients/lsp/cascade-tier.ts`
+    `reconcileOutstandingCascadeTouches`) drains the touch
     registry synchronously, awaits per entry, then calls `onResolvedFound`,
-    which appends a run (`index.ts:3380-3389`).
+    which appends a run (`index.ts` `onResolvedFound`).
 - **The overflow admission path** (`Overflow`, #3512). Past 32 unsettled
   computes, `appendCascadePromise` appends a settled run from a detached
-  `.then` (`runtime-coordinator.ts:1021-1023`) that the reset cannot reach.
+  `.then` (`runtime-coordinator.ts` `appendCascadePromise`) that the reset cannot reach.
   Under `Overflow` the session-1 compute takes this path, and session 2 admits
   one of its own past the cap (`Admit2`, `Resolve2`).
 - **The admission's generation is the one captured at dispatch**
   (`Dispatch1Gen`, #3512 r1). The classified `tool_result` handler captures
-  `writeSession` (`runtime-tool-result.ts:2217`) before it awaits the
+  `writeSession` (`runtime-tool-result.ts` `handleToolResult`) before it awaits the
   pipeline, and hands that one handle to the pipeline (the tier-3 touch) and
-  to `appendCascadePromise` (`runtime-tool-result.ts:2515`). The admission
+  to `appendCascadePromise` (`runtime-tool-result.ts` `handleToolResult`). The admission
   drops on a stale handle on both branches, and the overflow `.then` reuses
   it.
 - **The late admission** (`LateAdmit`, #3512 r1). `index.ts` wraps the handler
@@ -55,11 +58,12 @@ session-1 strays), #3568 (the handler's capture at entry).
   its claim join. It then dispatches in any phase (`Dispatch1`), and its
   compute, admission and stray touch follow the dispatch.
 - **Session 2's own tier-3 touches**, split into the dispatch, which captures
-  the generation, and the record (`integration.ts:2045`). Session 2's own quiet window reconciles them. That
+  the generation, and the record (`clients/dispatch/integration.ts`
+  `computeCascadeForFile`). Session 2's own quiet window reconciles them. That
   window cannot start while session 1's is still in progress
   (`_inProgress`).
 - **Session 2's turn_end** consumes and delivers
-  (`runtime-turn.ts:1147`). Its supersede filter is
+  (`runtime-turn.ts` `consumeCascadeRuns`). Its supersede filter is
   `getFilesChangedSince(origin.projectSeq)`. `projectSeq` restarts at the
   reset, so a session-1 run is never superseded.
 - **Strays** (`Strays`, #3512). A still-running session-1 cascade compute
@@ -68,8 +72,8 @@ session-1 strays), #3568 (the handler's capture at entry).
   dispatch captured in session 1, and the record site drops the touch through
   it.
 - **The duplicate session_start** (#2890). pi RPC awaits `rebindSession`
-  twice. The gate suppresses an identical `(reason, session id)` unless the
-  live tool plan changed (`index.ts:2057-2077`).
+  twice. The process-lifetime gate suppresses an identical `(session key,
+  reason, previousSessionFile)` even when pi re-runs the extension factory.
 
 `FixParts` selects the guards:
 
@@ -99,11 +103,29 @@ The shipped code is
 and `{}` is the code before #3499. `entryCapture` matters only under
 `EarlyAbandon`; the configs that predate #3568 leave it out.
 
+The retirement at shutdown (F1 of #3803) adds three parts:
+
+- `retireAtShutdown` (#3611): `session_shutdown` retires the scope
+  (`retireOwnScope`, `index.ts`; a handle is current only while its scope is
+  live, `clients/session-scope.ts`), so every handle a session-1 writer holds
+  is stale from `Shutdown1`, not only from the reset's new ticket. The model's
+  `gen` was written before #3611 as a counter bumped at `resetForSession`
+  (`StartReset`), so between the two a captured handle read as current. Every
+  guard compares through `Stale(g)`: `g # gen`, or, with this part, the window
+  (`s1down`, `s2starting`).
+- `retireSticky`: a mutant. The retirement is never lifted, so session 2's own
+  handles are stale as well.
+- `watchWindow`: an instrument, not a mechanism. It records the origins whose
+  write landed in the window, which `NoWriteBetween` reads. A part rather than
+  a constant, because every older config lists its parts and a new constant
+  would touch all of them; without it `late` never moves and the older
+  configs keep their state counts.
+
 ## Invariants
 
 - `NoCrossSessionState`: after session 2's reset, no session-1 run or parked
   compute is in the runtime. This is the promise "Session reset still clears
-  it" (`runtime-coordinator.ts:615-616`).
+  it" (`runtime-coordinator.ts` `resetForSession`).
 - `NoCrossSessionDelivery`: a run computed in session 1 is never delivered by
   session 2's turn_end.
 - `NoDropFreshTouch`: no guard drops session 2's own tier-3 touch (catalog
@@ -111,6 +133,12 @@ and `{}` is the code before #3499. `entryCapture` matters only under
 - `NoDropFreshAdmission`: the admission guard never drops a compute session 2
   admits (shape 54, #3512).
 - `OneResetPerSession`: one `session_start` mutation pass per session.
+- `NoWriteBetween` (F1 of #3803, with `watchWindow`): no session-1 write lands
+  between the shutdown and the reset. The reset's clear removes it, but only
+  when a reset comes: the replacement may be late or, in #3668's gap, never
+  start, so the write would sit in a runtime between sessions (the model's
+  `ResetClears = FALSE` mutants show what a write the reset does not reach
+  does). The guard drops the write where it lands instead.
 
 ## Results
 
@@ -146,6 +174,12 @@ at its first counterexample.
 | `DuplicateStart` | pass | 243 |
 | `DuplicateStartNoDedupe` (guard mutant: no #2890 gate) | violated `OneResetPerSession` | 28 |
 | `DuplicateStartToolDrift` (documented, see below) | violated `OneResetPerSession` | 28 |
+| `RetiredStraddleState` (shipped code, retired at shutdown, F1 of #3803) | pass | 189 |
+| `RetiredLateAdmission` (shipped code, late admission past the cap, strays, retired at shutdown) | pass | 2991 |
+| `RetiredLateDispatch` (shipped code, handler abandoned before its dispatch, retired at shutdown) | pass | 3264 |
+| `PreS1RetireAtReset` (pre-#3611: a handle is stale only at the reset) | violated `NoWriteBetween` | 16 |
+| `PreS1RetireAtResetAdmission` (the same, a late admission in the window) | violated `NoWriteBetween` | 13 |
+| `MutRetireSticky` (the retirement is never lifted) | violated `NoDropFreshTouch` | 151 |
 
 Before #3499, `StraddleState` violated `NoCrossSessionState` and
 `StraddleDelivery` violated `NoCrossSessionDelivery`. The delivery
@@ -190,6 +224,25 @@ What each config proves:
   against `FixDispatchCaptureLate`). A handler that resumes after the reset
   and only then dispatches captures session 2's generation, and the #3512
   guards, which compare against that capture, pass its compute.
+
+The retirement at shutdown (F1 of #3803):
+
+- The three `Retired*` configs are `StraddleState`, `LateAdmissionOverflow` and
+  `LateDispatchOverflow` with `retireAtShutdown` and `watchWindow`: every
+  invariant of the originals still holds, and `NoWriteBetween` too. Their
+  originals keep the reset-time counter, so the older rows stay comparable.
+- The retirement is load-bearing in the settle, the reconcile and the admission
+  (parked and overflow): reverting any one of those guards to `g # gen` reds a
+  `Retired*` config (the mutation table of the F1 pull request). A write that
+  lands between the shutdown and the reset with the older counter is
+  `PreS1RetireAtReset` (a settle that finishes after the shutdown) and
+  `PreS1RetireAtResetAdmission` (a handler that admits after it).
+- Both directions (shape 54): `MutRetireSticky` drops session 2's own touch
+  when the retirement outlives the reset. The shipped retirement belongs to
+  the scope that shut down.
+- The tier-3 record site keeps `g # gen`: the stray (`Stray`) and session 2's
+  record (`Record2`) exist only in `s2`, so a retirement arm there cannot be
+  reached, and a stray recorded in the window is not modelled.
 
 What the model cannot see: it has no clock. `FixWindowCaptureStartCheck`, the
 round-1 design, passes every invariant here, yet it cost real behaviour. A
@@ -244,6 +297,8 @@ Not modelled:
   modelled (see "What the model cannot see");
 - the pre-handler resets in `index.ts` (latency brackets, telemetry,
   once-per-session phases) against late session-1 writers;
+- a tier-3 touch recorded between the shutdown and the reset (see the
+  retirement at shutdown above);
 - the cross-cwd replacement. There the module is re-evaluated and the old
   `runtime` is a different object, so this straddle cannot occur.
 

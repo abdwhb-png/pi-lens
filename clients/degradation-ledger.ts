@@ -11,6 +11,7 @@ import { logLatency } from "./latency-logger.js";
 import {
 	getSinkRotations,
 	getSinkOptionConflicts,
+	getSinkTruncateRefusals,
 	getSinkWriteFailures,
 	resetSinkRotations,
 	resetSinkWriteFailures,
@@ -55,6 +56,26 @@ export type DegradationKind =
 	 */
 	| "actionable-warnings-inband-superseded"
 	/**
+	 * #3676: a report entry the settle's quick fix acted on was built under
+	 * another read guard (a /fork, /new or resume) or carried no valid branch
+	 * stamp (a cache file from before it, or a malformed value), so the pass
+	 * was applied and credited to no branch: the read guard then
+	 * asks for a re-read before the agent's next edit of that file. Subject is
+	 * the project root; once per session.
+	 */
+	| "actionable-warnings-quickfix-uncredited"
+	/** #4309: a resolved executable belongs to the adopted or session project. */
+	| "adopted-root-binary-refused"
+	/** #4309: an autonomous formatter or fixer is disabled for an adopted file. */
+	| "adopted-root-writer-skipped"
+	/**
+	 * #3748: a model-facing advisory (`clients/agent-nudge.ts`'s queue) never
+	 * reached a `context` call. Subject `cap:<scope id>`: the queue already held
+	 * its bound. Subject `scope-retired:<scope id>`: the scope that queued it
+	 * ended first, so no later call belongs to it. Counted.
+	 */
+	| "agent-advisory-dropped"
+	/**
 	 * #2430: an observational capture — the pre-snapshot, the post-diff, or the
 	 * `agent_settled` sweep — hit its per-turn wall-clock budget, timed out, or
 	 * was aborted. The net then has NO opinion about that call, which must be
@@ -81,6 +102,7 @@ export type DegradationKind =
 	| "ast-grep-napi-language-unavailable"
 	/** A managed-tool verification probe exceeded its retained output bound. */
 	| "ast-grep-napi-unavailable"
+	| "ast-grep-rule-invalid"
 	/**
 	 * #2722: a managed-tool verification probe returned a NON-VERDICT — the
 	 * #208 transport-required matcher was armed, never matched, and the kept
@@ -124,6 +146,13 @@ export type DegradationKind =
 	 */
 	| "bash-view-clipped"
 	| "biome-explain-unavailable"
+	/**
+	 * #4137 round 3: `clearInlineBlockers` refused a clean result from a run
+	 * without authorship (an opaque recovery, #3226) over the very bytes an
+	 * authored verdict recorded; the inline blocker record stays. One subject per
+	 * file key, counted across the session.
+	 */
+	| "blocker-clear-refused"
 	/**
 	 * #3594: `acquireBoundedPidFileLock`'s wait (the durable-store sync
 	 * waiter) was skipped because the same top-generation holder an earlier
@@ -198,6 +227,13 @@ export type DegradationKind =
 	 * cannot carry, since the warm-only callers never reach selection.
 	 */
 	/**
+	 * #1129 decision B: a root inside a real git checkout below the host tmpdir
+	 * got a process-owned data dir, so nothing it records outlives the process
+	 * (and a durable dir it may have had before is not read). Subject is the
+	 * slug hash; recorded once per root via the session-start data-dir drain.
+	 */
+	| "data-dir-ephemeral"
+	/**
 	 * #2874: a pre-hash project data-dir slug directory was renamed once to
 	 * its hashed slug (or an old/new pair was found coexisting and the new
 	 * one preferred), so two roots that differ only in separator-vs-hyphen
@@ -205,6 +241,24 @@ export type DegradationKind =
 	 * Recorded ONCE per migrated directory via the session-start drain.
 	 */
 	| "data_dir_migrated"
+	/**
+	 * A dead-code scan that missed the turn_end budget finished in the
+	 * background and was NOT used (#4117): its session ended before it settled
+	 * (`session-ended`), or it failed (`scan-failed`; a timeout or kill also
+	 * backs the root off). Subject is the client id; counted, because a slow root
+	 * repeats it every turn.
+	 */
+	| "dead-code-late-scan-dropped"
+	/**
+	 * #3814: the commit gate's pre-check of settled collect-later runner answers
+	 * (`absorbSettledRunnerBlockers`) threw. The gate falls back to the blocker
+	 * map as it stood, and the turn-end drain still records those answers. Subject
+	 * is `commit_gate`; counted, so a recurring fault is one row, not one per
+	 * commit.
+	 */
+	| "deferred-blocker-gate-error"
+	/** A deferred formatter outlived its bounded drain and has no clean result. */
+	| "deferred-format-unsettled"
 	| "demoted-finding-retired"
 	| "diagnostic-retained-unreconciled"
 	| "dispatch-non-absolute-baseline-path"
@@ -237,6 +291,28 @@ export type DegradationKind =
 	 * every call, so only the FIRST occurrence per (verdict, cwd) also writes a
 	 * record; the count here is the exact total.
 	 */
+	/**
+	 * #3598: `cargo clippy --fix` or `dart fix --apply` rewrote a sibling file an
+	 * agent edited during the run. Recorded ONCE per run, however many files:
+	 * the reason carries the restored and lost counts and the first file names.
+	 * Subject is the tool.
+	 */
+	| "fix-run-agent-edit-overwritten"
+	/** A bounded pre-run call was not carried into a fixer run (#3830). */
+	| "fix-run-pending-call-cap"
+	/**
+	 * #3830: a whole-package fixer's restore left a file alone, and named it
+	 * possibly lost, because a newer agent edit may have won (a call in flight,
+	 * or the bytes moved between the restore's read and its write). Recorded
+	 * ONCE per run, however many files. Subject is the tool.
+	 */
+	| "fix-run-restore-skipped-newer-edit"
+	/**
+	 * #3598: the pre-run hash set for a whole-package fixer was cut (unreadable
+	 * file, file over the size cap, or the byte budget), so an agent edit to an
+	 * uncovered file during the run is not protected. Subject is the tool.
+	 */
+	| "fix-run-scope-truncated"
 	/** A formatter write was declined because project/tool agreement was not provable. */
 	| "formatter-agreement-unavailable"
 	| "formatter-failure"
@@ -391,16 +467,19 @@ export type DegradationKind =
 	/** A busy notify-stall discriminator was deferred; detail is rising-edge bounded. */
 	| "instance-registry-corrupt"
 	/**
-	 * #3498: the removal `deregisterInstance` queued took the registry lock
-	 * and ran, whether or not the entry was still there. A queued removal
-	 * with no landed record was lost (host exit, or the lock never came).
-	 * Subject is this process's pid.
+	 * #3498: a removal queued by `deregisterInstance` (whole entry, at
+	 * shutdown) or `deregisterInstanceRoot` (one root, #3587) took the
+	 * registry lock and ran, whether or not there was still anything to
+	 * remove. A queued removal with no landed record was lost (host exit, or
+	 * the lock never came). Subject is this process's pid.
 	 */
 	| "instance-registry-deregister-landed"
 	/**
-	 * #3498: `deregisterInstance`'s sync removal could not take the registry
-	 * lock, so the removal was queued on the registry tail behind the holder.
-	 * Subject is this process's pid.
+	 * #3498: the sync removal `deregisterInstance` attempts first (it runs off
+	 * the tail, at shutdown) could not take the registry lock, so it was
+	 * queued on the registry tail behind the holder. `deregisterInstanceRoot`
+	 * no longer emits it: it has no sync attempt, only the lease-waiting
+	 * lock on its tail slot (#3618). Subject is this process's pid.
 	 */
 	| "instance-registry-deregister-queued"
 	/**
@@ -421,6 +500,14 @@ export type DegradationKind =
 	 * Subject is that lock file's resolved path.
 	 */
 	| "instance-registry-lock-legacy-held"
+	/**
+	 * A sync registry-lock acquisition returned without waiting because an
+	 * async registry op of this process holds the lock: that holder cannot
+	 * release while a sync wait blocks the event loop. The caller queues behind
+	 * it (`instance-registry-deregister-queued`). Subject is the resolved lock
+	 * target.
+	 */
+	| "instance-registry-lock-own-hold"
 	/**
 	 * #3476: a registry-lock acquisition took over a generation whose holder
 	 * was dead or past the 5 s lease. Subject is the resolved lock target.
@@ -444,6 +531,23 @@ export type DegradationKind =
 	 * normalized root it would have registered.
 	 */
 	| "instance-registry-registration-superseded"
+	/**
+	 * #3654: the File I/O Lifecycle Bridge dropped a `mutate` facet. The entry
+	 * was malformed, out of scope, ignored, refused under `no-read-guard`, or
+	 * failed its bookkeeping; a `delete` facet that fails its confirm gate (still
+	 * present on disk) reports here too. Subject is `"${caller}:${reason}"` — the
+	 * exact pair the synchronous `RecordResult` also returned, so a monitor can
+	 * join this row to the caller's own drop count.
+	 */
+	| "io-bridge-mutate-dropped"
+	/**
+	 * #3654: the File I/O Lifecycle Bridge dropped a `read` facet, for the same
+	 * reasons and with the same `"${caller}:${reason}"` subject as
+	 * `io-bridge-mutate-dropped`. A v1 `read-bridge` zero-line read of a
+	 * non-empty or unreadable file (#3652) reports here as
+	 * `<consumer>:bookkeeping-error`; it was `read-bridge-zero-line-dropped`.
+	 */
+	| "io-bridge-read-dropped"
 	/**
 	 * #3383: a newline-framed reader (`createWarmIpcLineReader`) discarded an
 	 * unterminated line that had grown past `MAX_FRAMED_LINE_BYTES`. The peer is
@@ -477,13 +581,29 @@ export type DegradationKind =
 	 * Without this row the fallback is indistinguishable from a healthy run.
 	 */
 	| "kill-ownership-unverifiable"
+	/**
+	 * #3813: a late auxiliary pair whose findings the turn-end cap cut was past
+	 * its re-arm TTL or ceiling, so it was NOT put back for the next turn (a pair
+	 * within its bound is re-armed and counted under `turn-end-sections-held`).
+	 * Counted; subject is `late-auxiliary:<serverId>`, a small fixed set.
+	 */
+	| "late-auxiliary-held-dropped"
 	/** A didChange content mirror was recorded behind a newer document version. */
 	| "lens-diagnostics-analysis-root-rejected"
 	/** Cross-graph rotation options disagreed; the first writer retained ownership. */
 	| "log-sink-option-conflict"
 	| "log-sink-rotate-failed"
 	| "log-sink-rotated"
+	/**
+	 * A test process called `truncate()` (behind `clearLatencyLog`) on a log
+	 * under the real `~/.pi-lens` and was refused (#3721). Folded in at READ time
+	 * like the other `log-sink-*` kinds: writing it through the sink would be a
+	 * write into the real log from the very process the refusal guards against.
+	 * One row per sink; `count` is the refused calls.
+	 */
+	| "log-sink-truncate-refused"
 	| "log-sink-write-failure"
+	| "lsp-adopted-root-evicted"
 	| "lsp-breaker"
 	| "lsp-capability-skip"
 	/**
@@ -504,6 +624,17 @@ export type DegradationKind =
 	/** An availability probe exceeded its advertised wall-clock budget (#2131). */
 	| "lsp-client-skipped-unavailable-command"
 	/**
+	 * #3968: a `lsp.servers.<id>.covers` claim was accepted WITHOUT runner-id
+	 * validation, because no runner registry had populated this process yet
+	 * (the first session's `loadLSPConfig` races the fire-and-forget dispatch
+	 * warm-up — the fail-open arm `clients/dispatch/known-runner-ids.ts`
+	 * names). Not an acceptance of unknown data without note: the claim is
+	 * recorded as unvalidated, the next session's load validates it, and the
+	 * record names exactly which claim it was. Subject `<file>\0<covers
+	 * pointer>`; once per session.
+	 */
+	| "lsp-covers-unvalidated"
+	/**
 	 * `loadWebTreeSitter()` (clients/deps/web-tree-sitter.js) rejected during
 	 * MODULE EVALUATION, not resolution (#1592). Node's ESM loader permanently
 	 * memoizes a module record that threw while evaluating, so re-importing
@@ -514,6 +645,14 @@ export type DegradationKind =
 	/** A retired LSP diagnostics call was redirected to lens_diagnostics. */
 	| "lsp-diagnostics-compatibility"
 	| "lsp-diagnostics-file-too-large"
+	/**
+	 * #3965: a `paths` request's directory expansion reached the shared
+	 * `MAX_FILES` bound, so later entries were not checked. Subject is the
+	 * workspace cwd; `recordDegradationOnce` keeps one row per workspace per
+	 * session, and the rendered result carries the same `(capped at N)`
+	 * disclosure so a caller never reads a truncated scan as a full answer.
+	 */
+	| "lsp-diagnostics-paths-cap"
 	| "lsp-diagnostics-timeout"
 	| "lsp-diagnostics-unsupported"
 	/**
@@ -543,6 +682,12 @@ export type DegradationKind =
 	 * `incrementDegradationCount` keeps one bounded entry per file.
 	 */
 	| "lsp-edit-stale-content"
+	/**
+	 * An idle LSP client was released by the shared idle-eviction timer (a
+	 * server whose registry `idleEviction` is `transparent`); it respawns on the
+	 * next request. Subject is the client key.
+	 */
+	| "lsp-idle-eviction"
 	| "lsp-liveness-probe-unsupported"
 	/**
 	 * A pi-lens `tool_call` handler threw. pi's `emitToolCall` has no
@@ -625,6 +770,10 @@ export type DegradationKind =
 	 * "hung" server is truly hung or just answering late.
 	 */
 	| "lsp-pull-unconfirmed"
+	/** A config registry decision dropped or admitted executable project data. */
+	| "lsp-registry-decision"
+	/** A host-created pi-agent staging root was declined as an LSP root. */
+	| "lsp-root-declined"
 	/**
 	 * The abandoned request behind an `lsp-pull-late-answer` timeout REJECTED
 	 * instead of answering (#1774) — e.g. a permanent server error such as
@@ -660,6 +809,8 @@ export type DegradationKind =
 	 * server and file for the same reason every other pull kind does.
 	 */
 	| "lsp-session-root-evicted"
+	/** A sibling LSP notification failed while touching a file. */
+	| "lsp-sibling-announcement"
 	/**
 	 * A language-server child process CLOSED without pi-lens having asked it to
 	 * (#1969). `clientShutdown()` sets `state.shutdownRequested`, so evictions
@@ -728,6 +879,12 @@ export type DegradationKind =
 	/** A complete MCP result exceeded the hard input budget (#2848). */
 	| "mcp-complete-result-budget-exceeded"
 	/**
+	 * An MCP `tools/call` carried argument keys the tool's schema does not
+	 * declare (#3749). Counted, not once: the subject is the tool name, the
+	 * group count is the exact number of such calls, the reason the latest keys.
+	 */
+	| "mcp-ignored-arguments"
+	/**
 	 * A shell-out linter/analyzer runner (knip, vulture, jscpd, trivy-config, …)
 	 * produced no usable output — empty stdout, unparseable stdout (e.g. a
 	 * rejected CLI flag that prints usage text instead of the expected report;
@@ -739,6 +896,25 @@ export type DegradationKind =
 	 * from the ledger alone.
 	 */
 	| "mode-suppression"
+	/**
+	 * #3677: the mutation bridge received a foreign `readGuardBranchEpoch` that
+	 * was not an integer `>= 0` — NaN, a negative, a fraction, or not a number.
+	 * (An integer above the live epoch is a dead session's capture, not this
+	 * kind: the read guard refuses it and nothing is queued.) It is ignored so
+	 * the `Math.max` merge cannot poison a legitimate deferred record with a
+	 * bogus epoch (a false block, since `Math.max` can only raise it), and the
+	 * ignored value is named. Once per session: a producer that sends one bad
+	 * epoch sends it on every call, and one row is the signal.
+	 */
+	| "mutation-bridge-invalid-branch-epoch"
+	/**
+	 * #4140: a v1 mutation-bridge producer (`ast_grep_replace`, LSP, observed
+	 * replay, a third-party v1 bridge) supplied a path outside the project or
+	 * one that could not be resolved, so its bookkeeping was not admitted. Once
+	 * per `<consumer>:out-of-scope`, the path in the reason. The v2 io-bridge
+	 * records the same drop as `io-bridge-mutate-dropped` and never this.
+	 */
+	| "mutation-bridge-out-of-scope"
 	| "native-read-clipped"
 	/**
 	 * #3524: the file moved between a native read's tool_call and its
@@ -764,6 +940,17 @@ export type DegradationKind =
 	| "observed-mutation-dir-cap"
 	/** An observed directory mutation exceeded the same-turn analysis fan-out. */
 	| "observed-mutation-dispatch-cap"
+	/**
+	 * #4137: a pending bash baseline was dropped before its `tool_result` took
+	 * it, so that call could not prove it authored its own writes and withheld
+	 * their blockers. Subject `overwrite`: a baseline with the same key was
+	 * replaced (a host with no distinct tool-call ids, or a reused id). Subject
+	 * `cap`: more baselines were pending than the store keeps, so the oldest
+	 * went. Subject `unsettled`: a baseline outlived its turn with no
+	 * `tool_result` (the call was blocked or aborted before it ran) and was
+	 * retired; a result that still arrives loses its authorship. Counted.
+	 */
+	| "opaque-baseline-lost"
 	/** Opaque mutation was analyzed without granting autonomous writer rights. */
 	| "opaque-mutation-ownership-boundary"
 	/** Opengrep completed with partial parsing warnings (#2943). */
@@ -830,6 +1017,8 @@ export type DegradationKind =
 	 * itself already landed; only the hash is missing. Subject is the file path.
 	 */
 	| "pipeline-post-write-hash-unavailable"
+	/** A mounted process bridge refused calls during a primary-session gap. */
+	| "process-bridge-unavailable"
 	/**
 	 * #2146, #3140: an incompatible process-singleton cell was discarded and
 	 * replaced with a fresh value (`clients/process-singletons.ts`,
@@ -841,6 +1030,15 @@ export type DegradationKind =
 	 */
 	| "process-singleton-reset"
 	/**
+	 * #3600: the projectDelta report carried diagnostics but its `generatedAt`
+	 * could not be parsed, so those rows fell back to the fold's `Date.now()`
+	 * instead of the report's own observation time. Recorded once per distinct
+	 * unparseable value (`recordDegradationOnce` keys on kind and subject), so
+	 * the fallback is visible rather than a silent freshness widening. Subject
+	 * is the unparseable raw value.
+	 */
+	| "project-delta-generatedat-unparseable"
+	/**
 	 * #3509: the project snapshot's cache-dir lock stayed held past its bounded
 	 * wait (or its directory failed), so an admission meta write was skipped or
 	 * a body promotion was dropped as a failed persist. Subject is the gz body
@@ -848,12 +1046,29 @@ export type DegradationKind =
 	 */
 	| "project-snapshot-lock-unavailable"
 	/**
+	 * #3789: serializing the project snapshot body on the main thread (the step
+	 * before the worker hand-off) threw, so the persist was dropped as failed.
+	 * Subject is the gz body path; reason carries the error message.
+	 */
+	| "project-snapshot-serialize-failed"
+	/**
 	 * The orphan backstop's OWN process-table scanner blew the scan timeout and
 	 * had to be tree-killed (#1864 review F3). Reason carries the kill verdict,
 	 * so a scanner that survived its own sweep's escalation — an orphan sweep
 	 * leaking an orphan — is visible rather than silent.
 	 */
 	| "query-predicates-invalid"
+	/**
+	 * #4131: another writer changed a file the agent authored without a read
+	 * (a bash write, a created file), or a mutation-bridge write landed on it
+	 * with no pre-write check (#4187 R2-4, the row's `writer: "bridge"`), so
+	 * its authorship ended (`ReadGuard.retireChangedAuthorship`) and its next
+	 * edit needs a read. Subject is the file; counted, the read-guard.log row
+	 * on the rising edge.
+	 */
+	/** Counted authorship-cap evictions; read-guard.log is rising-edge only. */
+	| "read-guard-authorship-cap"
+	| "read-guard-authorship-retired"
 	/**
 	 * #2524: the resource sampler's OWN process-table scanner (heartbeat CPU/RSS
 	 * sampling, `RESOURCE_SAMPLE_QUERY_TIMEOUT_MS` 2000ms — a much tighter and
@@ -899,6 +1114,13 @@ export type DegradationKind =
 	 * mismatch) is diagnosable from the ledger alone.
 	 */
 	| "read-guard-record-cap-trim"
+	/**
+	 * #3521: a deferred writer (the agent_settled sweep or the format, autofix
+	 * or LSP quick-fix drain) captured the read guard's branch epoch before a
+	 * `/tree`, and its `recordWritten` landed after it. The write is not
+	 * credited to the new branch, which never showed it. One subject, counted.
+	 */
+	| "read-guard-write-after-branch-move"
 	/**
 	 * The tier-3 cascade's outstanding-touch registry
 	 * (`clients/lsp/cascade-tier.ts`) reached its cap before a quiet-window
@@ -1062,11 +1284,60 @@ export type DegradationKind =
 	 * while the host is already exiting, so a second row would never be read.
 	 */
 	| "safe-spawn-signal-reraise-unsupported"
+	/**
+	 * A project scanner (vulture, jscpd) was started over a root that holds a
+	 * linked worktree it could not be told to leave out (#4117): the project's
+	 * own scanner config could not be read, so passing the exclusion would have
+	 * replaced it, or the worktree's path cannot be spelled in the scanner's
+	 * argument (a comma, a glob character). The scan then counts the worktree's
+	 * files as the project's. Subject is the scanner; counted, because the same
+	 * root is rescanned every session and turn.
+	 */
+	| "scan-worktree-exclusion-skipped"
 	/** A duplicate RPC session start was suppressed after its first full pass. */
 	/** A self-drift baseline could not be verified within its available evidence. */
 	| "self-drift-hash-budget-exhausted"
 	| "self-drift-unverifiable"
+	/**
+	 * #3819 r2: a demoted `/fork` or `/reload` start (a row-17 start held the
+	 * primary registration) discarded the hand-off slot left for it, so the
+	 * session cannot take it stale later. Once per start reason.
+	 */
+	| "session-scope-handoff-discarded"
+	/** An unclaimed successor hand-off exceeded its fixed retention window. */
+	| "session-scope-handoff-expired"
+	/**
+	 * #3881: a primary shutdown landed while its own `session_start` was still
+	 * in flight, before it adopted; it forwarded the slot left for that start
+	 * (or found none) and stashed nothing of its scope. Once per start reason.
+	 */
+	| "session-scope-handoff-interrupted"
+	/**
+	 * #3612: a `/fork` or `/reload` start found no hand-off slot left for its
+	 * session file (file-less: its predecessor's ticket, #3819), so it started from a sidecar or from nothing. Once per
+	 * start reason.
+	 */
+	| "session-scope-handoff-missed"
+	/**
+	 * #3611 (#3609 F1, decision A + C): a read-guard write was dropped because
+	 * its session scope retired, and its entry is still on its conversation's
+	 * branch. Subject `<retirement reason>:<site>` (`reload:deferred-format`),
+	 * so correct `/new` drops can be told from `/reload` and resume false
+	 * blocks. Counted.
+	 */
+	| "session-scope-read-dropped"
 	| "session-start-duplicate"
+	/**
+	 * #3662: a primary replacement shutdown left the process with no primary
+	 * and a successor pending. Subject `declined`: a `startup` start in that
+	 * gap was classified `concurrent-secondary` instead of taking the primary
+	 * slot. Subject `expired`: no successor started within
+	 * `SUCCESSOR_PENDING_TTL_MS`, so the marker stopped declining starts.
+	 * #3855: subject `not-the-successor`: a non-`startup` start in that gap
+	 * whose reason and key differ from the successor the shutdown named (a
+	 * subagent's own replacement) was classified `concurrent-secondary`.
+	 */
+	| "session-successor-pending"
 	/**
 	 * #3071: `clients/sgconfig.ts` evicted the oldest sg-config baseline
 	 * entries over its retained-entry cap. Subject is the baseline directory;
@@ -1186,6 +1457,21 @@ export type DegradationKind =
 	 * kind. Once per file per session; subject is the file path.
 	 */
 	| "startup-analyzer-disabled"
+	/** A project-size bound skipped the session-start warm pipeline (#4126). */
+	| "startup-warm-skipped"
+	/**
+	 * Automatic test ownership is indeterminate: filesystem identity or marker
+	 * I/O failed, a target walk hit its depth bound, or the dispatch walk missed.
+	 * Retain eligibility, once per complete hashed candidate/lookup identity;
+	 * metadata carries bounded display paths, the side, and the miss/error reason.
+	 */
+	| "test-checkout-identity-unavailable"
+	/**
+	 * Automatic discovery rejected a foreign-checkout candidate before its
+	 * first-match return. Once per hashed cwd/candidate/checkout identity;
+	 * eligible alternatives remain discoverable in the existing order/limits.
+	 */
+	| "test-discovery-foreign-checkout"
 	/**
 	 * #3071: a deferred turn-end test target hit `TEST_RUNNER_MAX_DEFERRALS`
 	 * and was retired from turn-end selection for the rest of the session —
@@ -1221,6 +1507,12 @@ export type DegradationKind =
 	 */
 	| "test-runner-failed-target-state"
 	/**
+	 * The final automatic-test gate rejected a positively foreign checkout.
+	 * Self and deferred targets may have no discovery/cache record; keep this
+	 * decision visible even with dbg disabled, once per hashed cwd/target/owner.
+	 */
+	| "test-target-foreign-checkout"
+	/**
 	 * The analyzer bootstrap stopped rebuilding after
 	 * `BOOTSTRAP_FAILURE_STRIKE_LIMIT` consecutive failed loads (#2467 review).
 	 * Recorded ONCE per session, because that is exactly what it reports: a
@@ -1248,8 +1540,11 @@ export type DegradationKind =
 	| "tool-cwd-resolution"
 	/** A loader request named a configured-disabled tool. */
 	| "tool-disabled"
-	/** Activation memory cannot key itself because the host supplied no session file. */
-	| "tool-set-session-file-unavailable"
+	| "tool-result-adopted-project"
+	/** A project edit was outside the session root and skipped analysis (#4218). */
+	| "tool-result-outside-project-root"
+	/** #3612: a lazy-tool activation arrived before its activation's session scope began. */
+	| "tool-set-scope-unavailable"
 	/**
 	 * A config file location or root key the user wrote is DEPRECATED and was
 	 * still honored (#2426). The deliberate opposite of `config-ignored`: the
@@ -1318,9 +1613,51 @@ export type DegradationKind =
 	 * every cycle is the resolver's whole correctness argument. See
 	 * `probe-home-state.ts`'s doc comment.
 	 */
-	| "ts-idle-eviction"
 	/** The host context could not provide a stable session identity (#2815). */
 	| "turn-context-identity-fallback"
+	/**
+	 * #3901: the turn-end cap cut an item-bearing advisory (knip, dead-code,
+	 * call-graph impact) that showed only items already re-offered once, or the
+	 * per-session parked-lane bound evicted a lane, so those items were NOT
+	 * parked again. A part showing a new item is parked and counted under
+	 * `turn-end-sections-held`. Counted; subject is the family
+	 * (`knip` | `dead-code` | `call-graph`), a fixed set.
+	 */
+	| "turn-end-advisory-carry-dropped"
+	/**
+	 * A turn_end knip scan did not fit the budget in a root that has linked
+	 * worktrees nested under it (#3872): knip walks them as project files
+	 * because the project never ignored them. The subject is the scan root.
+	 * Counted, because a busy session defers once per turn; the root's `knip`
+	 * latency rows carry `nestedWorktrees` for each turn.
+	 */
+	| "turn-end-knip-nested-worktrees"
+	/**
+	 * turn_end did not run knip in a checkout whose edit it was handed (#3872):
+	 * the per-turn root cap was reached, or an earlier scan had already spent
+	 * the turn_end budget. The subject is the reason (`root-cap` | `budget`);
+	 * counted, because the number of skipped roots is the observability question
+	 * and a busy orchestrator session would otherwise write one row per turn.
+	 */
+	| "turn-end-knip-root-skipped"
+	/**
+	 * #3813: the turn-end cap cut a part whose producer holds one-shot state
+	 * (a past-EOF retirement, a dependency-drift delivery count, a cascade
+	 * run, a settled runner result, a late auxiliary pair), so that state
+	 * stayed pending for the next turn instead of being consumed unseen. One
+	 * counted row per turn that held anything, never one per held part; the
+	 * turn's `heldSections` latency field carries the per-turn number.
+	 */
+	| "turn-end-sections-held"
+	/**
+	 * turn_end started no tests for a target in a linked worktree (#3871). The
+	 * subject is the reason: `no-runner-install` (the worktree has no
+	 * `node_modules/.bin`, venv or `vendor/bin` of its own, so running would
+	 * fetch through `npx` or use another environment). Counted, because a plegma
+	 * session edits many fresh worktrees and would otherwise write one row per
+	 * turn.
+	 */
+	| "turn-end-test-root-skipped"
 	/**
 	 * #2504 review round 8 (S1): a carried-forward deferred file entry was
 	 * dropped from an IN-BAND `turn_end` publish (`clients/actionable-warnings.ts`)
@@ -1364,14 +1701,28 @@ export type DegradationKind =
 	 * re-observes the file.
 	 */
 	| "wasm-abort"
+	/** #3834: a retired compiled query stayed alive for an active scan. Counted. */
+	| "wasm-query-batch-disposal-deferred"
 	/**
-	 * #2626: `resources_discover` (#205) resolved `<packageRoot>/skills` to a
-	 * directory that is absent, unreadable, or holds no `SKILL.md` — pi then
-	 * registers zero skills with no extension error and no stderr. Fires on
-	 * an installed copy missing `skills/`, or on the entry file having been
-	 * copied out of the package tree by a managed extension cache (so the
-	 * nearest `package.json` is the cache's own). Subject is the resolved
-	 * `skills/` path; see `clients/skills-resolver.ts`.
+	 * #3605: web-tree-sitter trapped (`memory access out of bounds`, `table
+	 * index is out of bounds`, ...) while parsing or querying one file. That
+	 * file degrades to not-parsed, and the parsers and tree cache are
+	 * recycled. Counted; past `WASM_TRAP_BUDGET` the next trap becomes a
+	 * `wasm-abort`. Subject is always `web-tree-sitter`.
+	 */
+	| "wasm-trap"
+	/**
+	 * #2626: the `resources_discover` handler (#205) resolves
+	 * `<packageRoot>/skills` and checks it — absent, unreadable, or holding no
+	 * `SKILL.md`. Before #1416 it also contributed the resolved path to pi, so
+	 * this record meant pi registered zero skills with no extension error and
+	 * no stderr; the contribution is gone, so it now reports only the
+	 * entry-relative health of that directory (the `pi.skills` manifest is the
+	 * registrar and may still deliver the skills). Fires on an installed copy
+	 * missing `skills/`, or on the entry file having been copied out of the
+	 * package tree by a managed extension cache (so the nearest `package.json`
+	 * is the cache's own). Subject is the resolved `skills/` path; see
+	 * `clients/skills-resolver.ts`.
 	 */
 	| "web-tree-sitter-load-failed"
 	| "widget-disposition-reconcile-fallback"
@@ -1514,19 +1865,21 @@ export function recordDegradation(record: DegradationRecord): boolean {
 }
 
 /** Record at most once per kind/subject during the current session. */
-export function recordDegradationOnce(record: DegradationRecord): void {
+export function recordDegradationOnce(record: DegradationRecord): boolean {
 	try {
 		const kind = boundedKind(record.kind);
 		const subject = subjectForLedger(record.subject);
 		const key = `${kind}\0${subject}`;
-		if (onceKeys.has(key)) return;
+		if (onceKeys.has(key)) return false;
 		onceKeys.add(key);
 		if (recordDegradation({ kind, subject, reason: record.reason })) {
 			logDurableDegradation(kind, subject, 1, record.metadata, record.code);
 		}
+		return true;
 	} catch (error) {
 		debugLedgerFailure("record-once", error);
 		// Telemetry must never break the observed path.
+		return false;
 	}
 }
 
@@ -1734,6 +2087,25 @@ export function getDegradationSummary(): DegradationGroup[] {
 			})),
 		});
 	}
+	// #3721, same read-time fold: a refused truncation of a real-home log by a
+	// test process is visible without writing a row through that sink.
+	const truncateRefusals = getSinkTruncateRefusals();
+	if (truncateRefusals.length > 0) {
+		summary.push({
+			kind: "log-sink-truncate-refused",
+			count: truncateRefusals.reduce(
+				(total, sink) => total + sink.refusedCount,
+				0,
+			),
+			droppedCount: 0,
+			latestReasons: truncateRefusals.map((sink) => ({
+				subject: truncateForLedger(sink.file),
+				reason: truncateForLedger(
+					`${sink.refusedCount} truncate call(s) refused: a test process aimed them at the real ~/.pi-lens`,
+				),
+			})),
+		});
+	}
 	// #2146, same read-time fold: process-singleton resets live in the leaf
 	// module's own bounded log. One entry per family, so this group's count is
 	// the number of families this build could not adopt, never an event tally.
@@ -1762,7 +2134,7 @@ export function getDegradationSummary(): DegradationGroup[] {
 				{
 					subject: truncateForLedger(probeHomeRedirect.probeHome),
 					reason: truncateForLedger(
-						`PI_LENS_HOME unset with cwd in an agent worktree/tmp probe context (${probeHomeRedirect.cwd}), or PILENS_PROBE=1 forced it; LOGS redirected away from the real home directory (tools, bin and instances.json are unaffected)`,
+						"PI_LENS_HOME unset with cwd in an agent worktree/tmp probe context, or PILENS_PROBE=1 forced it; LOGS redirected away from the real home directory (tools, bin and instances.json are unaffected)",
 					),
 				},
 			],
@@ -1818,12 +2190,18 @@ const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	// doc comment above) and is frequent/self-healing by design — a `⚠` would
 	// cry wolf on the sampler's ordinary best-effort data loss.
 	"resource-sampler-scanner-escalated",
+	// #1129: an ephemeral data dir for a tmp checkout is decision B working.
+	"data-dir-ephemeral",
 	// #2874: a successful legacy-directory migration is an upgrade tally, not
 	// a call to action. The hash-only subject avoids exposing the project path.
 	"data_dir_migrated",
 	// #3498: a queued registry removal that landed is the retry working; the
 	// `instance-registry-deregister-queued` beside it is the line that stands out.
 	"instance-registry-deregister-landed",
+	// #3813: a part the cap cut was kept pending for the next turn, which is
+	// the cap and its re-offer working together; the agent's message carries
+	// the "N held" note, and the ledger needs only the tally.
+	"turn-end-sections-held",
 ]);
 
 export function renderDegradationLines(

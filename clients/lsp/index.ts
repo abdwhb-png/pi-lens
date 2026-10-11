@@ -26,9 +26,9 @@ import {
 	recordDegradation,
 	recordDegradationOnce,
 } from "../degradation-ledger.js";
+import { assertInstallAllowed } from "../project-trust.js";
 import {
 	isLspSpawnAllowedByTrust,
-	assertInstallAllowed,
 	projectTrustDenialReason,
 } from "../project-trust.js";
 import { shouldPreferPullOnlyDiagnostics } from "../lsp-budget.js";
@@ -45,6 +45,7 @@ import {
 import {
 	DocumentDriftTracker,
 	fingerprintDocumentContent,
+	type DriftDisposition,
 	type DriftSweepResult,
 } from "./document-drift.js";
 import {
@@ -92,22 +93,49 @@ import {
 	getSessionRootsForTelemetry,
 	isOutsideAllSessionRoots,
 } from "./session-roots.js";
-import { getProcessSingleton } from "../process-singletons.js";
+import {
+	findLocalBinUpwards,
+	isProjectLocalBinPath,
+} from "../package-manager.js";
+import {
+	resolveAnalysisRoot,
+	resolveAnalysisRootPath,
+} from "../analysis-root.js";
+
+import {
+	configureLspServiceLifecycle,
+	getOwnedLspService,
+	peekOwnedLspService,
+	resetOwnedLspService,
+} from "./service-singleton.js";
+import { groupFilesByPrimaryServer, runPerServerGroups } from "./grouping.js";
+export { groupFilesByPrimaryServer, runPerServerGroups } from "./grouping.js";
+import { isEphemeralCheckoutRoot } from "../ephemeral-root.js";
 import { getLanguageId } from "./language.js";
 import {
 	getReverseDepsFromIndex,
 	loadReverseDependencyIndexFromSnapshot,
 } from "../reverse-deps.js";
-import type { LSPServerInfo } from "./server.js";
+import { isSameOrWithin, type LSPServerInfo } from "./server.js";
 import {
-	LSP_SERVERS,
+	refuseUntrustedLspExecution,
+	withLspProjectCodePermission,
+} from "./launch.js";
+import {
 	enforceLspRootCeiling,
+	getServerById,
 	hasProjectBoundaryMarker,
 	isDirectLspCommandTemporarilyUnavailable,
 	resetClassicTsRepairGuard,
 	resetLspLaunchAvailabilityGeneration,
 	resolveLspServerCwd,
 } from "./server.js";
+import { isAuxiliary, serverTraits } from "./server-traits.js";
+import {
+	auxWaitBudgetMs,
+	readEnvAuxGraceMs,
+	DEFAULT_AUX_GRACE_CEILING_MS,
+} from "./auxiliary-lifecycle.js";
 import {
 	classifyCascadeWaitTier,
 	classifyServerWaitTier,
@@ -135,6 +163,9 @@ const AUX_WAIT_DEMOTION_THRESHOLD = 5;
 const AUX_WAIT_DEMOTION_RATIO = 0.9;
 const AUX_WAIT_REPROMOTION_THRESHOLD = 5;
 const AUX_WAIT_REPROMOTION_RATIO = 0.5;
+/** Phase A bound: adopted roots are foreign workspaces, not session roots. */
+const ADOPTED_ROOT_CAP = 2;
+const ADOPTED_ROOT_IDLE_EVICT_MS = 60_000;
 
 /**
  * Request-local attribution for no-filePath workspace queries. The fixed site
@@ -410,16 +441,40 @@ async function runRenameNotify(
 	}
 }
 const DEFAULT_LSP_CLIENT_CEILING = 24;
-const DEFAULT_TS_IDLE_EVICT_MS = 20 * 60_000;
+const DEFAULT_IDLE_EVICT_MS = 20 * 60_000;
+const DEFAULT_EPHEMERAL_IDLE_EVICT_MS = 60_000;
 
-export function getTypeScriptIdleEvictMs(): number {
+/**
+ * #3645: the idle window shared by every server whose registry policy is
+ * `transparent`. `PI_LENS_LSP_IDLE_EVICT_MS` is the generic spelling; the
+ * original `PI_LENS_TS_IDLE_EVICT_MS` keeps its meaning and is consulted when
+ * the generic one is unset or invalid.
+ */
+export function getLspIdleEvictMs(): number {
+	for (const name of [
+		"PI_LENS_LSP_IDLE_EVICT_MS",
+		"PI_LENS_TS_IDLE_EVICT_MS",
+	]) {
+		const parsed = Number.parseInt(process.env[name] ?? "", 10);
+		if (Number.isSafeInteger(parsed) && parsed > 0) return parsed;
+	}
+	return DEFAULT_IDLE_EVICT_MS;
+}
+
+function getEphemeralLspIdleEvictMs(): number {
 	const parsed = Number.parseInt(
-		process.env.PI_LENS_TS_IDLE_EVICT_MS ?? "",
+		process.env.PI_LENS_EPHEMERAL_LSP_IDLE_EVICT_MS ?? "",
 		10,
 	);
 	return Number.isSafeInteger(parsed) && parsed > 0
 		? parsed
-		: DEFAULT_TS_IDLE_EVICT_MS;
+		: DEFAULT_EPHEMERAL_IDLE_EVICT_MS;
+}
+
+export function getLspIdleEvictMsForRoot(root: string): number {
+	return isEphemeralCheckoutRoot(root)
+		? getEphemeralLspIdleEvictMs()
+		: getLspIdleEvictMs();
 }
 
 export function getLspClientCeiling(): number {
@@ -526,50 +581,8 @@ function readTsserverSyncGraceMs(): number {
 	if (!Number.isFinite(parsed) || parsed < 0) return 300;
 	return parsed;
 }
-/**
- * Read the `PI_LENS_AUX_GRACE_MS` env override at call time (not module
- * load time) so tests can set it per-case. Controls the CEILING on how long
- * auxiliary-role promises (opengrep, ast-grep, zizmor, …) are waited after
- * all primary-role promises have settled, in both getDiagnostics
- * (raceToCompletion) and the touchFile push wait (#1458 S2 — the two lanes
- * share the same declared-budget-capped-by-ceiling shape). Each auxiliary
- * still gets only its OWN declared `aggregateWaitMs` up to this ceiling —
- * this is not a flat per-touch wait. Returns undefined when the var is
- * absent; each call site then supplies its own default ceiling (touchFile:
- * 2000ms; getDiagnostics: 2000ms — see the `?? 2000` at each call site).
- */
-function readEnvAuxGraceMs(): number | undefined {
-	const raw = process.env.PI_LENS_AUX_GRACE_MS;
-	if (raw === undefined) return undefined;
-	const parsed = Number.parseInt(raw, 10);
-	if (!Number.isFinite(parsed) || parsed < 0) return undefined;
-	return parsed;
-}
-const DEFAULT_AUX_GRACE_CEILING_MS = 2000;
-const MAX_ADAPTIVE_AUX_GRACE_CEILING_MS = 8000;
-const ADAPTIVE_AUX_GRACE_MARGIN_MS = 500;
-
-export function auxWaitBudgetMs(
-	serverId: string,
-	isCold: boolean,
-	configuredCeilingMs: number | undefined,
-	declaredWaitMs: number,
-): number {
-	if (configuredCeilingMs !== undefined || !isCold) {
-		return Math.min(
-			declaredWaitMs,
-			configuredCeilingMs ?? DEFAULT_AUX_GRACE_CEILING_MS,
-		);
-	}
-	const observedSpawnMs = getSuccessfulLspSpawnDurationMs(serverId);
-	if (observedSpawnMs === undefined || observedSpawnMs <= 0) {
-		return Math.min(declaredWaitMs, DEFAULT_AUX_GRACE_CEILING_MS);
-	}
-	return Math.min(
-		MAX_ADAPTIVE_AUX_GRACE_CEILING_MS,
-		Math.max(declaredWaitMs, observedSpawnMs + ADAPTIVE_AUX_GRACE_MARGIN_MS),
-	);
-}
+/** Servers named in one no-client `lsp_touch_file` row (#3873 O9). */
+const MAX_TOUCH_CANDIDATES = 8;
 const DIAGNOSTICS_SEMANTIC_SETTLE_THRESHOLD_MS = Math.max(
 	0,
 	Number.parseInt(
@@ -759,11 +772,14 @@ export interface LSPTouchFileOptions {
 	 * #3405: this touch's content IS the file's saved on-disk state and the
 	 * caller wants that file diagnosed now, so each server whose
 	 * `textDocumentSync.save` asked for it gets a `textDocument/didSave` after
-	 * its content notification lands. Two callers set it, both one-file and
+	 * its content notification lands. Three callers set it, each one-file and
 	 * caller-initiated: the post-write sync (`clients/pipeline.ts`
-	 * `resyncLspFile`) and the explicit `lsp_diagnostics` query
+	 * `resyncLspFile`), the held-only resync of a file the deferred drain wrote
+	 * (`resyncHeldLspDocument`, #3828 r3: through the drift queue, for that one
+	 * path only) and the explicit `lsp_diagnostics` query
 	 * (`tools/lsp-diagnostics.ts`). Warm-ups, cascade neighbour reads, the drift
-	 * resync and the workspace sweep deliberately leave it unset — a save is a
+	 * backstop's own resyncs, the importers a Git-change resync adds and the
+	 * workspace sweep deliberately leave it unset — a save is a
 	 * recompile trigger on a save-triggered server (Expert schedules a whole
 	 * project compile), so one per background read would be a storm, and none of
 	 * those callers is answering "is this file clean right now".
@@ -963,27 +979,6 @@ export interface LSPWorkspaceDiagnosticResult {
  * distinction (the workspace-pull fast path below) can act on it; callers
  * that don't (a plain per-file touch) can ignore it.
  */
-export function groupFilesByPrimaryServer(
-	files: readonly string[],
-): Array<{ files: string[]; multiServer: boolean }> {
-	const byServer = new Map<string, { files: string[]; multiServer: boolean }>();
-	for (const filePath of files) {
-		const servers = getServersForFileWithConfig(filePath);
-		const primary = servers[0]?.id ?? "none";
-		const group = byServer.get(primary);
-		if (group) {
-			group.files.push(filePath);
-			if (servers.length > 1) group.multiServer = true;
-		} else {
-			byServer.set(primary, {
-				files: [filePath],
-				multiServer: servers.length > 1,
-			});
-		}
-	}
-	return [...byServer.values()];
-}
-
 /**
  * #645: tracks, for ONE `runWorkspaceDiagnostics` sweep, which server ids
  * have already had at least one file pay the full `aggregateWaitMs` wait
@@ -1043,29 +1038,6 @@ export function createSweepIndexGate(): SweepIndexGate {
  * which only applies to a single-server group) can still act on it; a
  * caller that doesn't can just destructure `.files`.
  */
-export async function runPerServerGroups<
-	G extends { files: readonly string[]; multiServer?: boolean },
->(
-	groups: readonly G[],
-	concurrency: number,
-	processGroup: (group: G) => Promise<void>,
-	signal?: AbortSignal,
-): Promise<void> {
-	let nextGroup = 0;
-	const workers = Math.min(Math.max(1, concurrency), groups.length);
-	await Promise.all(
-		Array.from({ length: workers }, async () => {
-			while (!signal?.aborted) {
-				const gi = nextGroup;
-				nextGroup += 1;
-				if (gi >= groups.length) break;
-				await processGroup(groups[gi]!);
-			}
-			return true;
-		}),
-	);
-}
-
 const WORKSPACE_DIAGNOSTICS_CONCURRENCY = 8;
 
 // #621: a single-server group (the common case — one language, one server)
@@ -1130,7 +1102,7 @@ function primaryServerWaitFloorMs(
 	maxWaitMs?: number,
 ): number {
 	const serverWaitOverrideMs = getServersForFileWithConfig(filePath)
-		.filter((s) => s.role !== "auxiliary")
+		.filter((s) => !isAuxiliary(s))
 		.reduce((max, server) => Math.max(max, server.clientWaitTimeoutMs ?? 0), 0);
 	return Math.max(maxWaitMs ?? 0, serverWaitOverrideMs);
 }
@@ -1200,35 +1172,6 @@ export type NotifyStallDemotionReason =
 			cpuVerdict?: "flat" | "busy" | "unmeasured";
 			cpuPercent?: number | null;
 	  };
-
-// #1714: how many document notifies one auxiliary may hold UNACKNOWLEDGED
-// before the next notify has to prove the server drained its input.
-//
-// #1459's gate bounds CONCURRENT writes to one per auxiliary. That stops a
-// simultaneous fan-out, but a `lens_diagnostics mode=full` sweep is mostly
-// SEQUENTIAL — one file after another inside a server group (#387) — so every
-// write is alone in flight and the gate never engages. Each write still resolves
-// as soon as the pipe accepts the bytes, not when the scanner has read them, so
-// the sweep can hand a single-threaded scanner hundreds of full re-parses faster
-// than it consumes them. ast-grep stalled and had to be force-killed twice in
-// two full-scan exposures. Counting unacknowledged notifies bounds the BACKLOG
-// the sweep is allowed to build, which pipe-level backpressure alone does not.
-const AUX_NOTIFY_INFLIGHT_DEFAULT = 8;
-
-function auxNotifyInflightLimit(info: LSPServerInfo): number {
-	const perServer = info.notifyInflightLimit;
-	if (
-		typeof perServer === "number" &&
-		Number.isFinite(perServer) &&
-		perServer > 0
-	) {
-		return Math.floor(perServer);
-	}
-	const raw = Number(process.env.PI_LENS_LSP_AUX_NOTIFY_INFLIGHT);
-	return Number.isFinite(raw) && raw > 0
-		? Math.floor(raw)
-		: AUX_NOTIFY_INFLIGHT_DEFAULT;
-}
 
 // Budget for one project-wide `workspace/diagnostic` pull (#387 Item 2). Larger
 // than a per-file wait — it's a single request but scans the whole program —
@@ -1326,8 +1269,14 @@ async function collectWorkspaceDiagnosticFiles(
 // --- Service ---
 
 export class LSPService {
+	private static readonly MAX_SIBLING_ANNOUNCEMENTS = 1024;
 	private readonly sessionCwd: string | undefined;
 	private state: LSPState;
+	/** Content hashes already announced to a sibling root in this service. */
+	private readonly siblingAnnouncementHashes = new BoundedFifoMap<
+		string,
+		string
+	>(LSPService.MAX_SIBLING_ANNOUNCEMENTS);
 	private readonly workspaceProbeLogged = new Set<string>();
 	/** Per-service immutable root-boundary verdicts; root detectors cache hits too. */
 	private readonly projectBoundaryCache = new Map<string, Promise<boolean>>();
@@ -1558,6 +1507,9 @@ export class LSPService {
 	);
 	/** LRU clock for capacity eviction, keyed by the canonical server/root key. */
 	private readonly clientLastUsedAt = new Map<string, number>();
+	/** LRU of foreign project roots; kept apart from the session-root registry. */
+	private readonly adoptedRootLastUsedAt = new Map<string, number>();
+	private readonly adoptedClientKeys = new Set<string>();
 	/**
 	 * Manager-owned use leases close the acquisition/use gap that `isBusy()`
 	 * cannot see: a caller may hold a selected client before its first request has
@@ -1565,12 +1517,12 @@ export class LSPService {
 	 */
 	private readonly clientLeases = new Map<string, number>();
 	/**
-	 * Per-root idle eviction for TypeScript's large, rebuildable program graph.
+	 * Per-root idle eviction for servers whose registry policy is `transparent`.
 	 * Timers are unref'd so an idle language service cannot keep a one-shot host
 	 * alive, and are removed before shutdown so a concurrent request rebuilds
 	 * instead of receiving the retiring client.
 	 */
-	private readonly typeScriptIdleTimers = new Map<
+	private readonly idleEvictionTimers = new Map<
 		string,
 		ReturnType<typeof setTimeout>
 	>();
@@ -1664,6 +1616,68 @@ export class LSPService {
 		});
 	}
 
+	private analysisRootModeForFile(filePath: string): string {
+		const roots = getSessionRootsForTelemetry(128);
+		if (this.sessionCwd) roots.push(this.sessionCwd);
+		let adopted = false;
+		for (const root of new Set(roots)) {
+			const mode = resolveAnalysisRoot(filePath, root);
+			if (mode === "session" || mode === "linked-worktree") return mode;
+			adopted ||= mode === "adopted";
+		}
+		return adopted ? "adopted" : "none";
+	}
+
+	private fileIsOutsideRegisteredRoots(filePath: string): boolean {
+		const roots = getSessionRootsForTelemetry(128);
+		if (roots.length === 0) return isOutsideAllSessionRoots(filePath);
+		return !roots.some((root) => isSameOrWithin(root, filePath));
+	}
+
+	private admitAdoptedRoot(root: string, filePath: string): boolean {
+		if (this.analysisRootModeForFile(filePath) !== "adopted") return false;
+		const normalized = normalizeMapKey(root);
+		const liveRoots = new Set<string>();
+		for (const key of this.state.clients.keys()) {
+			if (this.adoptedClientKeys.has(key))
+				liveRoots.add(key.slice(key.indexOf(":") + 1));
+		}
+		for (const root of this.adoptedRootLastUsedAt.keys()) {
+			if (!liveRoots.has(root)) this.adoptedRootLastUsedAt.delete(root);
+		}
+		if (liveRoots.has(normalized)) {
+			this.adoptedRootLastUsedAt.set(normalized, Date.now());
+			return true;
+		}
+		if (this.adoptedRootLastUsedAt.size < ADOPTED_ROOT_CAP) {
+			this.adoptedRootLastUsedAt.set(normalized, Date.now());
+			return true;
+		}
+		this.adoptedRootLastUsedAt.set(normalized, Date.now());
+		const victim = [...this.adoptedRootLastUsedAt.keys()]
+			.sort(
+				(a, b) =>
+					(this.adoptedRootLastUsedAt.get(a) ?? 0) -
+					(this.adoptedRootLastUsedAt.get(b) ?? 0),
+			)
+			.find((candidate) => candidate !== normalized);
+		if (!victim) return true;
+		this.adoptedRootLastUsedAt.delete(victim);
+		for (const [key, client] of this.state.clients) {
+			if (!this.adoptedClientKeys.has(key) || !key.endsWith(`:${victim}`))
+				continue;
+			if ((this.clientLeases.get(key) ?? 0) > 0) continue;
+			this.retireClient(key);
+			void client.shutdown({ reason: "adopted-root-lru" }).catch(() => {});
+		}
+		incrementDegradationCount({
+			kind: "lsp-adopted-root-evicted",
+			subject: victim,
+			reason: `adopted root cap ${ADOPTED_ROOT_CAP} evicted ${victim}`,
+		});
+		return true;
+	}
+
 	/**
 	 * Resolve one server's client identity root. Root selection is hard-bounded
 	 * by the session cwd, then config-only nested roots reuse an already-hosted
@@ -1681,13 +1695,29 @@ export class LSPService {
 			onRootFailure,
 		);
 		if (!candidate) return undefined;
+		const mode = this.analysisRootModeForFile(filePath);
+		if (mode === "adopted") {
+			const classifierRoot = resolveAnalysisRootPath(
+				filePath,
+				this.sessionCwd ?? process.cwd(),
+			);
+			if (
+				!classifierRoot ||
+				normalizeMapKey(classifierRoot) !== normalizeMapKey(candidate)
+			)
+				return undefined;
+		}
 		// #2052: a file outside EVERY initialized session cwd gets no client at
 		// all. The ceiling below is unchanged (`process.cwd()`, as before this
 		// issue) and still only clamps files that are actually inside it —
 		// `enforceLspRootCeiling` returns the root untouched for an out-of-ceiling
 		// file. So this gate is the ONLY new refusal, and it consults the
 		// registry, not a single cwd.
-		if (isOutsideAllSessionRoots(filePath)) return undefined;
+		if (
+			this.fileIsOutsideRegisteredRoots(filePath) &&
+			this.analysisRootModeForFile(filePath) !== "adopted"
+		)
+			return undefined;
 		const root = enforceLspRootCeiling(candidate, process.cwd(), filePath);
 		if (normalizeMapKey(root) === normalizeMapKey(process.cwd())) return root;
 
@@ -1735,6 +1765,65 @@ export class LSPService {
 		return this.isDestroyed;
 	}
 
+	/**
+	 * Keep live same-server clients in sibling package roots current. A
+	 * didOpen/didChange only updates the client that owns the touched root, but
+	 * TypeScript importers in another package can retain the old module graph.
+	 * The notification uses each client's existing #271 watch queue.
+	 */
+	private announceToSiblings(
+		filePath: string,
+		content: string,
+		contentHash = this.hashContent(content),
+	): Promise<void> {
+		const normalizedPath = normalizeMapKey(filePath);
+		if (this.siblingAnnouncementHashes.get(normalizedPath) === contentHash) {
+			return Promise.resolve();
+		}
+		return Promise.all(
+			getServersForFileWithConfig(filePath).map((server) =>
+				this.resolveServerRoot(server, filePath).then((root) => {
+					if (!root) return false;
+					const ownKey = `${server.id}:${normalizeMapKey(root)}`;
+					return this.notifyLiveClientsForServer(
+						server.id,
+						filePath,
+						2,
+						ownKey,
+						false,
+					);
+				}),
+			),
+		).then(() => {
+			// Record attempted content even when every sibling is absent. A respawned
+			// client must receive a later A→B→A edit (#4156 M1).
+			this.siblingAnnouncementHashes.set(normalizedPath, contentHash);
+		});
+	}
+
+	private notifyLiveClientsForServer(
+		serverId: string,
+		filePath: string,
+		type: number,
+		ownKey: string,
+		includeOwn: boolean,
+	): boolean {
+		let notified = false;
+		const prefix = `${serverId}:`;
+		for (const [key, client] of this.state.clients) {
+			if (
+				!key.startsWith(prefix) ||
+				(!includeOwn && key === ownKey) ||
+				!client.isAlive()
+			) {
+				continue;
+			}
+			client.notify.watchedFileChange(filePath, type);
+			notified = true;
+		}
+		return notified;
+	}
+
 	private async withClientSpawnGate<T>(
 		operation: () => Promise<T>,
 	): Promise<T> {
@@ -1777,7 +1866,7 @@ export class LSPService {
 	private async acquireClientLeases(
 		entries: readonly SpawnedServer[],
 		filePath: string,
-	): Promise<string[] | undefined> {
+	): Promise<{ key: string; server: LSPServerInfo }[] | undefined> {
 		const keys = await Promise.all(
 			entries.map((entry) => this.clientKeyFor(entry, filePath)),
 		);
@@ -1797,11 +1886,11 @@ export class LSPService {
 			for (const [key] of keyed) {
 				this.clientLeases.set(key, (this.clientLeases.get(key) ?? 0) + 1);
 			}
-			return keyed.map(([key]) => key);
+			return keyed.map(([key, entry]) => ({ key, server: entry.info }));
 		});
 	}
 
-	private releaseClientLease(key: string): void {
+	private releaseClientLease(key: string, server: LSPServerInfo): void {
 		const remaining = (this.clientLeases.get(key) ?? 1) - 1;
 		if (remaining > 0) {
 			this.clientLeases.set(key, remaining);
@@ -1810,7 +1899,7 @@ export class LSPService {
 		this.clientLeases.delete(key);
 		if (this.state.clients.has(key)) {
 			this.clientLastUsedAt.set(key, Date.now());
-			this.scheduleTypeScriptIdleEviction(key);
+			this.scheduleIdleEviction(key, server);
 		}
 	}
 
@@ -1828,7 +1917,7 @@ export class LSPService {
 			try {
 				return await use(entry);
 			} finally {
-				this.releaseClientLease(leaseKey);
+				this.releaseClientLease(leaseKey, entry.info);
 			}
 		}
 		return undefined;
@@ -1868,23 +1957,54 @@ export class LSPService {
 		}
 
 		const [victimKey, victimClient] = victim;
+		// Released BEFORE the awaited shutdown so a waiter never parks on a client
+		// that is already going down; retireClient's own release is then a no-op.
 		this.releaseOutstandingAuxNotifyWrite(victimKey);
 		await victimClient.shutdown({ reason: "client_ceiling_lru" });
-		this.state.clients.delete(victimKey);
-		this.state.clientSpawnedAt.delete(victimKey);
-		this.forgetReadiness(victimKey);
-		this.clientLastUsedAt.delete(victimKey);
-		this.clearTypeScriptIdleTimer(victimKey);
+		this.retireClient(victimKey);
 		logSessionStart(
 			`lsp client ceiling ${getLspClientCeiling()}: evicted idle LRU ${victimKey}`,
 		);
 		return true;
 	}
 
-	private clearTypeScriptIdleTimer(key: string): void {
-		const timer = this.typeScriptIdleTimers.get(key);
+	private clearIdleEvictionTimer(key: string): void {
+		const timer = this.idleEvictionTimers.get(key);
 		if (timer) clearTimeout(timer);
-		this.typeScriptIdleTimers.delete(key);
+		this.idleEvictionTimers.delete(key);
+	}
+
+	/**
+	 * #3585: the ONE retirement of a client generation, used by capacity
+	 * eviction, idle eviction, notify-stall demotion and the
+	 * dead-client respawn. Everything keyed to the retired client's lifetime is
+	 * dropped here, so a replacement starts cold: a path that forgot one entry
+	 * was the defect shape behind #3502 (readiness) and #3537 (timeout streak).
+	 * Synchronous on purpose: idle eviction publishes the cold state before it
+	 * awaits teardown. Callers keep only what differs per path (the shutdown
+	 * call and its ordering, breaker cooldowns, demotion stamps).
+	 */
+	private retireClient(key: string): void {
+		this.releaseOutstandingAuxNotifyWrite(key);
+		this.state.clients.delete(key);
+		this.state.clientSpawnedAt.delete(key);
+		this.forgetReadiness(key);
+		this.clientLastUsedAt.delete(key);
+		if (this.adoptedClientKeys.delete(key)) {
+			const root = key.slice(key.indexOf(":") + 1);
+			if (
+				![...this.adoptedClientKeys].some((candidate) =>
+					candidate.endsWith(`:${root}`),
+				)
+			)
+				this.adoptedRootLastUsedAt.delete(root);
+		}
+		this.clearIdleEvictionTimer(key);
+		// #1714: the backlog count describes a process that no longer exists.
+		this.auxNotifyInflight.delete(key);
+		// #3585: a per-write latency estimate belongs to a client generation; a
+		// replacement inheriting it would be priced by its predecessor's wedge window.
+		this.auxNotifyDrainLatencyEwma.delete(key);
 	}
 
 	/** Release a notify token and its timer when its client generation retires. */
@@ -1899,15 +2019,24 @@ export class LSPService {
 		current.resolveSettled();
 	}
 
-	private scheduleTypeScriptIdleEviction(key: string): void {
-		if (!key.startsWith("typescript:")) return;
+	private scheduleIdleEviction(key: string, server: LSPServerInfo): void {
+		// The registry owns this policy. Unmeasured and resident servers stay resident.
+		if (
+			server.idleEviction !== "transparent" &&
+			!this.adoptedClientKeys.has(key)
+		)
+			return;
 		// Pressure-gating these timers would require a separate reconciliation pass
 		// when the manager crosses the threshold; keep ownership simple and use the
 		// warm-LSP-friendly 20-minute default instead.
-		this.clearTypeScriptIdleTimer(key);
+		this.clearIdleEvictionTimer(key);
 		const lastUsedAt = this.clientLastUsedAt.get(key) ?? Date.now();
+		const root = key.slice(key.indexOf(":") + 1);
+		const idleMs = this.adoptedClientKeys.has(key)
+			? ADOPTED_ROOT_IDLE_EVICT_MS
+			: getLspIdleEvictMsForRoot(root);
 		const timer = setTimeout(() => {
-			this.typeScriptIdleTimers.delete(key);
+			this.idleEvictionTimers.delete(key);
 			void this.withClientSpawnGate(async () => {
 				if (this.isDestroyed) return;
 				const client = this.state.clients.get(key);
@@ -1917,34 +2046,30 @@ export class LSPService {
 					(this.clientLeases.get(key) ?? 0) > 0 ||
 					(this.clientLastUsedAt.get(key) ?? 0) !== lastUsedAt
 				) {
-					this.scheduleTypeScriptIdleEviction(key);
+					this.scheduleIdleEviction(key, server);
 					return;
 				}
 
 				// Publish the cold state synchronously before awaiting teardown. A request
 				// arriving while shutdown is in progress therefore waits on the spawn gate
 				// and creates a fresh client; it can never receive this retiring one.
-				this.releaseOutstandingAuxNotifyWrite(key);
-				this.state.clients.delete(key);
-				this.state.clientSpawnedAt.delete(key);
-				this.forgetReadiness(key);
-				this.clientLastUsedAt.delete(key);
+				this.retireClient(key);
 				try {
-					await client.shutdown({ reason: "typescript_idle_eviction" });
+					await client.shutdown({ reason: "idle_eviction" });
 				} catch {
 					// The strong manager reference is already gone; shutdown is best-effort
 					// like the other eviction paths and must not reject from a timer callback.
 				}
-				logSessionStart(`lsp typescript idle eviction: released ${key}`);
+				logSessionStart(`lsp idle eviction: released ${key}`);
 				recordDegradation({
-					kind: "ts-idle-eviction",
+					kind: "lsp-idle-eviction",
 					subject: key,
-					reason: "idle TypeScript client released to bound memory",
+					reason: "idle LSP client released to bound memory",
 				});
 			}).catch(() => {});
-		}, getTypeScriptIdleEvictMs());
+		}, idleMs);
 		timer.unref?.();
-		this.typeScriptIdleTimers.set(key, timer);
+		this.idleEvictionTimers.set(key, timer);
 	}
 
 	/**
@@ -2148,14 +2273,14 @@ export class LSPService {
 	): Promise<void> {
 		if (this.state.clients.get(key) !== entry.client) return;
 		// The CPU verdict is asynchronous, but the streak has already committed to
-		// this client's teardown path. Release the TypeScript idle-timer ownership
+		// this client's teardown path. Release the idle-eviction timer ownership
 		// before sampling so another idle callback cannot target the same client
 		// while the verdict is in flight. A BUSY verdict below re-arms a fresh timer.
-		this.clearTypeScriptIdleTimer(key);
+		this.clearIdleEvictionTimer(key);
 		const verdict = await this.notifyStallCpuVerdict(entry);
 		if (verdict.cpuVerdict === "busy") {
 			if (this.state.clients.get(key) === entry.client) {
-				this.scheduleTypeScriptIdleEviction(key);
+				this.scheduleIdleEviction(key, entry.info);
 			}
 			this.logNotifyStallCpuBusy(key, entry, filePath, 0, verdict);
 			return;
@@ -2270,20 +2395,12 @@ export class LSPService {
 		// An async verdict belongs to one client generation. Never let a
 		// predecessor's decision delete or cool down its replacement.
 		if (this.state.clients.get(key) !== entry.client) return;
-		this.notifyWriteBackpressureStreak.delete(key);
-		this.releaseOutstandingAuxNotifyWrite(key);
-		// #1714: the demoted client is torn down, so its backlog count describes a
-		// process that no longer exists. Leaving it would make the replacement start
-		// at the ceiling and pay a barrier on its first file.
-		this.auxNotifyInflight.delete(key);
+		// #1714: retireClient also drops the backlog count; leaving it would make
+		// the replacement start at the ceiling and pay a barrier on its first file.
 		this.state.broken.set(key, Date.now() + BROKEN_BASE_COOLDOWN_MS);
 		this.notifyStallDemotions.set(key, Date.now());
 		void entry.client.shutdown().catch(() => {});
-		this.state.clients.delete(key);
-		this.state.clientSpawnedAt.delete(key);
-		this.forgetReadiness(key);
-		this.clientLastUsedAt.delete(key);
-		this.clearTypeScriptIdleTimer(key);
+		this.retireClient(key);
 		logLatency({
 			type: "phase",
 			phase: "lsp_notify_backpressure_broken",
@@ -2466,7 +2583,7 @@ export class LSPService {
 		// Latched open: this scanner is a stall, not a pacing problem, and the
 		// breaker owns it. Step aside here too rather than half-throttling it.
 		if (record.gateOpen) return false;
-		return record.unacked >= auxNotifyInflightLimit(entry.info);
+		return record.unacked >= serverTraits(entry.info).notifyInflightLimit;
 	}
 
 	/**
@@ -2478,10 +2595,12 @@ export class LSPService {
 	 * sends ONE request round-trip (`pingLiveness`, #1277,
 	 * clients/lsp/client.ts:2577).
 	 *
-	 * WHY A REPLY PROVES PROCESSING, measured rather than assumed. ast-grep-lsp is
-	 * tower-lsp-server and drains its message stream in order on one task, so a
-	 * request written after N `didOpen`s is answered after those N are scanned.
-	 * Live probe against the real binary, 30 real repository files:
+	 * WHY A REPLY PROVES PROCESSING, measured rather than assumed, and declared
+	 * as the `replyOrdering: "single-task-ordered"` trait on the row that was
+	 * measured (#1722, #1756 stage 1). ast-grep-lsp is tower-lsp-server and
+	 * drains its message stream in order on one task, so a request written after
+	 * N `didOpen`s is answered after those N are scanned. Live probe against the
+	 * real binary, 30 real repository files:
 	 *
 	 *   idle `workspace/symbol` reply        0 ms
 	 *   after 30 didOpens                 2263 ms, 29 of 30 publishes already in
@@ -2495,13 +2614,19 @@ export class LSPService {
 	 * immaterial against a ceiling of 4 to 8.
 	 *
 	 * A server that answered requests off a SEPARATE task would not give this
-	 * proof. What keeps that server safe is NOT the fail-open latch below: the
-	 * latch never arms for it. Such a server answers the barrier instantly,
-	 * `unacked` resets, and the gate stays inert for the whole sweep. Safety comes
-	 * from the outcome that inertness produces — the notify sequence is exactly
-	 * the pre-#1714 one, and #743's write deadline, backpressure streak and wedge
-	 * timer own the stall the same way they did before this change. The throttle
-	 * buys such a server nothing; it also costs it nothing.
+	 * proof, and one that declares `replyOrdering: "threaded"` is therefore
+	 * stepped over below rather than round-tripped. What kept such a server safe
+	 * BEFORE the trait existed is NOT the fail-open latch: the latch never arms
+	 * for it. It answered the barrier instantly, `unacked` reset, and the gate
+	 * stayed inert for the whole sweep. Safety comes from the outcome that
+	 * inertness produces — the notify sequence is exactly the pre-#1714 one, and
+	 * #743's write deadline, backpressure streak and wedge timer own the stall
+	 * the same way they did before this change. The throttle buys such a server
+	 * nothing; it also costs it nothing. Declaring the trait reaches that same
+	 * end state without spending the round-trip, and `unmeasured` — the default,
+	 * and every server that has not been probed — keeps the barrier armed
+	 * exactly as before, so an unmeasured server is never granted a pacing
+	 * change by omission.
 	 *
 	 * The wait is bounded by the CALLER's remaining budget, never by a schedule of
 	 * its own: every waiter gives the shared round-trip only `waitMs`, so a caller
@@ -2538,9 +2663,19 @@ export class LSPService {
 		// file. This is what stops a stalled scanner turning every remaining file
 		// into a fresh full-budget wait.
 		if (record.gateOpen) return;
-		const limit = auxNotifyInflightLimit(entry.info);
+		const traits = serverTraits(entry.info);
+		const limit = traits.notifyInflightLimit;
 		if (record.unacked < limit) return;
-		const ping = entry.client.pingLiveness;
+		// #1756 stage 1: a server that declares `"threaded"` answers requests off
+		// a separate task, so its reply is NOT evidence that the backlog was
+		// processed. It therefore has no usable liveness proof, and takes the same
+		// fail-open path as a client with no round-trip at all — reaching by
+		// declaration the inert state such a server used to reach only by
+		// measurement, without spending the round-trip.
+		const ping =
+			traits.replyOrdering === "threaded"
+				? undefined
+				: entry.client.pingLiveness;
 		if (!ping) {
 			record.unacked = 0;
 			return;
@@ -2921,7 +3056,7 @@ export class LSPService {
 		const attached = new Set(spawned.map((entry) => entry.info.id));
 		const skipped: string[] = [];
 		for (const server of getServersForFileWithConfig(filePath)) {
-			if (server.role !== "auxiliary") continue;
+			if (!isAuxiliary(server)) continue;
 			if (attached.has(server.id)) continue;
 			// An explicitly excluded server (the #584 workspace-sweep exclusion) was
 			// never asked, and its findings come from its own CLI extractor — that is
@@ -2994,6 +3129,34 @@ export class LSPService {
 	}
 
 	/**
+	 * #3601: the fingerprint of the content the first live client (the file's
+	 * own servers first) last sent for `filePath`, and when a send last changed
+	 * it, or `undefined` when no live client under `cwd` tracks the document.
+	 * In-memory only: it spawns, opens and stats nothing.
+	 */
+	getTrackedContent(
+		filePath: string,
+		cwd: string,
+	):
+		| {
+				hash: string;
+				changedAtMs?: number | undefined;
+				openedAtMs?: number | undefined;
+				openedHash?: string | undefined;
+				clientStartedAtMs?: number | undefined;
+		  }
+		| undefined {
+		const priorityServerIds = getServersForFileWithConfig(filePath).map(
+			(server) => server.id,
+		);
+		for (const { client } of this.activeClientsForCwd(cwd, priorityServerIds)) {
+			const sent = client.getSentContent?.(filePath);
+			if (sent !== undefined) return sent;
+		}
+		return undefined;
+	}
+
+	/**
 	 * Get or create LSP client for a file
 	 * Prevents duplicate client creation via in-flight promise tracking
 	 */
@@ -3008,7 +3171,7 @@ export class LSPService {
 		// Primary selection considers language servers only — auxiliary servers
 		// (opengrep, …) attach alongside the primary and are never chosen as it.
 		const servers = getServersForFileWithConfig(filePath).filter(
-			(s) => s.role !== "auxiliary",
+			(s) => !isAuxiliary(s),
 		);
 		// #2525: candidate roots are resolved LAZILY, and at most once per call.
 		// They are deliberately NOT hoisted: `NearestRoot` (clients/lsp/server.ts)
@@ -3402,6 +3565,13 @@ export class LSPService {
 		filePath: string,
 		excludeServerIds?: ReadonlySet<string>,
 		resolvedRoots?: Map<string, string>,
+		/**
+		 * The roots of the auxiliary servers this call attempted (#3873 G1). Kept
+		 * apart from `resolvedRoots`, which `isSpawnInFlight` reads as the
+		 * PRIMARY servers' roots: an auxiliary spawn in flight must not read as
+		 * the primary's.
+		 */
+		auxiliaryRoots?: Map<string, string>,
 	): Promise<{ clients: SpawnedServer[]; serverCountAttempted: number }> {
 		const allServers = getServersForFileWithConfig(filePath);
 		const servers =
@@ -3422,6 +3592,10 @@ export class LSPService {
 			(entry): entry is { server: LSPServerInfo; root: string } =>
 				entry.root !== undefined,
 		);
+
+		for (const { server, root } of rootedServers)
+			if (isAuxiliary(server))
+				auxiliaryRoots?.set(server.id, normalizeMapKey(root));
 
 		let serverCountAttempted = 0;
 		const acquisitions = new Map<string, Promise<SpawnedServer | undefined>>();
@@ -3470,7 +3644,7 @@ export class LSPService {
 	): Promise<SpawnedServer[]> {
 		if (this.checkDestroyed() || enabledIds.size === 0) return [];
 		const servers = getServersForFileWithConfig(filePath).filter(
-			(s) => s.role === "auxiliary" && enabledIds.has(s.id),
+			(s) => isAuxiliary(s) && enabledIds.has(s.id),
 		);
 		if (servers.length === 0) return [];
 		const rootMemo = new Map<string, Promise<string | undefined>>();
@@ -3687,11 +3861,13 @@ export class LSPService {
 		for (const server of getServersForFileWithConfig(filePath)) {
 			const root = await this.resolveServerRoot(server, filePath);
 			if (!root) continue;
-			const key = `${server.id}:${normalizeMapKey(root)}`;
-			const existing = this.state.clients.get(key);
-			if (existing?.isAlive()) {
-				existing.notify.watchedFileChange(filePath, type);
-			}
+			this.notifyLiveClientsForServer(
+				server.id,
+				filePath,
+				type,
+				`${server.id}:${normalizeMapKey(root)}`,
+				true,
+			);
 		}
 	}
 
@@ -3699,10 +3875,24 @@ export class LSPService {
 	 * Re-sync the open views affected by one recovered Git tree change. The
 	 * recovery seam already owns the changed-path set, so this deliberately
 	 * reads only the cached reverse-import index and never runs another diff.
+	 *
+	 * #3828 r3: `saved` makes the push of each changed path a save (the caller
+	 * wrote it); the importers added here are never saves. The answer names
+	 * what this pass did to each changed path, keyed as given: `unheld` when no
+	 * live client holds it, `deferred` when the pass did not reach it (it stays
+	 * queued, with its save), else the pass's own disposition.
 	 */
-	async resyncGitChangedFiles(changedPaths: readonly string[]): Promise<void> {
-		if (this.checkDestroyed() || changedPaths.length === 0) return;
+	async resyncGitChangedFiles(
+		changedPaths: readonly string[],
+		options: { saved?: boolean } = {},
+	): Promise<ReadonlyMap<string, DriftDisposition>> {
+		const dispositions = new Map<string, DriftDisposition>();
+		if (this.checkDestroyed() || changedPaths.length === 0) {
+			return dispositions;
+		}
 		const targets = new Set<string>();
+		/** Each changed path as given, to the target it resolves to. */
+		const changed = new Map<string, string>();
 		for (const changedPath of changedPaths) {
 			const resolved = path.resolve(changedPath);
 			for (const server of getServersForFileWithConfig(resolved)) {
@@ -3716,11 +3906,19 @@ export class LSPService {
 				}
 			}
 			targets.add(resolved);
+			changed.set(changedPath, resolved);
 		}
 		const openTargets = [...targets].filter((filePath) =>
 			this.hasLiveClientHoldingDocument(filePath),
 		);
-		this.documentDrift.enqueueResync(openTargets);
+		const written = new Set(changed.values());
+		this.documentDrift.enqueueResync(
+			openTargets.filter((filePath) => !written.has(filePath)),
+		);
+		this.documentDrift.enqueueResync(
+			openTargets.filter((filePath) => written.has(filePath)),
+			{ saved: options.saved === true },
+		);
 		const pass = await this.sweepDocumentDrift({ force: true });
 		logLatency({
 			type: "phase",
@@ -3733,6 +3931,15 @@ export class LSPService {
 				deferred: pass?.deferred ?? this.documentDrift.pendingResyncCount,
 			},
 		});
+		for (const [changedPath, resolved] of changed) {
+			dispositions.set(
+				changedPath,
+				openTargets.includes(resolved)
+					? (pass?.queued.get(normalizeMapKey(resolved)) ?? "deferred")
+					: "unheld",
+			);
+		}
+		return dispositions;
 	}
 
 	/**
@@ -3762,7 +3969,7 @@ export class LSPService {
 		if (this.checkDestroyed()) return undefined;
 		return this.documentDrift.sweep(
 			{
-				resync: async (filePath, content, _driftAgeMs, readStamp) => {
+				resync: async (filePath, content, _driftAgeMs, readStamp, saved) => {
 					// Reuse the normal touch path so the resync inherits the existing
 					// per-server notify-write budget, the #743 backpressure demotion and
 					// the client-lease machinery. diagnostics:"none" keeps it a pure
@@ -3782,6 +3989,8 @@ export class LSPService {
 						clientScope: "all",
 						excludeServerIds: await this.serverIdsNotHoldingDocument(filePath),
 						readStamp,
+						// #3828 r3: only a target its caller queued as a save.
+						saved: saved === true,
 					});
 					// touchFile swallows a rejected or timed-out notify write so the
 					// caller's edit keeps moving, so its return proves nothing about
@@ -3980,13 +4189,35 @@ export class LSPService {
 
 		const root = await this.resolveServerRootOnce(server, filePath, rootMemo);
 		if (!root || this.checkDestroyed()) return undefined;
-		if (server.role !== "auxiliary") {
+		if (!isAuxiliary(server)) {
 			resolvedRoots?.set(server.id, normalizeMapKey(root));
 		}
 		const allowInstall = this.shouldAllowInstall(server.id);
 
 		const normalizedRoot = normalizeMapKey(root);
 		const key = `${server.id}:${normalizedRoot}`;
+		const adopted = this.analysisRootModeForFile(filePath) === "adopted";
+		if (adopted) {
+			const localCommand =
+				server.command ?? server.projectLocalCommand ?? server.availabilityKey;
+			const localBinary = localCommand
+				? path.isAbsolute(localCommand)
+					? isProjectLocalBinPath(localCommand, root)
+						? localCommand
+						: undefined
+					: findLocalBinUpwards(localCommand, root)
+				: undefined;
+			if (localBinary) {
+				recordDegradationOnce({
+					kind: "lsp-registry-decision",
+					subject: `${server.id}:${normalizeMapKey(root)}`,
+					reason: "project-local LSP binary refused for adopted root",
+				});
+				return undefined;
+			}
+			this.adoptedClientKeys.add(key);
+			if (!this.admitAdoptedRoot(root, filePath)) return undefined;
+		}
 		const isOptionalServer = OPTIONAL_LSP_SERVER_IDS.has(server.id); // NOSONAR: set intentionally empty — no optional servers configured yet
 
 		if (
@@ -4049,7 +4280,7 @@ export class LSPService {
 			if (existing.isAlive()) {
 				this.unavailableLogged.delete(key);
 				this.clientLastUsedAt.set(key, Date.now());
-				this.scheduleTypeScriptIdleEviction(key);
+				this.scheduleIdleEviction(key, server);
 				if (!this.warmStartLogged.has(key)) {
 					logSessionStart(
 						`lsp warm-start ${server.id}: reused root=${root} file=${filePath}`,
@@ -4105,12 +4336,8 @@ export class LSPService {
 			} catch {
 				/* ignore dead client shutdown errors */
 			}
-			this.state.clients.delete(key);
-			this.state.clientSpawnedAt.delete(key);
 			// #3502: the replacement is cold and earns its own readiness verdict.
-			this.forgetReadiness(key);
-			this.clientLastUsedAt.delete(key);
-			this.clearTypeScriptIdleTimer(key);
+			this.retireClient(key);
 			this.state.broken.delete(key);
 
 			// #1127: count EARLY, non-intentional runtime exits toward the circuit
@@ -4391,12 +4618,25 @@ export class LSPService {
 		filePath: string,
 		allowInstall: boolean,
 	): Promise<SpawnedServer | undefined> {
-		// #1334 S5: honor the host project-trust decision before executing any
-		// project-resolved binary. Only an explicit host "not trusted" blocks —
-		// a host with no trust surface (`"unknown"`) spawns exactly as before.
-		// Deliberately NOT marked broken: trust is a policy outcome, not a server
-		// failure, and the user may grant trust later in the same session.
-		if (!isLspSpawnAllowedByTrust()) {
+		try {
+			if (server.executesProjectCode === true) {
+				refuseUntrustedLspExecution({
+					kind: "project-code-server",
+					serverId: server.id,
+					root,
+				});
+			}
+		} catch (error) {
+			logSessionStart(
+				`lsp spawn ${server.id}: refused — ${error instanceof Error ? error.message : String(error)}`,
+			);
+			this.noteSpawnVerdict(key, "failed");
+			return undefined;
+		}
+		// Admission is normally performed by compileLspRegistry. Keep this
+		// service-side backstop for uncompiled test/host entries so a raw server
+		// object cannot bypass the registry's trust decision.
+		if (server.trustAllowed !== true && !isLspSpawnAllowedByTrust()) {
 			logSessionStart(
 				`lsp spawn ${server.id}: refused — ${projectTrustDenialReason()}`,
 			);
@@ -4410,7 +4650,17 @@ export class LSPService {
 		);
 		recordLsp(server.id, root, "spawn_start");
 		try {
-			const spawned = await server.spawn(root, { allowInstall });
+			const projectCodeAllowed =
+				this.analysisRootModeForFile(filePath) !== "adopted";
+			const spawned = await withLspProjectCodePermission(
+				projectCodeAllowed,
+				() =>
+					server.spawn(root, {
+						allowInstall,
+						projectCodeAllowed,
+						sessionRoot: this.sessionCwd ?? process.cwd(),
+					}),
+			);
 
 			// Guard 1: service was shut down while we were waiting for the spawn.
 			// Kill the raw process — no LSPClient exists yet — and bail out without
@@ -4482,10 +4732,18 @@ export class LSPService {
 			}
 
 			const override = getServerInitOverride(server.id, filePath);
-			const mergedInit = mergeInitializationOptions(
-				spawned.initialization,
-				override?.initializationOptions,
-			);
+			// #4299: the compiler owner's admitted path must survive config
+			// merging; otherwise the wrapper can fork a different compiler.
+			const mergedInit =
+				spawned.launchVariant === "classic"
+					? mergeInitializationOptions(
+							override?.initializationOptions,
+							spawned.initialization,
+						)
+					: mergeInitializationOptions(
+							spawned.initialization,
+							override?.initializationOptions,
+						);
 			// A replacement process is a new first-contact identity even when the
 			// configured server id is unchanged. Re-arm both capability latches before
 			// the replacement can publish a snapshot.
@@ -4539,7 +4797,7 @@ export class LSPService {
 			this.lastSpawnVerdict.delete(key);
 			this.state.clientSpawnedAt.set(key, Date.now());
 			this.clientLastUsedAt.set(key, Date.now());
-			this.scheduleTypeScriptIdleEviction(key);
+			this.scheduleIdleEviction(key, server);
 			this.failureCounts.delete(key);
 			if (isOptionalServer) {
 				this.optionalDisabled.delete(key);
@@ -4724,6 +4982,18 @@ export class LSPService {
 			});
 			return;
 		}
+		const contentHash = this.hashContent(content);
+		if (typeof content === "string") {
+			void this.announceToSiblings(filePath, content, contentHash).catch(
+				(cause: unknown) => {
+					incrementDegradationCount({
+						kind: "lsp-sibling-announcement",
+						subject: normalizeMapKey(filePath),
+						reason: `sibling notification failed: ${String(cause)}`,
+					});
+				},
+			);
+		}
 		const startedAt = Date.now();
 		// #3480: the whole-content fingerprint (a sha256 past 96 chars), computed
 		// at most once per touch however many servers it checks and marks.
@@ -4761,6 +5031,7 @@ export class LSPService {
 			options.clientScope ?? (diagnosticsMode === "full" ? "all" : "primary");
 		const useAllClients = clientScope === "all";
 		const resolvedPrimaryRoots = new Map<string, string>();
+		const attemptedAuxiliaryRoots = new Map<string, string>();
 		const waitSkipReasons = new Set<string>();
 		const coldAuxiliaryServerIds = new Set<string>();
 		const noteColdAuxiliary = (
@@ -4778,6 +5049,7 @@ export class LSPService {
 				filePath,
 				options.excludeServerIds,
 				resolvedPrimaryRoots,
+				attemptedAuxiliaryRoots,
 			);
 			spawned = result.clients;
 			serverCountAttempted = result.serverCountAttempted;
@@ -4861,6 +5133,12 @@ export class LSPService {
 					...(waitSkipReasons.size > 0
 						? { reason: [...waitSkipReasons][0] }
 						: {}),
+					// #3873 O9: part of the touch's one row, so no extra record per touch.
+					candidates: this.describeTouchCandidates(
+						filePath,
+						resolvedPrimaryRoots,
+						attemptedAuxiliaryRoots,
+					),
 				},
 			});
 			return;
@@ -4871,7 +5149,7 @@ export class LSPService {
 			// now-current client set and replay; no notification targets the retiree.
 			if (this.checkDestroyed()) {
 				const primaryServerIds = spawned
-					.filter((entry) => entry.info.role !== "auxiliary")
+					.filter((entry) => !isAuxiliary(entry.info))
 					.map((entry) => entry.info.id);
 				return {
 					diags: [],
@@ -4972,19 +5250,19 @@ export class LSPService {
 			// version-less publication, or malformed binding fails closed and is not
 			// replayed. The fresh notify still runs below, so scanners continue toward
 			// a publication for this touch while the prior late result reaches the read.
-			const touchContentHash = this.hashContent(content);
 			// #1586: THE content-match atom. Every content-bound question in this touch
 			// — the carry-over below, #1493's pre-notify snapshot, and the merge-time
 			// coverage predicate — asks it here and nowhere else, so a door cannot
 			// acquire a rule of its own by writing the comparison inline. A binding with
 			// no `contentHash` (version-less publish) fails closed: `undefined` never
 			// equals a hash.
+			const touchContentHash = contentHash;
 			const bindingMatchesTouchContent = (
 				binding: StoredDiagnosticBinding | undefined,
 			): boolean => binding?.contentHash === touchContentHash;
 			const carriedAuxiliary = options.collectDiagnostics
 				? spawned.flatMap((entry) => {
-						if (entry.info.role !== "auxiliary") return [];
+						if (!isAuxiliary(entry.info)) return [];
 						const binding = entry.client.getDiagnosticBinding?.(filePath);
 						if (!bindingMatchesTouchContent(binding)) return [];
 						const diags = entry.client.getDiagnostics(filePath);
@@ -5002,7 +5280,7 @@ export class LSPService {
 			// publication carried in from the previous touch).
 			const auxPublishedThisContent = new Set(
 				spawned.flatMap((entry) =>
-					entry.info.role === "auxiliary" &&
+					isAuxiliary(entry.info) &&
 					bindingMatchesTouchContent(
 						entry.client.getDiagnosticBinding?.(filePath),
 					)
@@ -5049,7 +5327,7 @@ export class LSPService {
 			// timeout-preserves-last-known semantics rather than by this exemption.
 			const auxCoversThisContent = (serverId: string): boolean => {
 				const entry = spawnedByServerId.get(serverId);
-				if (entry?.info.role !== "auxiliary") return false;
+				if (!entry || !isAuxiliary(entry.info)) return false;
 				return (
 					auxPublishedThisContent.has(serverId) ||
 					bindingMatchesTouchContent(
@@ -5127,8 +5405,7 @@ export class LSPService {
 						// #1459: one outstanding resync per auxiliary. Primaries are
 						// untouched — they serve one file per touch and are not the fan-out
 						// target a `clientScope: "all"` sweep floods.
-						const gated =
-							entry.info.role === "auxiliary" && clientKey !== undefined;
+						const gated = isAuxiliary(entry.info) && clientKey !== undefined;
 						let slot: { release: () => void } | undefined;
 						if (gated && clientKey) {
 							// #1714: before taking the slot, make the server prove it
@@ -5339,7 +5616,7 @@ export class LSPService {
 			// An auxiliary that missed a deadline is a named coverage gap, never an
 			// inconclusive touch — see `resolveTouchVerdict` (diagnostic-binding.ts).
 			const primaryEntries = spawned.filter(
-				(entry) => entry.info.role !== "auxiliary",
+				(entry) => !isAuxiliary(entry.info),
 			);
 			const primaryServerIds = new Set(primaryEntries.map((e) => e.info.id));
 			const primaryNotifyWriteTimedOutServerIds =
@@ -5667,7 +5944,7 @@ export class LSPService {
 				const hasTouchAuxiliaries =
 					clientScope === "with-auxiliary" &&
 					options.collectDiagnostics === true &&
-					spawned.some((e) => e.info.role === "auxiliary");
+					spawned.some((e) => isAuxiliary(e.info));
 				if (spawned.some((entry) => entry.info.custom === true)) {
 					try {
 						const snapshotHook = options.hook ?? "tool_result_edit";
@@ -5721,7 +5998,7 @@ export class LSPService {
 						entry.client.serverId,
 					);
 					return hasTouchAuxiliaries &&
-						entry.info.role === "auxiliary" &&
+						isAuxiliary(entry.info) &&
 						coldAuxiliaryServerIds.has(entry.client.serverId) &&
 						(configuredAuxCeilingMs !== undefined ||
 							(observedSpawnMs !== undefined && observedSpawnMs > 0))
@@ -5758,7 +6035,7 @@ export class LSPService {
 					}
 				};
 				const perServerRaceBudgets = spawned.map((entry, entryIndex) => {
-					return hasTouchAuxiliaries && entry.info.role === "auxiliary"
+					return hasTouchAuxiliaries && isAuxiliary(entry.info)
 						? auxWaitBudgetMs(
 								entry.client.serverId,
 								coldAuxiliaryServerIds.has(entry.client.serverId),
@@ -5770,7 +6047,7 @@ export class LSPService {
 				const perServerWaits = spawned.map((entry, entryIndex) => {
 					if (
 						hasTouchAuxiliaries &&
-						entry.info.role === "auxiliary" &&
+						isAuxiliary(entry.info) &&
 						this.isAuxiliaryWaitDemoted(
 							entry.info.id,
 							entry.client.root ?? filePath,
@@ -5925,7 +6202,7 @@ export class LSPService {
 					? (() => {
 							// Primary waits: all non-auxiliary servers.
 							const primaryWaits = perServerWaits.filter(
-								(_, i) => spawned[i].info.role !== "auxiliary",
+								(_, i) => !isAuxiliary(spawned[i].info),
 							);
 							// Aux waits: auxiliary servers (advisory). `client` and the
 							// pre-notify `diagnosticsVersion` baseline travel alongside the
@@ -5934,7 +6211,7 @@ export class LSPService {
 							// below).
 							const auxWaits = perServerWaits
 								.map((p, i) =>
-									spawned[i].info.role === "auxiliary"
+									isAuxiliary(spawned[i].info)
 										? {
 												promise: p,
 												serverId: spawned[i].info.id,
@@ -6361,9 +6638,7 @@ export class LSPService {
 				// captured on, and `undefined` from a double that predates the accessor fails
 				// CLOSED rather than silently reverting to the global counter.
 				if (!hasTouchAuxiliaries && options.collectDiagnostics === true) {
-					const auxEntries = spawned.filter(
-						(entry) => entry.info.role === "auxiliary",
-					);
+					const auxEntries = spawned.filter((entry) => isAuxiliary(entry.info));
 					if (auxEntries.length > 0) {
 						const outcomes = auxEntries.map((entry) => {
 							const baseline = diagnosticBaselines.get(entry.client);
@@ -6459,19 +6734,19 @@ export class LSPService {
 					);
 					diagnosticsUnansweredServerIds = unanswered.map((e) => e.info.id);
 					diagnosticsUnansweredPrimaryServerIds = unanswered
-						.filter((entry) => entry.info.role !== "auxiliary")
+						.filter((entry) => !isAuxiliary(entry.info))
 						.map((e) => e.info.id);
 					// Fail-safe: a touch with no waited-on primary has no primary answer to
 					// preserve, so it keeps the pre-#1549 touch-wide verdict rather than
 					// absolving itself on an auxiliary's evidence.
 					const hasWaitedPrimary = waited.some(
-						(entry) => entry.info.role !== "auxiliary",
+						(entry) => !isAuxiliary(entry.info),
 					);
 					const hasUnsupportedPrimary = diagnosticsUnsupportedServerIds.some(
 						(serverId) =>
 							spawned.some(
 								(entry) =>
-									entry.info.id === serverId && entry.info.role !== "auxiliary",
+									entry.info.id === serverId && !isAuxiliary(entry.info),
 							),
 					);
 					diagnosticsTimedOut =
@@ -6665,7 +6940,7 @@ export class LSPService {
 			const staleWriteAuxiliaryServerIds = spawned
 				.filter(
 					(entry) =>
-						entry.info.role === "auxiliary" &&
+						isAuxiliary(entry.info) &&
 						notifyWriteTimedOutServerIds.includes(entry.info.id) &&
 						!auxCoveredAtMerge.has(entry.info.id),
 				)
@@ -6960,7 +7235,7 @@ export class LSPService {
 			const auxNoAnswerServerIds = spawned
 				.filter(
 					(entry) =>
-						entry.info.role === "auxiliary" &&
+						isAuxiliary(entry.info) &&
 						(diagnosticsUnansweredServerIds.includes(entry.info.id) ||
 							notifyWriteTimedOutServerIds.includes(entry.info.id)) &&
 						!auxCoveredAtMerge.has(entry.info.id),
@@ -7046,8 +7321,9 @@ export class LSPService {
 			// through its own budget, demonstrably did not.
 			//
 			// NO TEST PINS THIS LINE, and that is a property of today's readers rather
-			// than a coverage gap: `ensureWarmForSweep` filters `role === "auxiliary"`
-			// out of its server list entirely, so no reader consumes an auxiliary's
+			// than a coverage gap: `ensureWarmForSweep` filters auxiliaries out
+			// of its server list entirely (`!isAuxiliary`), so no reader consumes
+			// an auxiliary's
 			// `demonstratedReady` mark and deleting this `continue` changes no observable
 			// behavior (verified by mutation — the LSP suite stays green). It stays
 			// because the mark's meaning is "this server answered", and the moment any
@@ -7121,8 +7397,7 @@ export class LSPService {
 			const primaryDiagnosticsUnsupported =
 				diagnosticsUnsupportedServerIds.some((serverId) =>
 					spawned.some(
-						(entry) =>
-							entry.info.id === serverId && entry.info.role !== "auxiliary",
+						(entry) => entry.info.id === serverId && !isAuxiliary(entry.info),
 					),
 				);
 			if (diagnosticsUnsupportedServerIds.length > 0) {
@@ -7322,7 +7597,8 @@ export class LSPService {
 			});
 			return result;
 		} finally {
-			for (const key of leaseKeys) this.releaseClientLease(key);
+			for (const lease of leaseKeys)
+				this.releaseClientLease(lease.key, lease.server);
 		}
 	}
 
@@ -7336,7 +7612,12 @@ export class LSPService {
 	private async findOutsideProjectRoot(
 		filePath: string,
 	): Promise<string | undefined> {
-		if (!isOutsideAllSessionRoots(filePath)) return undefined;
+		if (!this.fileIsOutsideRegisteredRoots(filePath)) return undefined;
+		// Phase A adopted projects are deliberately not registered as session
+		// roots: they may receive per-file LSP diagnostics, but must never widen
+		// the session-wide bookkeeping population. The shared resolver is the
+		// admission seam, so this gate cannot drift from tool_result's decision.
+		if (this.analysisRootModeForFile(filePath) === "adopted") return undefined;
 		const candidates = await Promise.all(
 			getServersForFileWithConfig(filePath).map((server) =>
 				server.root(filePath),
@@ -7534,20 +7815,24 @@ export class LSPService {
 		const graceMs = diagnosticsMode === "document" ? 0 : EARLY_UNBLOCK_GRACE_MS;
 
 		// R8 (#714) / #1458 S2: per-promise role descriptors so raceToCompletion
-		// can apply a bounded aux grace once all primary-role promises have
+		// can apply a bounded aux grace once every language-role promise has
 		// settled. Servers with role:"auxiliary" (opengrep, ast-grep, zizmor, …)
-		// get their OWN declared `aggregateWaitMs` budget after the primary
-		// settles, capped by the PI_LENS_AUX_GRACE_MS global ceiling (default
-		// 2000ms) — the same "declared budget, capped by a ceiling" shape
-		// `touchFile`'s with-auxiliary push wait uses, so this lane can no longer
-		// starve a scanner whose measured warm run (e.g. opengrep ~1.3s) is
-		// shorter than the ceiling but longer than a flat short grace. Late
-		// arrivals are still dropped (advisory only — they land in the client
-		// cache and surface on the next edit). Primary-only callers have no
+		// get their OWN declared `aggregateWaitMs` budget after the language
+		// server settles, capped by the PI_LENS_AUX_GRACE_MS global ceiling
+		// (DEFAULT_AUX_GRACE_CEILING_MS) — the same "declared budget, capped by a
+		// ceiling" shape `touchFile`'s with-auxiliary push wait uses, so this lane
+		// can no longer starve a scanner whose measured warm run (e.g. opengrep
+		// ~1.3s) is shorter than the ceiling but longer than a flat short grace.
+		// Late arrivals are still dropped (advisory only — they land in the client
+		// cache and surface on the next edit). Language-only callers have no
 		// auxiliary descriptors, so this path is never entered and there is
 		// zero behavior change for the single-server hot path.
+		//
+		// The role rides through as the server's OWN `entry.info.role`: one
+		// vocabulary, so this build is no longer the translation point between
+		// `"language"` and a descriptor-shaped `"primary"` (#1488).
 		const diagDescriptors: PromiseDescriptor[] = spawned.map((entry) => {
-			if (entry.info.role !== "auxiliary") return { role: "primary" };
+			if (!isAuxiliary(entry.info)) return { role: entry.info.role };
 			const strategy = getStrategy(
 				entry.info.id,
 				entry.client.getLaunchVariant?.(),
@@ -7562,7 +7847,7 @@ export class LSPService {
 			// promise here stops self-bounding. The narrowing itself is pinned in
 			// tests/clients/lsp/aggregation.test.ts, which can build the
 			// non-self-bounded promises this path cannot.
-			return { role: "auxiliary", budgetMs: strategy.aggregateWaitMs };
+			return { role: entry.info.role, budgetMs: strategy.aggregateWaitMs };
 		});
 
 		// Result-aware racing: trigger early-unblock when any client has results,
@@ -7588,8 +7873,9 @@ export class LSPService {
 				descriptors: diagDescriptors,
 				// #1458 S2: ceiling, not a flat wait — each auxiliary's own
 				// budgetMs (above) determines the actual per-touch grace up to
-				// this cap. Matches touchFile's `readEnvAuxGraceMs() ?? 2000`.
-				auxGraceMs: readEnvAuxGraceMs() ?? 2000,
+				// this cap. Matches touchFile's ceiling, and names the shared
+				// constant instead of repeating its value (#1488).
+				auxGraceMs: readEnvAuxGraceMs() ?? DEFAULT_AUX_GRACE_CEILING_MS,
 			},
 		);
 
@@ -7873,21 +8159,22 @@ export class LSPService {
 	 * a polyglot workspace used to win every no-filePath query outright (#1812
 	 * — a supporting primary server spawned later never got a look-in). Scans
 	 * for the first LIVE client matching `predicate` (when given), preferring
-	 * any primary (non-`"auxiliary"` role) match over an auxiliary one — the
-	 * same primary-over-auxiliary preference `getClientForFile` encodes via
-	 * its `role !== "auxiliary"` filter (this file, `getClientForFile`) and
+	 * any primary (non-auxiliary) match over an auxiliary one — the same
+	 * primary-over-auxiliary preference `getClientForFile` encodes via its
+	 * `!isAuxiliary` filter (this file, `getClientForFile`) and
 	 * `getAliveServerIds` groups by. `isAlive()` is required for BOTH the
 	 * preferred and fallback candidate — mirrors `getCapabilitySnapshots`'s
 	 * own no-filePath branch (this file, ~line 5868), whose liveness filter
 	 * this helper otherwise duplicates; without it a dead primary would win
 	 * over a live, answering auxiliary. Role is read from the map key's
-	 * `serverId` prefix against `LSP_SERVERS`, the same single source of
-	 * truth `getCapabilitySnapshots` already parses that key from — never a
-	 * second, hand-rolled role table. A `serverId` prefix absent from
-	 * `LSP_SERVERS` (should not happen in practice — every spawned client's
-	 * key is built from a known server's `id`) resolves to `role === undefined`,
-	 * which falls through to the primary branch: unknown treated as primary,
-	 * never silently dropped. Returns undefined only when NO live client
+	 * `serverId` prefix through `getServerById` against `LSP_SERVERS`, the
+	 * same single source of truth `getCapabilitySnapshots` already parses that
+	 * key from — never a second, hand-rolled role table. A `serverId` prefix
+	 * absent from `LSP_SERVERS` (should not happen in practice — every spawned
+	 * client's key is built from a known server's `id`) resolves to no server,
+	 * which `isAuxiliary` reads as `DEFAULT_LSP_SERVER_ROLE` and so falls
+	 * through to the primary branch: unknown treated as primary, never
+	 * silently dropped. Returns undefined only when NO live client
 	 * (primary or auxiliary) matches.
 	 */
 	private selectWorkspaceScopeClient(
@@ -7899,8 +8186,7 @@ export class LSPService {
 			if (predicate && !predicate(client)) continue;
 			const separator = key.indexOf(":");
 			const serverId = separator >= 0 ? key.slice(0, separator) : key;
-			const role = LSP_SERVERS.find((s) => s.id === serverId)?.role;
-			if (role === "auxiliary") {
+			if (isAuxiliary(getServerById(serverId))) {
 				if (!auxFallback) auxFallback = { client, serverId };
 				continue;
 			}
@@ -8743,7 +9029,9 @@ export class LSPService {
 	 * "Failed warm-up" is measured per non-auxiliary server via the SAME
 	 * `demonstratedReady` signal `touchFile` marks on a confirmed round trip: a
 	 * server whose key is still absent from `demonstratedReady` after both
-	 * attempts never proved it can answer diagnostics. Warm-up stays
+	 * attempts never proved it can answer diagnostics, unless another rooted
+	 * member of its `fallbackFor` family did (#3939: a never-spawned alternate or
+	 * a preferred that lost to its working alternate is not a failure). Warm-up stays
 	 * `clientScope:"primary"` (not the sweep's `"all"`) on purpose: `"all"`
 	 * would additionally spawn the sweep-EXCLUDED auxiliaries
 	 * (`WORKSPACE_SWEEP_EXCLUDED_SERVER_IDS`), which is work this warm-up does not
@@ -8773,7 +9061,7 @@ export class LSPService {
 			return { performedWarmup: false, failedServerIds: [] };
 		}
 		const servers = getServersForFileWithConfig(representativeFile).filter(
-			(s) => s.role !== "auxiliary",
+			(s) => !isAuxiliary(s),
 		);
 		if (servers.length === 0) {
 			return { performedWarmup: false, failedServerIds: [] };
@@ -8790,9 +9078,41 @@ export class LSPService {
 				this.demonstratedReadyKeyFor(server, representativeFile),
 			),
 		);
-		const alreadyWarm = keys.every(
-			(key) => key === undefined || this.state.demonstratedReady.has(key),
-		);
+		// #3939 F1: a `fallbackFor` pair is ONE family. Acquisition serves the file
+		// from the first member that spawns (`getClientForFile`) and starts an
+		// alternate only when its preferred declines (`getClientsForFile`), so the
+		// member that never served is cold by construction, not by failure. Any
+		// rooted member that demonstrated readiness satisfies the whole family; a
+		// family with no ready member keeps every rooted member cold, so a selected
+		// fallback that fails to answer still counts. Same identity rule as
+		// `getClientsForFile`: an alternate joins an EARLIER attached preferred
+		// (registry order); one whose preferred is not attached (denied, wrong
+		// extension) heads its own family. Walking only backwards cannot cycle.
+		const headOf = new Map<string, string>();
+		const familyHead = servers.map((server) => {
+			const preferredHead =
+				server.fallbackFor === undefined
+					? undefined
+					: headOf.get(server.fallbackFor);
+			const head = preferredHead ?? server.id;
+			headOf.set(server.id, head);
+			return head;
+		});
+		const isColdAt = (i: number): boolean => {
+			const key = keys[i];
+			if (key === undefined || this.state.demonstratedReady.has(key)) {
+				return false;
+			}
+			return !servers.some((_, j) => {
+				const peerKey = keys[j];
+				return (
+					peerKey !== undefined &&
+					familyHead[j] === familyHead[i] &&
+					this.state.demonstratedReady.has(peerKey)
+				);
+			});
+		};
+		const alreadyWarm = servers.every((_, i) => !isColdAt(i));
 		if (alreadyWarm) return { performedWarmup: false, failedServerIds: [] };
 
 		// #799: negative cache. Every server that still needs warming (not
@@ -8808,7 +9128,7 @@ export class LSPService {
 		let allNonWarmCached = true;
 		for (let i = 0; i < servers.length; i++) {
 			const key = keys[i];
-			if (key === undefined || this.state.demonstratedReady.has(key)) continue;
+			if (key === undefined || !isColdAt(i)) continue;
 			if (this.state.demonstratedCold.has(key)) {
 				cachedColdServerIds.push(servers[i].id);
 			} else {
@@ -8868,10 +9188,7 @@ export class LSPService {
 		const stillColdServerIds = (): string[] => {
 			const cold: string[] = [];
 			for (let i = 0; i < servers.length; i++) {
-				const key = keys[i];
-				if (key !== undefined && !this.state.demonstratedReady.has(key)) {
-					cold.push(servers[i].id);
-				}
+				if (isColdAt(i)) cold.push(servers[i].id);
 			}
 			return cold;
 		};
@@ -9365,7 +9682,7 @@ export class LSPService {
 							// barrier. Charge it to the same backlog ledger, and leave a
 							// scanner that is already at its ceiling out of the burst.
 							let auxKey: string | undefined;
-							if (entry.info.role === "auxiliary") {
+							if (isAuxiliary(entry.info)) {
 								auxKey = await this.demonstratedReadyKeyFor(
 									entry.info,
 									filePath,
@@ -9375,8 +9692,16 @@ export class LSPService {
 								}
 							}
 							try {
-								await entry.client.notify.open(filePath, content, languageId);
-								if (auxKey) this.noteAuxNotifyIssued(auxKey, entry.client);
+								const sent = await entry.client.notify.open(
+									filePath,
+									content,
+									languageId,
+								);
+								// #3585: a refused write (`false`) never reached the server's
+								// input queue, so it is not part of the backlog.
+								if (auxKey && sent !== false) {
+									this.noteAuxNotifyIssued(auxKey, entry.client);
+								}
 								// #1783: deliberately NOT recorded for the drift backstop.
 								// This pass can skip a scanner at its backlog ceiling, so its
 								// coverage is partial by design, and `processFile` runs
@@ -9753,7 +10078,8 @@ export class LSPService {
 						// So skip this group's files and record each as UNCONFIRMED
 						// (timedOut + skippedWarmupFailure), never as confirmed-clean `[]`:
 						// the group is keyed by its primary server, so a non-empty
-						// `failedServerIds` means that primary is the one that couldn't warm.
+						// `failedServerIds` means that primary's `fallbackFor` family (the
+						// primary alone, when it has no alternate) couldn't warm.
 						if (warmup.failedServerIds.length > 0) {
 							logLatency({
 								type: "phase",
@@ -10199,7 +10525,7 @@ export class LSPService {
 	 * but slow/wedged" (#1766) — a cold spawn still in flight is not a verdict
 	 * on a server that doesn't exist yet.
 	 *
-	 * Mirrors the `role !== "auxiliary"` filter getClientForFile applies at
+	 * Mirrors the `!isAuxiliary` filter getClientForFile applies at
 	 * :2146-2148 (kept coupled to that line intentionally): auxiliary servers
 	 * (opengrep, typos, …) spawn routinely and concurrently with an ALREADY
 	 * ALIVE primary (dispatch/runners/lsp.ts's with-auxiliary path fires one
@@ -10221,6 +10547,62 @@ export class LSPService {
 			if (this.state.inFlight.has(`${serverId}:${root}`)) return true;
 		}
 		return false;
+	}
+
+	/**
+	 * #3873 O9: what a touch that found no client had to choose from. One entry
+	 * per PRIMARY language server configured for the file: whether a root
+	 * resolved for it (`rooted`), what this service held for that server and
+	 * root (`clientFound`: `alive`, `dead` or `none`), and that client's spawn
+	 * time (`generation`, epoch ms; a replaced client has a new one). Pure
+	 * lookup over the roots the touch already resolved, so `rooted: false` means
+	 * this touch resolved no root for it (none found, its wait timed out first,
+	 * or it was an alternate never tried), and an `alive` client next to a
+	 * no-client verdict is the contradiction worth reading.
+	 *
+	 * An auxiliary server (opengrep, ast-grep, typos, ...) is listed only when
+	 * this touch attempted it and so has a root in `auxiliaryRoots`, which only
+	 * `clientScope: "all"` fills (`getClientsForFile`). In the primary and
+	 * with-auxiliary scopes it is skipped: no root is resolved for it here, so
+	 * its entry would read `rooted: false` beside a live client. The
+	 * with-auxiliary outcome is the `auxiliary_readiness` row's (written only in
+	 * that branch). Bounded at {@link MAX_TOUCH_CANDIDATES}.
+	 */
+	describeTouchCandidates(
+		filePath: string,
+		resolvedRoots: ReadonlyMap<string, string>,
+		auxiliaryRoots: ReadonlyMap<string, string> = new Map(),
+	): Array<{
+		serverId: string;
+		rooted: boolean;
+		clientFound: "alive" | "dead" | "none";
+		generation: number | undefined;
+	}> {
+		const candidates: Array<{
+			serverId: string;
+			rooted: boolean;
+			clientFound: "alive" | "dead" | "none";
+			generation: number | undefined;
+		}> = [];
+		for (const server of getServersForFileWithConfig(filePath)) {
+			// Only `clientScope: "all"` attempts auxiliary servers in this touch; an
+			// auxiliary it did not attempt was never considered.
+			const auxiliary = isAuxiliary(server);
+			if (auxiliary && !auxiliaryRoots.has(server.id)) continue;
+			if (candidates.length >= MAX_TOUCH_CANDIDATES) break;
+			const root = (auxiliary ? auxiliaryRoots : resolvedRoots).get(server.id);
+			const key = root === undefined ? undefined : `${server.id}:${root}`;
+			const client =
+				key === undefined ? undefined : this.state.clients.get(key);
+			candidates.push({
+				serverId: server.id,
+				rooted: root !== undefined,
+				clientFound: client ? (client.isAlive() ? "alive" : "dead") : "none",
+				generation:
+					key === undefined ? undefined : this.state.clientSpawnedAt.get(key),
+			});
+		}
+		return candidates;
 	}
 
 	/**
@@ -10253,8 +10635,8 @@ export class LSPService {
 		for (const [key, token] of this.outstandingAuxNotifyWrites) {
 			this.releaseOutstandingAuxNotifyWrite(key, token);
 		}
-		for (const key of this.typeScriptIdleTimers.keys()) {
-			this.clearTypeScriptIdleTimer(key);
+		for (const key of this.idleEvictionTimers.keys()) {
+			this.clearIdleEvictionTimer(key);
 		}
 
 		// Belt-and-braces: wait for any in-flight spawns so that Guard 1/2 in
@@ -10483,8 +10865,7 @@ export class LSPService {
 			const id = client.serverId;
 			if (seen.has(id)) continue;
 			seen.add(id);
-			const role = LSP_SERVERS.find((s) => s.id === id)?.role;
-			(role === "auxiliary" ? aux : primary).push(id);
+			(isAuxiliary(getServerById(id)) ? aux : primary).push(id);
 		}
 		return [...primary, ...aux];
 	}
@@ -10492,60 +10873,27 @@ export class LSPService {
 
 // --- Singleton Instance ---
 
-interface LSPProcessState {
-	service: LSPService | null;
-	generationHandoff: Promise<void> | undefined;
-}
-
-const LSP_PROCESS_FAMILY = "lsp.service";
-const LSP_PROCESS_VERSION = 1;
-
-function lspProcessState(): LSPProcessState {
-	let incompatibleHandoff: Promise<void> | undefined;
-	return getProcessSingleton(
-		LSP_PROCESS_FAMILY,
-		LSP_PROCESS_VERSION,
-		() => ({ service: null, generationHandoff: incompatibleHandoff }),
-		(value) => {
-			// Shut down a live incompatible service before replacing its cell.
-			if (!value || typeof value !== "object") return;
-			const candidate = value as {
-				service?: {
-					shutdown?: (options: LSPShutdownOptions) => Promise<void>;
-				} | null;
-				generationHandoff?: Promise<void>;
-			};
-			const previousHandoff = candidate.generationHandoff;
-			const teardown = candidate.service?.shutdown
-				? candidate.service
-						.shutdown({ fast: true, reason: "process_singleton_reset" })
-						.catch(() => undefined)
-				: undefined;
-			if (previousHandoff && teardown) {
-				incompatibleHandoff = Promise.allSettled([
-					previousHandoff,
-					teardown,
-				]).then(() => undefined);
-			} else {
-				incompatibleHandoff = previousHandoff ?? teardown;
-			}
-		},
-	);
-}
-
-function processService(): LSPService {
-	const state = lspProcessState();
-	if (!state.service)
-		state.service = new LSPService(state.generationHandoff, process.cwd());
-	return state.service;
-}
+configureLspServiceLifecycle<LSPService>({
+	create: (generationHandoff) =>
+		new LSPService(generationHandoff, process.cwd()),
+	beforeReset: (options) => {
+		abortDeferredLspWork(
+			`lsp service reset: ${options.reason ?? "unspecified"}`,
+		);
+		resetLspLaunchAvailabilityGeneration();
+		if (options.reason === "session_start") {
+			resetClassicTsRepairGuard();
+		}
+	},
+	destroy: (service, options) => service.shutdown(options),
+});
 /**
  * #850: all singleton generations whose teardown is still pending. A new
  * generation may be allocated synchronously, but its first spawn waits on this
  * handoff so two generations can never own the same server/root concurrently.
  */
 export function getLSPService(): LSPService {
-	return processService();
+	return getOwnedLspService<LSPService>();
 }
 
 /**
@@ -10555,7 +10903,7 @@ export function getLSPService(): LSPService {
  * would spawn its server) after `resetLSPService`.
  */
 export function peekLSPService(): LSPService | undefined {
-	return lspProcessState().service ?? undefined;
+	return peekOwnedLspService<LSPService>();
 }
 
 /**
@@ -10584,57 +10932,19 @@ export async function notifyExternalFileChange(
 
 export async function resyncGitChangedFiles(
 	changedPaths: readonly string[],
-): Promise<void> {
+): Promise<ReadonlyMap<string, DriftDisposition>> {
 	return getLSPService().resyncGitChangedFiles(changedPaths);
 }
 
 export function resetLSPService(options: LSPShutdownOptions = {}): void {
-	// #2504 review round 2 (F3): whatever the retiring service was still being
-	// asked for off-hook must stop HERE, before any teardown and before the
-	// `!retiringService` early return below (a `session_start` reset with no
-	// live service must still retire a loop the previous session armed). This
-	// is the one choke point every lifecycle path goes through —
-	// `session_shutdown`, `session_start`, and the idle reset — so the
-	// deferred actionable-warnings pull cannot open another file against a
-	// dying service, cannot re-spawn one after the idle reset, and cannot be
-	// mid-`openFile` when the loop closes (#234). Aborting spawns nothing.
-	abortDeferredLspWork(`lsp service reset: ${options.reason ?? "unspecified"}`);
-	// Invalidate availability publication started by the retiring service before
-	// any asynchronous teardown. The launch seam checks this generation after
-	// every managed lookup, install, and process launch (#2351).
-	resetLspLaunchAvailabilityGeneration();
-	// A new session must get its own classic-tsserver-repair attempt: the
-	// guard is a process-lifetime flag (see resetClassicTsRepairGuard), so a
-	// repair that failed transiently in an earlier session must not stay
-	// latched for the rest of the extension-host process (#1570).
+	// Keep the session-start reset names visible at this public seam for the
+	// session-state reachability ratchet; the owner hook performs the same
+	// transition for facade-only callers.
 	if (options.reason === "session_start") {
 		resetClassicTsRepairGuard();
-		// #1618 (R3): a hold from a PRIOR generation's sweep must never survive
-		// a session boundary — state that must re-arm at session_start cannot
-		// hide behind a leaked/stuck guard from the generation before it.
 		clearWorkspaceSweepHoldForSessionStart();
 	}
-	const state = lspProcessState();
-	const retiringService = state.service;
-	state.service = null;
-	if (!retiringService) return;
-
-	// shutdown() marks the service destroyed synchronously before its first
-	// await. Include both that teardown and every earlier pending generation:
-	// repeated resets may retire a replacement that is itself still waiting on
-	// its predecessor. allSettled keeps teardown best-effort without ever
-	// rejecting (and therefore permanently poisoning) the next generation.
-	const teardown = retiringService.shutdown(options);
-	const pending = state.generationHandoff
-		? [state.generationHandoff, teardown]
-		: [teardown];
-	const handoff = Promise.allSettled(pending).then(() => undefined);
-	state.generationHandoff = handoff;
-	void handoff.then(() => {
-		if (state.generationHandoff === handoff) {
-			state.generationHandoff = undefined;
-		}
-	});
+	resetOwnedLspService<LSPService>(options);
 }
 
 /**

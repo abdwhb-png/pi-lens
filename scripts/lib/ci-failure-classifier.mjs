@@ -2,9 +2,8 @@
 //
 // Kept separate from the CLI so the log-reading heuristics and the
 // once-per-sequential-invocation rerun guard are unit-testable without a
-// GitHub event or a network call (the check-pr-title.mjs /
-// merge-train-warden.mjs pattern). The guard does not serialize CONCURRENT
-// invocations -- see the REAL SCOPE note on shouldTriggerRerun (review
+// GitHub event or a network call (the check-pr-title.mjs pattern). The guard does not serialize
+// CONCURRENT invocations -- see the REAL SCOPE note on shouldTriggerRerun (review
 // round 2, V2/V3) for exactly what is and isn't guaranteed under
 // concurrency.
 //
@@ -15,32 +14,21 @@
 // module turns "read the log, decide" into a function a human or an
 // orchestrator can call on a run id.
 
-/** Strips the ANSI color/cursor codes vitest's reporter and GitHub Actions
- * both wrap every line in. Every pattern below matches against the stripped
- * text -- matching raw escape-coded text is what makes log heuristics
- * brittle across reporter versions. */
-// oxlint-disable-next-line no-control-regex -- ESC (\x1b) is the literal ANSI escape-sequence lead byte this pattern strips, not accidental input.
-const ANSI_PATTERN = /\x1b\[[0-9;]*m/g;
-function stripAnsi(text) {
-	return text.replace(ANSI_PATTERN, "");
-}
+import {
+	CI_JOB_NAMES,
+	isAdvisoryCheck,
+	isBlockingConclusion,
+	isUnitTestsShardJobName,
+} from "./ci-checks.mjs";
+import {
+	parseVitestSummary,
+	stripAnsi,
+	stripLineTimestamps,
+} from "./vitest-summary.mjs";
 
-/**
- * Strips the GitHub Actions per-line ISO-8601 timestamp prefix (real log,
- * every line): "2026-08-26T00:09:00.9329487Z  FAIL ...". Every job log
- * fetched from the real API is prefixed this way on EVERY line -- discovered
- * the hard way in review round 2 (V4): a `^\s*` line-start anchor added to
- * fix a different false-positive (BARE_FAIL_LINE matching "FAIL" inside a
- * passing test's own title) broke on the very real fixtures it was meant to
- * keep working, because "FAIL" is never actually the first character on a
- * real log line -- the timestamp is. Applied before any anchored pattern
- * below, so "line start" means "start of content", not "start of the raw
- * line".
- */
-const LINE_TIMESTAMP_PREFIX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+Z ?/gm;
-function stripLineTimestamps(text) {
-	return text.replace(LINE_TIMESTAMP_PREFIX, "");
-}
+// The strip helpers moved to vitest-summary.mjs (#4087); ci-verdict and the
+// classifier tests keep importing them from here.
+export { stripAnsi, stripLineTimestamps };
 
 /**
  * Normalizes transport details that GitHub's Windows log surface can add to
@@ -75,6 +63,7 @@ const MAX_LOG_BYTES = 2 * 1024 * 1024;
 // snapshot without rebuilding". The project label ("default") sits between
 // FAIL and the file path.
 const FAIL_LINE = /^\s*FAIL\s+\S+\s+(\S+\.test\.tsx?)\s*>\s*(.+)$/gm;
+
 // A file-level FAIL with no "> testname" -- a collection/import error never
 // reaches a single test, so vitest has no test name to print (review round
 // 1, F2/P2). Deliberately looser than FAIL_LINE: only used when FAIL_LINE
@@ -90,10 +79,12 @@ const FAIL_LINE = /^\s*FAIL\s+\S+\s+(\S+\.test\.tsx?)\s*>\s*(.+)$/gm;
 // elsewhere in the same log under a fake real classification (safe
 // direction, but reimposes the manual-read tax this classifier exists to
 // remove). See the "V4 fabricated FAIL in a passing test title" fixture.
-const BARE_FAIL_LINE = /^\s*FAIL\b.*?(\S+\.test\.tsx?)(?=\s|$)/m;
+export const BARE_FAIL_LINE =
+	/^\s*FAIL\b.*?(\S+\.(?:test|spec)\.[cm]?[jt]sx?)(?=\s|$)/m;
 // (real log, same run) "AssertionError: expected false to be true //
 // Object.is equality"
-const ASSERTION_LINE = /^\s*AssertionError:\s*(.+)$/m;
+export const ASSERTION_LINE =
+	/^\s*AssertionError(?: \[ERR_ASSERTION\])?:\s*(.+)$/m;
 // vitest prints this inline, AS EACH FILE FINISHES, before the end-of-run
 // "Failed Tests" summary block ever gets a chance to print (real log, run
 // 32913518938, job 98012237782, line 536): " ❯  default
@@ -118,13 +109,8 @@ const INLINE_TEST_FAIL_MARKER = /^\s*×\s+(.+?)\s*\d*m?s?\s*$/m;
 // failure evidence even when an infrastructure-looking line appears later.
 // Keep these explicit: the classifier must not let a new infra needle outrank
 // a genuine assertion or compile failure.
-const TEST_FILES_FAILED = /^\s*Test Files\s+\d+\s+failed\b/im;
 const TYPESCRIPT_ERROR =
 	/^\s*\S+\.tsx?\(\d+,\d+\): error TS\d+:|^\s*\S+\.tsx?:\d+:\d+ - error TS\d+:/m;
-// The run's own final tally line (real log, same run): " Tests  1 failed |
-// 9837 passed | 48 skipped (9886)". No file/test detail, but a nonzero
-// failed count here is unambiguous.
-const OVERALL_TESTS_FAILED = /^\s*Tests\s+(\d+)\s+failed\b/m;
 // #2839: vitest's timeout failure text (real log, run 34389495533 attempt 1,
 // job 102594125043, PR #2834): "Error: Test timed out in 5000ms." Vitest's
 // runner uses the same template for hooks: "Error: Hook timed out in 300ms."
@@ -292,8 +278,9 @@ function findRealFailureSignal(log) {
 	if (assertionMatch) {
 		return { detail: `unknown file > ${assertionMatch[1].trim()}` };
 	}
-	if (TEST_FILES_FAILED.test(log)) {
-		return { detail: log.match(TEST_FILES_FAILED)?.[0] ?? "Test Files failed" };
+	const summary = parseVitestSummary(log);
+	if (summary.filesFailed !== null) {
+		return { detail: `Test Files ${summary.filesFailed} failed` };
 	}
 	const typescriptMatch = TYPESCRIPT_ERROR.exec(log);
 	if (typescriptMatch) {
@@ -311,10 +298,12 @@ function findRealFailureSignal(log) {
 			detail: `${bareFail[1]} (file-level failure -- no ">"-separated test name, e.g. an import/collection error)`,
 		};
 	}
-	const overallFailed = OVERALL_TESTS_FAILED.exec(log);
-	if (overallFailed && Number(overallFailed[1]) > 0) {
+	// The run's own final tally line (real log, same run): " Tests  1 failed |
+	// 9837 passed | 48 skipped (9886)". No file/test detail, but a nonzero
+	// failed count here is unambiguous.
+	if (summary.testsFailed > 0) {
 		return {
-			detail: `${overallFailed[1]} test(s) failed (overall tally line; no per-file detail found)`,
+			detail: `${summary.testsFailed} test(s) failed (overall tally line; no per-file detail found)`,
 		};
 	}
 	const inlineTest = INLINE_TEST_FAIL_MARKER.exec(log);
@@ -675,8 +664,7 @@ export function buildCommentBody({
 }
 
 // ---------------------------------------------------------------------------
-// I/O layer. Every function below takes an injected `fetcher` (the
-// merge-train-warden.mjs pattern, scripts/lib/merge-train-warden.mjs:138) so
+// I/O layer. Every function below takes an injected `fetcher` so
 // the orchestration in runClassifier is testable against a mocked GitHub API
 // with no network call and no gh CLI dependency.
 // ---------------------------------------------------------------------------
@@ -751,13 +739,25 @@ async function fetchRunAndFailedJob({ fetcher, owner, repo, runId, jobName }) {
 		`${base}/actions/runs/${runId}/jobs`,
 	);
 	const jobs = jobsResponse.jobs ?? [];
-	const failedJob = jobName
-		? jobs.find((job) => job.conclusion === "failure" && job.name === jobName)
-		: jobs.find((job) => job.conclusion === "failure");
+	const failedJobs = jobName
+		? failedJobsNamed(jobs, jobName)
+		: jobs.filter((job) => job.conclusion === "failure").slice(0, 1);
+	const failedJob = failedJobs[0];
 	if (!failedJob) {
-		throw new Error(
-			`run ${runId} has no failed job${jobName ? ` named "${jobName}"` : ""}`,
+		// #3801 (verify r2 V3): a CI run that failed ONLY on advisory jobs (a
+		// not-ready `Heavy advisory gate`, the Windows run) is not a `real`
+		// failure of the change; the caller must not label the PR `ci:real`.
+		// Every job with a BLOCKING conclusion (failure, timed_out, cancelled, ...)
+		// must be advisory: a required job that timed out beside a red gate is
+		// not "only advisory" (verify r3 V6).
+		const blocking = jobs.filter((job) => isBlockingConclusion(job.conclusion));
+		const advisoryOnly =
+			blocking.length > 0 && blocking.every((job) => isAdvisoryCheck(job.name));
+		const error = new Error(
+			`run ${runId} has no failed job${jobName ? ` named "${jobName}"` : ""}${advisoryOnly ? `; ${ADVISORY_ONLY_MARKER} (${blocking.map((job) => job.name).join(", ")})` : ""}`,
 		);
+		error.advisoryOnly = advisoryOnly;
+		throw error;
 	}
 	const prNumber = run.pull_requests?.[0]?.number ?? null;
 	return {
@@ -769,14 +769,41 @@ async function fetchRunAndFailedJob({ fetcher, owner, repo, runId, jobName }) {
 		// (or a hand-rolled fixture) reads as attempt 1.
 		runAttempt: Number(run.run_attempt) || 1,
 		jobId: failedJob.id,
-		jobName: failedJob.name,
+		jobName: failedJobs.map((job) => job.name).join(", "),
+		jobIds: failedJobs.map((job) => job.id),
 	};
+}
+
+/**
+ * The failed jobs a `--job-name` selects. #3753: `Unit tests` is an aggregate
+ * check-run over `Unit tests (shard k/N)` matrix jobs, and the log the
+ * classifier must read (the failing test names, the exit-137 kill) is the
+ * shard's, not the aggregate's. Failed shard rows win when any exist; with
+ * none, an exact-name failure is the pre-sharding shape (a run from before
+ * #3753, or the aggregate failing on its own).
+ */
+function failedJobsNamed(jobs, jobName) {
+	const failed = jobs.filter((job) => job.conclusion === "failure");
+	const shards =
+		jobName === CI_JOB_NAMES.UNIT_TESTS
+			? failed.filter((job) => isUnitTestsShardJobName(job.name))
+			: [];
+	return shards.length > 0
+		? shards
+		: failed.filter((job) => job.name === jobName);
 }
 
 async function fetchJobLog({ fetcher, owner, repo, jobId }) {
 	const base = `https://api.github.com/repos/${owner}/${repo}`;
 	return fetchText(fetcher, `${base}/actions/jobs/${jobId}/logs`);
 }
+
+/**
+ * The phrase a skipped classification carries when every failed job of the run
+ * is advisory. ci-infra-kill-rerun.yml's label step greps the CLI output for
+ * it (tests/config/ci-infra-kill-rerun-gate.test.ts pins the two together).
+ */
+export const ADVISORY_ONLY_MARKER = "only advisory jobs failed";
 
 /**
  * Find this PR's existing classifier comment, if any -- there is at most one
@@ -951,7 +978,11 @@ export async function runClassifier({
 			error instanceof Error &&
 			error.message.includes("has no failed job")
 		) {
-			return { skipped: true, reason: error.message };
+			return {
+				skipped: true,
+				reason: error.message,
+				...(error.advisoryOnly === true ? { advisoryOnly: true } : {}),
+			};
 		}
 		await commentClassificationFailure({
 			fetcher,
@@ -968,6 +999,7 @@ export async function runClassifier({
 		prNumber: resolvedPrNumber,
 		runAttempt,
 		jobId,
+		jobIds,
 		jobName: resolvedJobName,
 	} = runAndJob;
 	const prNumber = prNumberOverride ?? resolvedPrNumber;
@@ -977,9 +1009,12 @@ export async function runClassifier({
 		);
 	}
 
-	let rawLog;
+	let rawLogs;
 	try {
-		rawLog = await fetchJobLog({ fetcher, owner, repo, jobId });
+		rawLogs = [];
+		for (const id of jobIds) {
+			rawLogs.push(await fetchJobLog({ fetcher, owner, repo, jobId: id }));
+		}
 	} catch (error) {
 		await commentClassificationFailure({
 			fetcher,
@@ -1004,7 +1039,12 @@ export async function runClassifier({
 		: null;
 	let classification;
 	try {
-		classification = classifyFailureLog(rawLog);
+		// One log per failed job (several failed shards, #3753). A real failure
+		// in ANY of them wins: a rerun that would only replay the infra-killed
+		// shard cannot fix a shard that is genuinely red.
+		const classified = rawLogs.map((rawLog) => classifyFailureLog(rawLog));
+		classification =
+			classified.find((entry) => entry.kind === "real") ?? classified[0];
 	} catch (error) {
 		await commentClassificationFailure({
 			fetcher,
