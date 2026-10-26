@@ -11,12 +11,16 @@ import {
 	drainResidentJscpdScans,
 	removeTempDirSync,
 } from "./clients/test-utils.js";
-import { makeLspServiceDouble } from "./support/lsp-service-double.js";
+import { installLspServiceDouble } from "./support/lsp-service-seam.js";
 import {
 	aliveServerHolder,
 	lspStatusRecorder,
 } from "./support/lsp-status-repaint.js";
-import { makeSessionStartEvent } from "./support/host-event-factory.js";
+import {
+	makeContextWithSystemEvent,
+	makeSessionStartEvent,
+	makeSystemHead,
+} from "./support/host-event-factory.js";
 // #2146: process-scope state (the primary-session registration, the instance
 // registry's mutation tail) now lives on `globalThis`, so `vi.resetModules()`
 // no longer clears it — that is the fix, not a regression. This suite gives
@@ -166,7 +170,12 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
 
 // Cases install their own doubles for these modules with vi.doMock;
 // resetModules does not clear the mock registry, so drop them after each case
-// in every describe below (#2883).
+// in every describe below (#2883). EVERY module the file doMocks is listed:
+// a module unmocked only in the body of the case that mocks it, or in another
+// describe's beforeEach, leaks into whichever case a shuffle runs next and
+// that case rejects with `No "readHostModelIdentity" export is defined on the
+// "../clients/runtime-coordinator.js" mock` (#4405: 64 member rows over three
+// seeds).
 afterEach(async () => {
 	vi.doUnmock("../clients/bootstrap.js");
 	vi.doUnmock("../clients/bus-events-logger.js");
@@ -176,11 +185,16 @@ afterEach(async () => {
 	vi.doUnmock("../clients/diagnostic-tracker.js");
 	vi.doUnmock("../clients/dispatch/integration.js");
 	vi.doUnmock("../clients/extension-log.js");
+	vi.doUnmock("../clients/installer/index.js");
+	vi.doUnmock("../clients/latency-logger.js");
 	vi.doUnmock("../clients/pipeline.js");
 	vi.doUnmock("../clients/quiet-window.js");
 	vi.doUnmock("../clients/runtime-agent-end.js");
+	vi.doUnmock("../clients/runtime-coordinator.js");
+	vi.doUnmock("../clients/runtime-session.js");
 	vi.doUnmock("../clients/runtime-turn.js");
 	vi.doUnmock("../clients/session-scope.js");
+	vi.doUnmock("../clients/turn-context.js");
 	// #4133: a jscpd scan started by the real bootstrap is fire-and-forget; wait
 	// for it before this test's fixture roots and the worker's tmp root are
 	// removed, so a kill cannot strand its report directory. Runs after every
@@ -1110,11 +1124,9 @@ describe("index.ts integration", () => {
 		"session_shutdown uses fast LSP reset so teardown does not wait on graceful shutdown",
 		async () => {
 			const resetLSPService = vi.fn();
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService,
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({}, { beforeReset: resetLSPService });
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
@@ -1144,16 +1156,14 @@ describe("index.ts integration", () => {
 			const resetLSPService = vi.fn(() => {
 				order.push("reset_lsp_service");
 			});
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService,
-			}));
 			vi.doMock("../clients/debug-handles.js", () => ({
 				dumpActiveHandles: (label: string) => {
 					order.push(`dump:${label}`);
 				},
 			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({}, { beforeReset: resetLSPService });
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
@@ -1173,10 +1183,6 @@ describe("index.ts integration", () => {
 			// The recurrence: the retire ran last and unguarded, so a throw from
 			// any teardown step above it left the scope live. After a /reload that
 			// re-evaluated the entry, nothing else ever ends the old scope.
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService: vi.fn(),
-			}));
 			vi.doMock("../clients/debug-handles.js", () => ({
 				dumpActiveHandles: () => {
 					throw new Error("teardown step failed");
@@ -1190,6 +1196,8 @@ describe("index.ts integration", () => {
 				return { ...actual, retireScope };
 			});
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble();
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
@@ -1217,10 +1225,6 @@ describe("index.ts integration", () => {
 	it(
 		"session_shutdown emits the bus-event session-end rollup (S2d gap 5, #1432 review)",
 		async () => {
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService: vi.fn(),
-			}));
 			const emitBusEventRollupAtSessionEnd = vi.fn();
 			vi.doMock("../clients/bus-events-logger.js", async (importActual) => {
 				const actual =
@@ -1230,6 +1234,8 @@ describe("index.ts integration", () => {
 				return { ...actual, emitBusEventRollupAtSessionEnd };
 			});
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble();
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
@@ -1637,10 +1643,6 @@ describe("index.ts integration", () => {
 			// agent_settled itself queues is already in flight, so the dump must
 			// fire after runQuietWindow is invoked, not before.
 			const order: string[] = [];
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService: vi.fn(),
-			}));
 			vi.doMock("../clients/quiet-window.js", () => ({
 				registerQuietWindowTask: () => {},
 				registerBuiltinQuietWindowTasks: () => {},
@@ -1654,6 +1656,8 @@ describe("index.ts integration", () => {
 				},
 			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble();
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi();
 			registerExtension(pi as any);
@@ -1672,10 +1676,6 @@ describe("index.ts integration", () => {
 
 	describe("#1654 deferred-mutation drain runs at agent_settled, not agent_end", () => {
 		function mockDrainDeps(handleAgentEndMock: ReturnType<typeof vi.fn>) {
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService: vi.fn(),
-			}));
 			vi.doMock("../clients/quiet-window.js", () => ({
 				registerQuietWindowTask: () => {},
 				registerBuiltinQuietWindowTasks: () => {},
@@ -1692,6 +1692,8 @@ describe("index.ts integration", () => {
 				const handleAgentEndMock = vi.fn(async () => undefined);
 				mockDrainDeps(handleAgentEndMock);
 
+				// The seam install goes after the doMocks above: it evaluates the graph.
+				await installLspServiceDouble();
 				const { default: registerExtension } = await import("../index.js");
 				const { pi, handlers } = createMockPi();
 				registerExtension(pi as any);
@@ -1860,11 +1862,7 @@ describe("index.ts integration", () => {
 			// The idle reset releases the warm servers from a detached timer with no pi
 			// event in flight; without the wrapped reset the footer would keep showing a
 			// stale "LSP Active" until the next turn. Assert the timer firing repaints it.
-			const { resetLSPService, service } = aliveServerHolder();
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: service,
-				resetLSPService,
-			}));
+			const { resetLSPService, overrides } = aliveServerHolder();
 			vi.doMock("../clients/bootstrap.js", async () => {
 				const { bootstrapSeamMock } =
 					await import("./support/bootstrap-mock.js");
@@ -1882,6 +1880,10 @@ describe("index.ts integration", () => {
 				}));
 			});
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble(overrides, {
+				beforeReset: resetLSPService,
+			});
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": false });
 			registerExtension(pi as any);
@@ -1914,17 +1916,20 @@ describe("index.ts integration", () => {
 		INTEGRATION_TIMEOUT_MS,
 	);
 
-	// #1016: pi-lens injects ephemeral turn-end findings via the `context` event.
+	// #1016: pi-lens injects ephemeral turn-end findings at request time.
 	// The findings are spliced in IMMEDIATELY BEFORE the final message rather than
 	// prepended at index 0, so messages[0] stays byte-stable across turns and the
 	// prompt-cache prefix on prefix-caching providers (Anthropic/Bedrock) survives.
 	// The real user prompt stays as the trailing message (cache breakpoint), and the
 	// existing transcript is never dropped (fe0ed5da: never emit empty input).
+	// #4631: on pi 0.87+ this runs in `context_with_system`, the hook that sees the
+	// full transcript (system head included) and whose returned list pi uses
+	// verbatim; `context` there sees the conversation alone.
 	async function loadContextHandler() {
 		const { default: registerExtension } = await import("../index.js");
 		const { pi, handlers } = createMockPi();
 		registerExtension(pi as any);
-		const context = handlers.context?.[0];
+		const context = handlers.context_with_system?.[0];
 		expect(context).toBeTypeOf("function");
 		return context as IntegrationHook;
 	}
@@ -1953,19 +1958,30 @@ describe("index.ts integration", () => {
 			const assistant = { role: "assistant", content: "On it." };
 			const finalUser = { role: "user", content: "Fix the bug" };
 			const existing = [firstUser, assistant, finalUser];
+			// #4631 round 6 (R6-1): the host's `context_with_system` event leads
+			// with the system head, and the handler must hand it back untouched.
+			const head = makeSystemHead();
 
 			const result = (await context(
-				{ messages: existing },
+				makeContextWithSystemEvent(existing, head),
 				{ cwd: tmpDir },
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
-			// Full expected ordering: prior turns, then updated final user prompt
-			// with guidance appended — [firstUser, assistant, updatedFinalUser].
-			expect(result.messages).toHaveLength(3);
-			expect(result.messages[0]).toEqual(firstUser);
-			expect(result.messages[1]).toEqual(assistant);
+			// Full expected ordering: the host's head, prior turns, then the
+			// updated final user prompt with guidance appended —
+			// [head, firstUser, assistant, updatedFinalUser].
+			expect(result.messages).toHaveLength(4);
+			// #4631 round 6 (R6-1): the host's shape is a SYSTEM message at index
+			// 0, exactly as the builder sends it; a handler that dropped it would
+			// shift every turn below.
+			// Compared against a FRESH builder output, not the event's own object: a
+			// handler that mutated the head in place would pass the reference check.
+			expect(result.messages[0]).toEqual(makeSystemHead());
+			expect(result.messages[0].role).toBe("system");
+			expect(result.messages[1]).toEqual(firstUser);
+			expect(result.messages[2]).toEqual(assistant);
 
-			const last = result.messages[2];
+			const last = result.messages[3];
 			expect(last.role).toBe("user");
 			expect(last.content).toContain(
 				"Fix the bug\n\n[pi-lens automated context — not a user request]",
@@ -1988,11 +2004,14 @@ describe("index.ts integration", () => {
 			const firstUser = { role: "user", content: "Start the task" };
 			const assistant = { role: "assistant", content: "On it." };
 			const finalUser = { role: "user", content: "Fix the bug" };
-			const baseTranscript = () => [
-				{ ...firstUser },
-				{ ...assistant },
-				{ ...finalUser },
-			];
+			// #4631 round 6 (R6-1): the same host head leads BOTH turns, so the
+			// prefix comparison below measures the real cached bytes.
+			const head = makeSystemHead();
+			const baseTranscript = () =>
+				makeContextWithSystemEvent(
+					[{ ...firstUser }, { ...assistant }, { ...finalUser }],
+					head,
+				);
 
 			// Turn A
 			const contextA = await loadContextHandler();
@@ -2001,10 +2020,9 @@ describe("index.ts integration", () => {
 				{ content: "Finding A" },
 				tmpDir,
 			);
-			const resultA = (await contextA(
-				{ messages: baseTranscript() },
-				{ cwd: tmpDir },
-			)) as { messages: Array<{ role: string; content: unknown }> };
+			const resultA = (await contextA(baseTranscript(), { cwd: tmpDir })) as {
+				messages: Array<{ role: string; content: unknown }>;
+			};
 
 			// Turn B — same base transcript, different injected finding. Fresh module
 			// registration to mirror a second independent turn.
@@ -2015,10 +2033,9 @@ describe("index.ts integration", () => {
 				{ content: "Completely different Finding B" },
 				tmpDir,
 			);
-			const resultB = (await contextB(
-				{ messages: baseTranscript() },
-				{ cwd: tmpDir },
-			)) as { messages: Array<{ role: string; content: unknown }> };
+			const resultB = (await contextB(baseTranscript(), { cwd: tmpDir })) as {
+				messages: Array<{ role: string; content: unknown }>;
+			};
 
 			// The prior conversation prefix (everything up to the trailing user prompt)
 			// is identical between the two turns — this is what prefix-caching providers reuse.
@@ -2026,7 +2043,9 @@ describe("index.ts integration", () => {
 			const prefixB = resultB.messages.slice(0, -1);
 			// Assert that turn 2's prefix equals turn 1's prefix byte-for-byte:
 			expect(prefixB).toEqual(prefixA);
-			expect(prefixA).toEqual([firstUser, assistant]);
+			// #4631 round 6 (R6-1): the prefix the providers cache is the host's
+			// head plus the prior turns — the user message sits at index 1.
+			expect(prefixA).toEqual([makeSystemHead(), firstUser, assistant]);
 
 			// The trailing message starts with the same user prompt text across turns
 			const lastA = resultA.messages[resultA.messages.length - 1];
@@ -2058,6 +2077,10 @@ describe("index.ts integration", () => {
 
 			// Degenerate case: no trailing message to sit before, so we emit just the
 			// injected block (identical to pre-#1016 behavior) — never empty input.
+			// #4631 round 6 (R6-1): this cell stays HEADLESS on purpose. The branch
+			// it reaches (`existingMessages.length === 0`) is unreachable from a
+			// host, which always leads the transcript with the system head; giving
+			// it a head would delete its only coverage.
 			expect(result.messages.length).toBeGreaterThan(0);
 			expect(result.messages[0]).toEqual(injectedMatcher);
 		},
@@ -2090,9 +2113,11 @@ describe("index.ts integration", () => {
 				content: [{ type: "tool_result", tool_use_id: "tu_1", content: "ok" }],
 			};
 			const existing = [firstUser, toolUse, toolResult];
+			// #4631 round 6 (R6-1): the host's transcript leads with the system head.
+			const head = makeSystemHead();
 
 			const result = (await context(
-				{ messages: existing },
+				makeContextWithSystemEvent(existing, head),
 				{ cwd: tmpDir },
 			)) as { messages: Array<{ role: string; content: unknown }> };
 
@@ -2102,13 +2127,18 @@ describe("index.ts integration", () => {
 			expect(result.messages[toolUseIdx + 1]).toBe(toolResult);
 
 			// The findings are appended AFTER the whole transcript, not before the tail.
-			expect(result.messages.slice(0, existing.length)).toEqual(existing);
+			expect(result.messages.slice(1, 1 + existing.length)).toEqual(existing);
 			expect(result.messages[result.messages.length - 1]).toEqual(
 				injectedMatcher,
 			);
 
-			// index-0 stability still holds (cache prefix preserved).
-			expect(result.messages[0]).toEqual(firstUser);
+			// index-0 stability still holds (cache prefix preserved): the host's
+			// head is still at index 0, and the first user turn follows it.
+			// Compared against a FRESH builder output, not the event's own object: a
+			// handler that mutated the head in place would pass the reference check.
+			expect(result.messages[0]).toEqual(makeSystemHead());
+			expect(result.messages[0].role).toBe("system");
+			expect(result.messages[1]).toEqual(firstUser);
 		},
 		INTEGRATION_TIMEOUT_MS,
 	);
@@ -2120,7 +2150,11 @@ describe("index.ts integration", () => {
 			// No cache written → nothing to inject → handler returns undefined (no
 			// override), so a non-injecting turn is byte-identical to no handler.
 			const finalUser = { role: "user", content: "Fix the bug" };
-			const result = await context({ messages: [finalUser] }, { cwd: tmpDir });
+			// #4631 round 6 (R6-1): a real request, head included, so the no-op
+			// answer is measured on the shape the host sends.
+			const result = await context(makeContextWithSystemEvent([finalUser]), {
+				cwd: tmpDir,
+			});
 			expect(result).toBeUndefined();
 		},
 		INTEGRATION_TIMEOUT_MS,
@@ -2146,7 +2180,7 @@ describe("index.ts integration", () => {
 				RuntimeCoordinator: class {
 					projectRoot = tmpDir;
 					turnIndex = 0;
-					complexityBaselines = new Map();
+					complexityBaselines = new Set();
 					cachedExports = new Map();
 					readGuard = mockReadGuard;
 					shouldWarmLspOnRead() {
@@ -2166,6 +2200,10 @@ describe("index.ts integration", () => {
 						return 0;
 					}
 					resetForSession() {}
+					// #4483: the tool_call's pre-edit linter capture asks for it.
+					captureSessionGeneration() {
+						return { isCurrent: () => true };
+					}
 					setTelemetryIdentity() {}
 					telemetrySessionId = "test-session";
 				},
@@ -2227,6 +2265,8 @@ describe("index.ts integration", () => {
 					effectiveOffset: 1,
 					effectiveLimit: 6,
 				}),
+				// #1649: the tool_call's one pass is the capture; the guard takes none.
+				{ captureLineHashes: false },
 			);
 		},
 		INTEGRATION_TIMEOUT_MS,
@@ -2244,7 +2284,7 @@ describe("index.ts integration", () => {
 				RuntimeCoordinator: class {
 					projectRoot = tmpDir;
 					turnIndex = 0;
-					complexityBaselines = new Map();
+					complexityBaselines = new Set();
 					cachedExports = new Map();
 					readGuard = {
 						recordRead: () => {},
@@ -2272,6 +2312,10 @@ describe("index.ts integration", () => {
 						return 0;
 					}
 					resetForSession() {}
+					// #4483: the tool_call's pre-edit linter capture asks for it.
+					captureSessionGeneration() {
+						return { isCurrent: () => true };
+					}
 					setTelemetryIdentity() {}
 					telemetrySessionId = "test-session";
 				},
@@ -2356,7 +2400,7 @@ describe("index.ts integration", () => {
 				RuntimeCoordinator: class {
 					projectRoot = tmpDir;
 					turnIndex = 0;
-					complexityBaselines = new Map();
+					complexityBaselines = new Set();
 					cachedExports = new Map();
 					readGuard = {
 						recordRead: () => {},
@@ -2384,6 +2428,10 @@ describe("index.ts integration", () => {
 						return 0;
 					}
 					resetForSession() {}
+					// #4483: the tool_call's pre-edit linter capture asks for it.
+					captureSessionGeneration() {
+						return { isCurrent: () => true };
+					}
 					setTelemetryIdentity() {}
 					telemetrySessionId = "test-session";
 				},
@@ -2483,7 +2531,7 @@ describe("index.ts integration", () => {
 				RuntimeCoordinator: class {
 					projectRoot = tmpDir;
 					turnIndex = 0;
-					complexityBaselines = new Map();
+					complexityBaselines = new Set();
 					cachedExports = new Map();
 					readGuard = {
 						recordRead: () => {},
@@ -2509,6 +2557,10 @@ describe("index.ts integration", () => {
 						return 0;
 					}
 					resetForSession() {}
+					// #4483: the tool_call's pre-edit linter capture asks for it.
+					captureSessionGeneration() {
+						return { isCurrent: () => true };
+					}
 					setTelemetryIdentity() {}
 					telemetrySessionId = "test-session";
 				},
@@ -2544,11 +2596,9 @@ describe("index.ts integration", () => {
 					},
 				}));
 			});
-			vi.doMock("../clients/lsp/capabilities.js", async () => ({
-				getLSPService: () => makeLspServiceDouble({ touchFile: touchFileMock }),
-				resetLSPService: () => {},
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({ touchFile: touchFileMock });
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": false });
 			registerExtension(pi as any);
@@ -2591,7 +2641,7 @@ describe("index.ts integration", () => {
 				RuntimeCoordinator: class {
 					projectRoot = tmpDir;
 					turnIndex = 0;
-					complexityBaselines = new Map();
+					complexityBaselines = new Set();
 					cachedExports = new Map();
 					readGuard = {
 						recordRead: () => {},
@@ -2617,6 +2667,10 @@ describe("index.ts integration", () => {
 						return 0;
 					}
 					resetForSession() {}
+					// #4483: the tool_call's pre-edit linter capture asks for it.
+					captureSessionGeneration() {
+						return { isCurrent: () => true };
+					}
 					setTelemetryIdentity() {}
 					telemetrySessionId = "test-session";
 				},
@@ -2652,11 +2706,9 @@ describe("index.ts integration", () => {
 					},
 				}));
 			});
-			vi.doMock("../clients/lsp/capabilities.js", async () => ({
-				getLSPService: () => makeLspServiceDouble({ touchFile: touchFileMock }),
-				resetLSPService: () => {},
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({ touchFile: touchFileMock });
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": false });
 			registerExtension(pi as any);
@@ -2694,7 +2746,7 @@ describe("index.ts integration", () => {
 				RuntimeCoordinator: class {
 					projectRoot = tmpDir;
 					turnIndex = 0;
-					complexityBaselines = new Map();
+					complexityBaselines = new Set();
 					cachedExports = new Map();
 					readGuard = {
 						recordRead: () => {},
@@ -2720,6 +2772,10 @@ describe("index.ts integration", () => {
 						return 0;
 					}
 					resetForSession() {}
+					// #4483: the tool_call's pre-edit linter capture asks for it.
+					captureSessionGeneration() {
+						return { isCurrent: () => true };
+					}
 					setTelemetryIdentity() {}
 					telemetrySessionId = "test-session";
 				},
@@ -2755,11 +2811,9 @@ describe("index.ts integration", () => {
 					},
 				}));
 			});
-			vi.doMock("../clients/lsp/capabilities.js", async () => ({
-				getLSPService: () => makeLspServiceDouble({ touchFile: touchFileMock }),
-				resetLSPService: () => {},
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({ touchFile: touchFileMock });
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, handlers } = createMockPi({ "no-lsp": false });
 			registerExtension(pi as any);
@@ -2798,7 +2852,11 @@ describe("index.ts integration", () => {
 						return 0;
 					}
 					resetForSession() {}
-					complexityBaselines = new Map();
+					// #4483: the tool_call's pre-edit linter capture asks for it.
+					captureSessionGeneration() {
+						return { isCurrent: () => true };
+					}
+					complexityBaselines = new Set();
 					projectRulesScan = { hasCustomRules: false, rules: [] };
 					cachedExports = new Map();
 					errorDebtBaseline = null;
@@ -2812,17 +2870,6 @@ describe("index.ts integration", () => {
 						recordRead: () => {},
 					};
 				},
-			}));
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () =>
-					makeLspServiceDouble({
-						getAliveClientCount: () => 1,
-						getAliveServerIds: () => ["typescript"],
-						getStatus: () => [
-							{ serverId: "typescript", root: tmpDir, connected: true },
-						],
-					}),
-				resetLSPService: () => {},
 			}));
 			vi.doMock("../clients/dispatch/integration.js", async () => ({
 				getDispatchSlopScoreLine: () => "Slop score: 12/100",
@@ -2903,6 +2950,14 @@ describe("index.ts integration", () => {
 				}));
 			});
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({
+				getAliveClientCount: () => 1,
+				getAliveServerIds: () => ["typescript"],
+				getStatus: () => [
+					{ serverId: "typescript", root: tmpDir, connected: true },
+				],
+			});
 			const { default: registerExtension } = await import("../index.js");
 			const { pi, commands } = createMockPi();
 			registerExtension(pi as any);
@@ -3026,7 +3081,6 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 		vi.doUnmock("../clients/runtime-coordinator.js");
 		vi.doUnmock("../clients/installer/index.js");
 		vi.doUnmock("../clients/runtime-session.js");
-		vi.doUnmock("../clients/lsp/capabilities.js");
 		quietTasks = [];
 		handleTurnEndHook = undefined;
 		_resetProcessSingletonsForTests();
@@ -3221,8 +3275,8 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 			registerExtension(pi as any);
 
 			const result = await mock.emit(
-				"context",
-				{ messages: [{ role: "user", content: "continue" }] },
+				"context_with_system",
+				makeContextWithSystemEvent([{ role: "user", content: "continue" }]),
 				{ cwd: tmpDir },
 			);
 			expect(result).toBeUndefined();
@@ -3275,8 +3329,8 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 
 			expect(sentMessages).toHaveLength(0);
 			const firstContext = await mock.emit(
-				"context",
-				{ messages: [{ role: "user", content: "continue" }] },
+				"context_with_system",
+				makeContextWithSystemEvent([{ role: "user", content: "continue" }]),
 				{ cwd: tmpDir },
 			);
 			const messages = (
@@ -3290,8 +3344,10 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 			expect(messages).toContain("[from a prior turn");
 			expect(messages).toContain("FAIL test/app.test.ts:1");
 			const secondContext = await mock.emit(
-				"context",
-				{ messages: [{ role: "user", content: "continue again" }] },
+				"context_with_system",
+				makeContextWithSystemEvent([
+					{ role: "user", content: "continue again" },
+				]),
 				{ cwd: tmpDir },
 			);
 			expect(secondContext).toBeUndefined();
@@ -3339,8 +3395,8 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 			);
 
 			const result = await mock.emit(
-				"context",
-				{ messages: [{ role: "user", content: "continue" }] },
+				"context_with_system",
+				makeContextWithSystemEvent([{ role: "user", content: "continue" }]),
 				{ cwd: tmpDir },
 			);
 			expect(result).toBeUndefined();
@@ -3830,11 +3886,9 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 				clearCachePrefixSession,
 			}));
 			const resetLSPService = vi.fn();
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService,
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({}, { beforeReset: resetLSPService });
 			const { default: registerExtension } = await import("../index.js");
 			const primary = createMockPi();
 			registerExtension(primary.pi as any);
@@ -3850,8 +3904,8 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 			await secondary.trigger("session_start", {}, secondaryCtx);
 			resetLSPService.mockClear();
 			await secondary.trigger(
-				"context",
-				{ messages: [{ role: "user", content: "prompt" }] },
+				"context_with_system",
+				makeContextWithSystemEvent([{ role: "user", content: "prompt" }]),
 				secondaryCtx,
 			);
 			await secondary.trigger(
@@ -3906,11 +3960,9 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 				logCacheUsage,
 			}));
 			const resetLSPService = vi.fn();
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService,
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble({}, { beforeReset: resetLSPService });
 			const { default: registerExtension } = await import("../index.js");
 			const primary = createMockPi();
 			registerExtension(primary.pi as any);
@@ -4074,11 +4126,9 @@ describe("#484 turn-summary emit at the agent_settled quiet window", () => {
 				>()),
 				incrementDegradationCount: r6Mocks.incrementDegradationCount,
 			}));
-			vi.doMock("../clients/lsp/capabilities.js", () => ({
-				getLSPService: () => makeLspServiceDouble(),
-				resetLSPService: vi.fn(),
-			}));
 
+			// The seam install goes after the doMocks above: it evaluates the graph.
+			await installLspServiceDouble();
 			const { default: registerExtension } = await import("../index.js");
 			const primary = createMockPi();
 			registerExtension(primary.pi as any);

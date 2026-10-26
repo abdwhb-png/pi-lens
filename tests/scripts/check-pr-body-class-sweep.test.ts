@@ -1,9 +1,11 @@
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
 	lintClassSweep,
 	lintLocalPrBody,
+	lintPrBody,
 } from "../../scripts/check-pr-body.mjs";
 
 // #4273: a `## Class sweep` names the defect shape, quotes the search that
@@ -59,18 +61,49 @@ describe("Class sweep shape and search (#4273)", () => {
 		expect(lintClassSweep(section(sweep))).toHaveLength(1);
 	});
 
+	// Recurrence: #4385. The test ran against the real repository root, and
+	// `lintPrBody` hands `testCorpus` no git stub, so the 4248 body's `tests/`
+	// citations made it run a real `git ls-files tests` and lex every test file:
+	// 2024 of 2072 ms in one profiled call, over the 5000 ms default under shard
+	// load. An empty root keeps the composition (Class sweep reached through
+	// `lintLocalPrBody`) and drops the whole-tree scan.
 	it("reaches the local preflight composition", () => {
-		const gitStub = () => "";
-		expect(
-			lintLocalPrBody(pr4248Body, process.cwd(), gitStub as never).errors.join(
-				" ",
-			),
-		).toContain('"## Class sweep"');
-		expect(
-			lintLocalPrBody(pr4245Body, process.cwd(), gitStub as never).errors.join(
-				" ",
-			),
-		).not.toContain('"## Class sweep"');
+		const root = mkdtempSync(join(tmpdir(), "pi-lens-class-sweep-"));
+		try {
+			const gitStub = () => "";
+			expect(
+				lintLocalPrBody(pr4248Body, root, gitStub as never).errors.join(" "),
+			).toContain('"## Class sweep"');
+			expect(
+				lintLocalPrBody(pr4245Body, root, gitStub as never).errors.join(" "),
+			).not.toContain('"## Class sweep"');
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	// #4717 F1, class-wide: the reviewed head (and master, by measurement)
+	// accepted a `## Class sweep` hidden inside an HTML comment, because the
+	// heading scan read the fence-blanked body only. GitHub renders no section
+	// for it, so the requirement and the section lint now read the
+	// comment-blanked body as the reader sees it.
+	it("does not read a Class sweep an HTML comment hides", () => {
+		const hidden = [
+			"## Summary",
+			"The section is hidden.",
+			"",
+			"<!--",
+			"## Class sweep",
+			"Defect shape: x. Search: `rg x`. Verdict: none.",
+			"-->",
+			"",
+			"## Observability",
+			"Recorded.",
+		].join("\n");
+		expect(lintClassSweep(hidden)).toEqual([]);
+		expect(lintPrBody(hidden, { workingTree: true }).errors).toContainEqual(
+			expect.stringContaining('missing "## Class sweep"'),
+		);
 	});
 
 	// F1: the template sanctions "a per-member line (an arrow or a coverage

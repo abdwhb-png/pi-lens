@@ -1,11 +1,32 @@
+// flake-shape: in-process-mock — the declaration owner is wrapped, not replaced:
+// every other export stays real, and only the resolver is counted so the
+// snapshot's per-file walks are observable (#4638 review F10).
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { removeTempDirSync } from "../clients/test-utils.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	TEST_FIXTURE_ROOT_MARKER,
+	pinFixtureHome,
+	removeTempDirSync,
+	setupTestEnvironment,
+} from "../clients/test-utils.js";
+import {
+	addRenameClient,
+	makeRenameClient,
+} from "../support/lsp-rename-client-double.js";
+import { LSPService } from "../../clients/lsp/index.js";
 import { makeLspServiceDouble } from "../support/lsp-service-double.js";
 import { CacheManager } from "../../clients/cache-manager.js";
+import {
+	_resetDeferredForTests,
+	_resetStateCacheForTests,
+} from "../../clients/diagnostic-dispositions.js";
+import {
+	_setRecentPhasesForTest,
+	getRecentLoggedPhases,
+} from "../../clients/latency-logger.js";
 import { hashDiagnosticContent } from "../../clients/lsp/diagnostic-binding.js";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 import { readChangesSince } from "../../clients/project-changes.js";
@@ -15,11 +36,26 @@ const mocked = vi.hoisted(() => ({
 	service: null as unknown,
 }));
 
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: () => mocked.service,
-}));
+// #4638 review (F10): the declaration owner is wrapped, not replaced — every
+// other export stays real — so the snapshot's per-file walks can be counted.
+const walkedDeclarations = vi.hoisted(() => ({ files: [] as string[] }));
+vi.mock("../../clients/python-environment.js", async (importOriginal) => {
+	const actual =
+		await importOriginal<
+			typeof import("../../clients/python-environment.js")
+		>();
+	return {
+		...actual,
+		detectPythonTargetVersion: vi.fn(async (filePath: string) => {
+			walkedDeclarations.files.push(filePath);
+			return actual.detectPythonTargetVersion(filePath);
+		}),
+	};
+});
 
+import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
 import { createLspNavigationTool } from "../../tools/lsp-navigation.js";
+import { installLspService } from "../support/lsp-service-seam.js";
 
 const tmpPath = (name: string): string => path.join(os.tmpdir(), name);
 const tmpFileUrl = (name: string): string => pathToFileURL(tmpPath(name)).href;
@@ -44,69 +80,71 @@ describe("lsp_navigation tool", () => {
 		// present — the real `LSPService` always has it — so the double keeps the
 		// factory's `touchFile`, and the scoped-open case below asserts the touch
 		// (with its options), which is the call production actually makes.
-		mocked.service = makeLspServiceDouble({
-			supportsLSP: vi.fn().mockReturnValue(true),
-			hasLSP: vi.fn().mockResolvedValue(true),
-			getDiagnostics: vi.fn().mockResolvedValue([]),
-			getOperationSupport: vi.fn().mockResolvedValue(null),
-			getCapabilitySnapshots: vi.fn().mockResolvedValue([]),
-			codeAction: vi
-				.fn()
-				.mockResolvedValue([
-					{ title: "Move to new file", kind: "refactor.move.newFile" },
+		mocked.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: vi.fn().mockReturnValue(true),
+				hasLSP: vi.fn().mockResolvedValue(true),
+				getDiagnostics: vi.fn().mockResolvedValue([]),
+				getOperationSupport: vi.fn().mockResolvedValue(null),
+				getCapabilitySnapshots: vi.fn().mockResolvedValue([]),
+				codeAction: vi
+					.fn()
+					.mockResolvedValue([
+						{ title: "Move to new file", kind: "refactor.move.newFile" },
+					]),
+				rename: vi.fn().mockResolvedValue(null),
+				// #3601: a rename edit that writes a file besides its target is applied
+				// only to a file the client tracks. These cases are about provenance,
+				// not staleness, so every file reads as tracked in sync with the disk,
+				// sent long before the rename.
+				getTrackedContent: vi.fn((filePath: string) => ({
+					hash: hashDiagnosticContent(fs.readFileSync(filePath, "utf-8")),
+					changedAtMs: 0,
+				})),
+				renameFile: vi.fn().mockResolvedValue({
+					applied: false,
+					serverIds: [],
+					willRenameFailures: [],
+					didRenameFailures: [],
+					droppedConflicts: 0,
+					inputEditCount: 0,
+					summary: [],
+				}),
+				references: vi.fn().mockResolvedValue([
+					{
+						uri: tmpFileUrl("sample.ts"),
+						range: {
+							start: { line: 1, character: 1 },
+							end: { line: 1, character: 5 },
+						},
+					},
 				]),
-			rename: vi.fn().mockResolvedValue(null),
-			// #3601: a rename edit that writes a file besides its target is applied
-			// only to a file the client tracks. These cases are about provenance,
-			// not staleness, so every file reads as tracked in sync with the disk,
-			// sent long before the rename.
-			getTrackedContent: vi.fn((filePath: string) => ({
-				hash: hashDiagnosticContent(fs.readFileSync(filePath, "utf-8")),
-				changedAtMs: 0,
-			})),
-			renameFile: vi.fn().mockResolvedValue({
-				applied: false,
-				serverIds: [],
-				willRenameFailures: [],
-				didRenameFailures: [],
-				droppedConflicts: 0,
-				inputEditCount: 0,
-				summary: [],
+				typeDefinition: vi.fn().mockResolvedValue([
+					{
+						uri: tmpFileUrl("types.ts"),
+						range: {
+							start: { line: 9, character: 0 },
+							end: { line: 9, character: 4 },
+						},
+					},
+				]),
+				declaration: vi.fn().mockResolvedValue([]),
+				workspaceSymbol: vi.fn().mockResolvedValue([]),
+				getAdvertisedCommands: vi
+					.fn()
+					.mockResolvedValue(["_typescript.organizeImports"]),
+				executeCommand: vi
+					.fn()
+					.mockResolvedValue({ executed: true, result: null }),
+				documentSymbol: vi.fn().mockResolvedValue([]),
+				incomingCalls: vi.fn().mockResolvedValue([]),
+				outgoingCalls: vi.fn().mockResolvedValue([]),
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				getWorkspaceDiagnosticsSupport: vi
+					.fn()
+					.mockResolvedValue({ mode: "push-only" }),
 			}),
-			references: vi.fn().mockResolvedValue([
-				{
-					uri: tmpFileUrl("sample.ts"),
-					range: {
-						start: { line: 1, character: 1 },
-						end: { line: 1, character: 5 },
-					},
-				},
-			]),
-			typeDefinition: vi.fn().mockResolvedValue([
-				{
-					uri: tmpFileUrl("types.ts"),
-					range: {
-						start: { line: 9, character: 0 },
-						end: { line: 9, character: 4 },
-					},
-				},
-			]),
-			declaration: vi.fn().mockResolvedValue([]),
-			workspaceSymbol: vi.fn().mockResolvedValue([]),
-			getAdvertisedCommands: vi
-				.fn()
-				.mockResolvedValue(["_typescript.organizeImports"]),
-			executeCommand: vi
-				.fn()
-				.mockResolvedValue({ executed: true, result: null }),
-			documentSymbol: vi.fn().mockResolvedValue([]),
-			incomingCalls: vi.fn().mockResolvedValue([]),
-			outgoingCalls: vi.fn().mockResolvedValue([]),
-			getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
-			getWorkspaceDiagnosticsSupport: vi
-				.fn()
-				.mockResolvedValue({ mode: "push-only" }),
-		});
+		);
 	});
 
 	it("reports cached LSP capabilities without requiring path", async () => {
@@ -254,6 +292,122 @@ describe("lsp_navigation tool", () => {
 				.incomingCalls,
 		).toHaveBeenCalledOnce();
 		expect(result.details?.operation).toBe("incomingCalls");
+	});
+
+	// #4687: the schema carries callHierarchyItem as an opaque object, so the
+	// LSP CallHierarchyItem shape is checked at execute, before any server call
+	// (MCP never validates the schema at all). Recurrence: a malformed item
+	// reaching `uriToPath` or the server, where it fails as an opaque error or
+	// an empty "no callers" answer instead of a refusal naming the field.
+	const wellFormedItem = () => ({
+		name: "foo",
+		kind: 12,
+		uri: tmpFileUrl("item.py"),
+		range: {
+			start: { line: 1, character: 0 },
+			end: { line: 1, character: 3 },
+		},
+		selectionRange: {
+			start: { line: 1, character: 0 },
+			end: { line: 1, character: 3 },
+		},
+	});
+	it.each([
+		[
+			"absent",
+			(): unknown => undefined,
+			"callHierarchyItem parameter required",
+		],
+		[
+			"a string",
+			(): unknown => "foo",
+			"callHierarchyItem must be the object prepareCallHierarchy returned",
+		],
+		// #4723 F7: an array is an object to `typeof`; without the array branch
+		// it would be reported as a missing `name` instead of the wrong shape.
+		[
+			"an array",
+			(): unknown => [],
+			"callHierarchyItem must be the object prepareCallHierarchy returned",
+		],
+		[
+			"no uri",
+			(): unknown => ({ ...wellFormedItem(), uri: undefined }),
+			"callHierarchyItem.uri must be a string",
+		],
+		[
+			"a string kind",
+			(): unknown => ({ ...wellFormedItem(), kind: "Function" }),
+			"callHierarchyItem.kind must be a number",
+		],
+		[
+			"no range",
+			(): unknown => ({ ...wellFormedItem(), range: undefined }),
+			"callHierarchyItem.range must be a range object",
+		],
+		[
+			"a string selectionRange.end.character",
+			(): unknown => {
+				const item = wellFormedItem();
+				return {
+					...item,
+					selectionRange: {
+						...item.selectionRange,
+						end: { line: 1, character: "3" },
+					},
+				};
+			},
+			"callHierarchyItem.selectionRange.end.character must be a number",
+		],
+	] satisfies ReadonlyArray<readonly [string, () => unknown, string]>)(
+		"refuses a callHierarchyItem that is %s before any server call",
+		async (_label, makeItem, message) => {
+			for (const operation of ["incomingCalls", "outgoingCalls"] as const) {
+				const service = mocked.service as Record<
+					string,
+					ReturnType<typeof vi.fn>
+				>;
+				service.getOperationSupport?.mockClear();
+				service[operation]?.mockClear();
+				const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+				const result = await tool.execute(
+					`bad-item-${operation}`,
+					{ operation, callHierarchyItem: makeItem() },
+					new AbortController().signal,
+					null,
+					{ cwd: "." },
+				);
+
+				expect(result.isError).toBe(true);
+				expect(result.details?.failureKind).toBe("bad_input");
+				expect(parseToolJson(result).errors).toEqual([
+					`${message} for ${operation}`,
+				]);
+				expect(service[operation]).not.toHaveBeenCalled();
+				expect(service.getOperationSupport).not.toHaveBeenCalled();
+			}
+		},
+	);
+
+	it("passes a call hierarchy item's extra fields (detail, data) to the server unchanged", async () => {
+		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+		const callHierarchyItem = {
+			...wellFormedItem(),
+			detail: "module a",
+			data: { serverToken: 7 },
+		};
+		await tool.execute(
+			"item-extra",
+			{ operation: "outgoingCalls", callHierarchyItem },
+			new AbortController().signal,
+			null,
+			{ cwd: "." },
+		);
+
+		expect(
+			(mocked.service as { outgoingCalls: ReturnType<typeof vi.fn> })
+				.outgoingCalls,
+		).toHaveBeenCalledWith(callHierarchyItem);
 	});
 
 	it("adds workspaceSymbol hint when path is omitted and empty", async () => {
@@ -458,6 +612,11 @@ describe("lsp_navigation tool", () => {
 
 	it("reports an empty declaration result with the no-results reason", async () => {
 		const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+		// A server answered: the service has a client for the file. With no
+		// client (`null`), an empty answer is no_server (#4403 round 5, V5).
+		(
+			mocked.service as { getOperationSupport: ReturnType<typeof vi.fn> }
+		).getOperationSupport = vi.fn().mockResolvedValue({ declaration: true });
 
 		const result = await tool.execute(
 			"declaration-empty",
@@ -1220,7 +1379,7 @@ describe("lsp_navigation tool", () => {
 			expect(
 				(mocked.service as { getDiagnostics: ReturnType<typeof vi.fn> })
 					.getDiagnostics,
-			).toHaveBeenCalledWith(filePath);
+			).toHaveBeenCalledWith(filePath, undefined, new Set());
 		} finally {
 			removeTempDirSync(tmpDir);
 		}
@@ -1666,6 +1825,291 @@ describe("lsp_navigation tool", () => {
 		}
 	});
 
+	// #4578: the `rename_file` destination is a WRITE target, so it resolves
+	// through the same host-path seam pi's own write tool uses
+	// (`resolveHostToolPath`, clients/path-utils.ts): `~` expands to `$HOME`, a
+	// leading `@` mention prefix is dropped, pi's unicode space class folds to
+	// U+0020, and a `file://` URL converts. Pre-fix the destination took a bare
+	// `path.resolve(cwd, x)`, so `~/renamed.ts` became `<cwd>/~/renamed.ts`: the
+	// rename created a literal `~` directory inside the project and rewrote every
+	// importer to point into it. These cells drive the real tool over a real
+	// `LSPService`, so the rename, the confinement check, and the importer
+	// rewrite are the production ones.
+	describe("rename_file destination resolution (#4578)", () => {
+		/**
+		 * A real `LSPService` rename behind the factory-seeded service double.
+		 *
+		 * `renameFile` is the PRODUCTION implementation on a real service, so the
+		 * destination resolution, the workspace confinement and the importer
+		 * rewrite are the shipped ones. Every other member is the double's `vi.fn`,
+		 * which is what keeps a language server from starting: the tool resyncs the
+		 * renamed file through `openFileBestEffort` -> `touchFile`, and a bare real
+		 * service SPAWNS for that call (measured here: `touchFile` on a `.ts` file
+		 * left `deno` running, `getAliveClientCount()` 1). This suite is not the
+		 * `lsp-spawn-heavy` lane and must start no server.
+		 */
+		const makeRenameHarness = () => {
+			const realService = new LSPService();
+			const service = makeLspServiceDouble({
+				// The tool's own dispatch gate: a file operation is only reached
+				// when the service reports a server for the file (tools/lsp-navigation.ts
+				// `supportsLSP` gate). This is the double saying "yes", not a server.
+				supportsLSP: vi.fn(() => true),
+				hasLSP: vi.fn(async () => true),
+				renameFile: (
+					oldFilePath: string,
+					newFilePath: string,
+					options: Parameters<LSPService["renameFile"]>[2],
+				) => realService.renameFile(oldFilePath, newFilePath, options),
+			});
+			return {
+				realService,
+				service,
+				touchFile: service.touchFile as ReturnType<typeof vi.fn>,
+				/**
+				 * The real service's own `touchFile` is the only call that can
+				 * discover and spawn a server, so instrument it (the spy keeps the
+				 * implementation) and assert it is never reached.
+				 */
+				realTouchFile: vi.spyOn(realService, "touchFile"),
+				/** Nothing the case started may outlive it, before its fixture goes. */
+				stop: async (): Promise<void> => {
+					await realService.shutdown();
+				},
+			};
+		};
+
+		type RenameHarness = ReturnType<typeof makeRenameHarness>;
+
+		const renameThroughTool = async (
+			harness: RenameHarness,
+			cwd: string,
+			callId: string,
+			sourcePath: string,
+			newFilePath: string,
+		) => {
+			mocked.service = installLspService(harness.service);
+			const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+			return tool.execute(
+				callId,
+				{
+					operation: "rename_file",
+					path: sourcePath,
+					newFilePath,
+					apply: true,
+				},
+				new AbortController().signal,
+				null,
+				{ cwd },
+			);
+		};
+
+		/**
+		 * No language server was started. Two arms, same claim: the real service
+		 * never reached its spawn-capable `touchFile`, and its live clients are
+		 * exactly the fixture's — a real spawn adds a `serverId` entry.
+		 */
+		const expectNoServerStarted = (
+			harness: RenameHarness,
+			registeredServerIds: string[],
+		): void => {
+			expect(harness.realTouchFile).not.toHaveBeenCalled();
+			expect(
+				harness.realService.getStatus().map((entry) => entry.serverId),
+			).toEqual(registeredServerIds);
+		};
+
+		it("expands a ~ destination to $HOME and rewrites the importer there, never a ~ directory under the cwd", async () => {
+			// #4591: this cell needs HOME to CONTAIN the workspace, because a
+			// `~/…` destination has to land inside it. Both live under the pinned
+			// fixture home, which is outside every root the harness deletes, so a
+			// straggler child writing to its inherited HOME cannot re-create one.
+			const { home, restore } = pinFixtureHome("lsp-nav-4578-home");
+			const workspace = path.join(home, "workspace");
+			fs.mkdirSync(path.join(workspace, TEST_FIXTURE_ROOT_MARKER), {
+				recursive: true,
+			});
+			const oldPath = path.join(workspace, "old.ts");
+			const importPath = path.join(workspace, "import.ts");
+			const renamedPath = path.join(workspace, "renamed.ts");
+			fs.writeFileSync(oldPath, "export const value = 1;\n");
+			fs.writeFileSync(importPath, "import { value } from './old';\n");
+			// #3601: an importer no language client has open is refused when its
+			// mtime sits within 2 s of the rename request. An old mtime is the
+			// fixture for "the server read these bytes earlier", not a wait.
+			const past = new Date(Date.now() - 60_000);
+			fs.utimesSync(importPath, past, past);
+
+			const harness = makeRenameHarness();
+			const client = makeRenameClient(workspace, {
+				changes: {
+					[pathToFileURL(importPath).href]: [
+						{
+							range: {
+								start: { line: 0, character: 25 },
+								end: { line: 0, character: 28 },
+							},
+							newText: "renamed",
+						},
+					],
+				},
+			});
+			addRenameClient(harness.realService, "typescript", workspace, client);
+			// Prove the pin TOOK: the rename writes at the resolved destination, so
+			// a pin that silently fell through would put a test file in the
+			// developer's real home.
+			expect(os.homedir(), "the fixture HOME did not take effect").toBe(home);
+
+			try {
+				const result = await renameThroughTool(
+					harness,
+					workspace,
+					"rename-file-tilde-home",
+					oldPath,
+					"~/workspace/renamed.ts",
+				);
+
+				expect(result.isError).toBeUndefined();
+				// The defect: the destination joined onto the cwd as
+				// `<cwd>/~/workspace/renamed.ts`.
+				expect(fs.existsSync(path.join(workspace, "~"))).toBe(false);
+				expect(fs.readFileSync(renamedPath, "utf-8")).toBe(
+					"export const value = 1;\n",
+				);
+				expect(fs.existsSync(oldPath)).toBe(false);
+				// The server was asked about the expanded destination, so the importer
+				// rewrite it computed names the file that actually landed.
+				expect(client.willRenameFiles).toHaveBeenCalledWith(
+					oldPath,
+					renamedPath,
+				);
+				expect(fs.readFileSync(importPath, "utf-8")).toBe(
+					"import { value } from './renamed';\n",
+				);
+				// The post-rename resync ran, and it reached the double only.
+				expectNoServerStarted(harness, ["typescript"]);
+				expect(harness.touchFile).toHaveBeenCalled();
+			} finally {
+				restore();
+				await harness.stop();
+			}
+		});
+
+		it("expands a ~ destination outside the workspace and refuses it without creating a ~ directory", async () => {
+			const { home, restore } = pinFixtureHome("lsp-nav-4578-home-outside");
+			const project = setupTestEnvironment("pi-lens-lsp-nav-4578-project-");
+			const oldPath = path.join(project.tmpDir, "old.ts");
+			fs.writeFileSync(oldPath, "export const value = 1;\n");
+			const harness = makeRenameHarness();
+			expect(os.homedir(), "the fixture HOME did not take effect").toBe(home);
+
+			try {
+				const result = await renameThroughTool(
+					harness,
+					project.tmpDir,
+					"rename-file-tilde-outside",
+					oldPath,
+					"~/renamed.ts",
+				);
+
+				// The existing rename confinement refuses a destination outside the
+				// workspace, and its message names the EXPANDED destination: the
+				// refusal is about `$HOME/renamed.ts`, not about a `~` under the cwd.
+				expect(result.isError).toBe(true);
+				expect(String(result.content[0]?.text)).toContain(
+					`workspace edit path escapes workspace: ${pathToFileURL(path.join(home, "renamed.ts")).href}`,
+				);
+				expect(result.details?.failureKind).toBe("lsp_error");
+				expect(fs.existsSync(oldPath)).toBe(true);
+				expect(fs.existsSync(path.join(project.tmpDir, "~"))).toBe(false);
+				expect(fs.existsSync(path.join(home, "renamed.ts"))).toBe(false);
+				expectNoServerStarted(harness, []);
+			} finally {
+				restore();
+				await harness.stop();
+				project.cleanup();
+			}
+		});
+
+		it("drops a leading @ mention prefix on the destination, as pi's write path does", async () => {
+			const env = setupTestEnvironment("pi-lens-lsp-nav-4578-at-prefix-");
+			const oldPath = path.join(env.tmpDir, "old.ts");
+			fs.writeFileSync(oldPath, "export const value = 1;\n");
+			const harness = makeRenameHarness();
+
+			try {
+				// pi's `normalizePath` drops ONE leading `@` (its file-mention prefix),
+				// so a destination spelled `@renamed.ts` names the file `renamed.ts`.
+				// A file genuinely called `@renamed.ts` stays reachable as
+				// `./@renamed.ts`, exactly as it does for pi's own write tool.
+				const result = await renameThroughTool(
+					harness,
+					env.tmpDir,
+					"rename-file-at-prefix",
+					oldPath,
+					"@renamed.ts",
+				);
+
+				expect(result.isError).toBeUndefined();
+				expect(fs.existsSync(path.join(env.tmpDir, "renamed.ts"))).toBe(true);
+				expect(fs.existsSync(path.join(env.tmpDir, "@renamed.ts"))).toBe(false);
+
+				// Only a LEADING `@` is pi's mention prefix, so the `./@…` spelling keeps
+				// the character: a file genuinely called `@kept.ts` stays reachable,
+				// exactly as it does for pi's own write tool.
+				const literal = await renameThroughTool(
+					harness,
+					env.tmpDir,
+					"rename-file-at-literal",
+					path.join(env.tmpDir, "renamed.ts"),
+					"./@kept.ts",
+				);
+
+				expect(literal.isError).toBeUndefined();
+				expect(fs.existsSync(path.join(env.tmpDir, "@kept.ts"))).toBe(true);
+				expect(fs.existsSync(path.join(env.tmpDir, "kept.ts"))).toBe(false);
+				expectNoServerStarted(harness, []);
+				expect(harness.touchFile).toHaveBeenCalled();
+			} finally {
+				await harness.stop();
+				env.cleanup();
+			}
+		});
+
+		it("folds pi's unicode space class on the destination, as pi's write path does", async () => {
+			const env = setupTestEnvironment("pi-lens-lsp-nav-4578-nbsp-");
+			const oldPath = path.join(env.tmpDir, "old.ts");
+			fs.writeFileSync(oldPath, "export const value = 1;\n");
+			const foldedPath = path.join(env.tmpDir, "renamed a.ts");
+			const harness = makeRenameHarness();
+
+			try {
+				// U+00A0 is in pi's unicode space class, which folds to U+0020 before
+				// resolution, so a destination typed with it names the plain-space file.
+				const result = await renameThroughTool(
+					harness,
+					env.tmpDir,
+					"rename-file-unicode-space",
+					oldPath,
+					`renamed${String.fromCharCode(0x00a0)}a.ts`,
+				);
+
+				expect(result.isError).toBeUndefined();
+				expect(fs.existsSync(foldedPath)).toBe(true);
+				expect(
+					fs.existsSync(
+						path.join(env.tmpDir, `renamed${String.fromCharCode(0x00a0)}a.ts`),
+					),
+				).toBe(false);
+				expectNoServerStarted(harness, []);
+				expect(harness.touchFile).toHaveBeenCalled();
+			} finally {
+				await harness.stop();
+				env.cleanup();
+			}
+		});
+	});
+
 	// #2450 fix round 3 (F4) note: `isRecordable`'s cwd-vs-projectRoot
 	// divergence is NOT reachable through this file's mocked-service harness.
 	// `rename`'s real (unmocked) `applyWorkspaceEdit(edit, ctx.cwd, ...)`
@@ -1683,4 +2127,406 @@ describe("lsp_navigation tool", () => {
 	// tests/clients/lsp/integration.test.ts ("records a server-initiated
 	// edit on a sibling package when the mutation context's isRecordable
 	// judges against the project root, not cwd").
+});
+
+// #1634: every diagnostics read routes through the shared finding policy or
+// carries an age label. `lsp_navigation workspaceDiagnostics` did neither: the
+// path read rendered raw server findings with no disposition, rule-policy or
+// inline `pi-lens-ignore` filter (the stack `lens_diagnostics source=lsp`
+// applies since #3088), and the tracked snapshot replayed client-published rows
+// of unknown age. Recurrence it prevents: an agent that marked a finding
+// `false-positive` saw it again on this route, and a snapshot row published
+// before an out-of-band edit read as current.
+describe("lsp_navigation workspaceDiagnostics delivery gate (#1634)", () => {
+	const MARKED = "Type 'string' is not assignable to type 'number'.";
+	const KEPT = "Cannot find name 'other'.";
+	let cwd: string;
+	let filePath: string;
+	let previousDataDir: string | undefined;
+
+	const serverDiagnostics = () => [
+		{
+			severity: 1,
+			message: MARKED,
+			source: "typescript",
+			code: 2322,
+			range: {
+				start: { line: 0, character: 6 },
+				end: { line: 0, character: 11 },
+			},
+		},
+		{
+			severity: 1,
+			message: KEPT,
+			source: "typescript",
+			code: 2304,
+			range: {
+				start: { line: 1, character: 13 },
+				end: { line: 1, character: 18 },
+			},
+		},
+	];
+
+	beforeEach(async () => {
+		cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-1634-nav-"));
+		filePath = path.join(cwd, "app.ts");
+		fs.writeFileSync(
+			filePath,
+			"const value: number = 'bad';\nexport const other = 1;\n",
+		);
+		previousDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(cwd, "data");
+		mocked.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: vi.fn().mockReturnValue(true),
+				getDiagnostics: vi.fn().mockResolvedValue([]),
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				getWorkspaceDiagnosticsSupport: vi
+					.fn()
+					.mockResolvedValue({ mode: "push-only" }),
+			}),
+		);
+		_resetDeferredForTests();
+		_resetStateCacheForTests();
+		// The phase ring is process state: an earlier case's record must not
+		// satisfy this case's trace assertion.
+		_setRecentPhasesForTest([]);
+		const marked = await createLensDiagnosticMarkTool(() => cwd).execute(
+			"mark-1634",
+			{
+				filePath,
+				line: 1,
+				message: MARKED,
+				rule: "typescript:2322",
+				tool: "lsp",
+				disposition: "false-positive",
+			},
+			undefined,
+			() => {},
+			{ cwd },
+		);
+		expect(marked.isError).toBeFalsy();
+	});
+
+	afterEach(() => {
+		if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+		else process.env.PILENS_DATA_DIR = previousDataDir;
+		_resetDeferredForTests();
+		_resetStateCacheForTests();
+		removeTempDirSync(cwd);
+	});
+
+	const resultMessages = (envelope: Record<string, unknown>): string[] =>
+		(envelope.result as Array<{ diagnostics: Array<{ message: string }> }>)
+			.flatMap((entry) => entry.diagnostics)
+			.map((diagnostic) => diagnostic.message);
+
+	it("drops a finding marked false-positive from the path read and states the count", async () => {
+		(mocked.service as { getDiagnostics: unknown }).getDiagnostics = vi
+			.fn()
+			.mockResolvedValue(serverDiagnostics());
+		(
+			mocked.service as { getWorkspaceDiagnosticsSupport: unknown }
+		).getWorkspaceDiagnosticsSupport = vi
+			.fn()
+			.mockResolvedValue({ mode: "pull" });
+
+		const result = await createLspNavigationTool(
+			(flag) => flag === "lens-lsp",
+		).execute(
+			"nav-1634-path",
+			{ operation: "workspaceDiagnostics", path: filePath },
+			new AbortController().signal,
+			null,
+			{ cwd },
+		);
+		const envelope = parseToolJson(result);
+
+		expect(resultMessages(envelope)).toEqual([KEPT]);
+		expect(result.details?.dispositionSuppressed).toBe(1);
+		expect(envelope.notes).toContainEqual(
+			expect.stringContaining("suppressed by disposition: 1 finding(s)"),
+		);
+		// The lane's bounded trace: one record for the file it filtered, named
+		// for the tool that rendered it (#4459 review F5).
+		expect(getRecentLoggedPhases()).toContainEqual(
+			expect.objectContaining({
+				phase: "lsp_probe_disposition_filter",
+				toolName: "lsp_navigation",
+				metadata: expect.objectContaining({ suppressed: 1 }),
+			}),
+		);
+	});
+
+	it("filters the tracked snapshot the same way and labels each file's age", async () => {
+		(mocked.service as { getAllDiagnostics: unknown }).getAllDiagnostics = vi
+			.fn()
+			.mockResolvedValue(
+				new Map([
+					[
+						filePath,
+						{ diags: serverDiagnostics(), ts: Date.now() - 5 * 60_000 },
+					],
+				]),
+			);
+
+		const result = await createLspNavigationTool(
+			(flag) => flag === "lens-lsp",
+		).execute(
+			"nav-1634-snapshot",
+			{ operation: "workspaceDiagnostics" },
+			new AbortController().signal,
+			null,
+			{ cwd },
+		);
+		const envelope = parseToolJson(result);
+		const [entry] = envelope.result as Array<{ lag?: string }>;
+
+		expect(resultMessages(envelope)).toEqual([KEPT]);
+		expect(entry?.lag).toBe("scanned 5m ago");
+		expect(result.details?.dispositionSuppressed).toBe(1);
+		expect(envelope.notes).toContainEqual(
+			expect.stringContaining("suppressed by disposition: 1 finding(s)"),
+		);
+		expect(getRecentLoggedPhases()).toContainEqual(
+			expect.objectContaining({
+				phase: "lsp_probe_disposition_filter",
+				toolName: "lsp_navigation",
+			}),
+		);
+	});
+
+	const COMPILE = "SyntaxError: multiple exception types must be parenthesized";
+	const PYRIGHT = 'Cannot access attribute "value" for class "object"';
+
+	const jediCompileRow = () => ({
+		severity: 1,
+		message: COMPILE,
+		source: "compile",
+		rule: "compile:unknown",
+		semantic: "blocking" as const,
+		serverId: "python-jedi",
+		range: {
+			start: { line: 2, character: 8 },
+			end: { line: 2, character: 20 },
+		},
+	});
+	const pyrightRow = () => ({
+		severity: 1,
+		message: PYRIGHT,
+		source: "pyright",
+		serverId: "pyright",
+		range: { start: { line: 4, character: 4 }, end: { line: 4, character: 9 } },
+	});
+
+	async function snapshotWith(
+		files: Array<[string, Array<Record<string, unknown>>]>,
+	) {
+		walkedDeclarations.files.length = 0;
+		(mocked.service as { getAllDiagnostics: unknown }).getAllDiagnostics = vi
+			.fn()
+			.mockResolvedValue(
+				new Map(
+					files.map(([file, diags]) => [file, { diags, ts: Date.now() }]),
+				),
+			);
+		return parseToolJson(
+			await createLspNavigationTool((flag) => flag === "lens-lsp").execute(
+				"nav-4638",
+				{ operation: "workspaceDiagnostics" },
+				new AbortController().signal,
+				null,
+				{ cwd },
+			),
+		);
+	}
+
+	function snapshotRows(envelope: Record<string, unknown>) {
+		return (
+			envelope.result as Array<{
+				diagnostics: Array<Record<string, unknown>>;
+			}>
+		).flatMap((entry) => entry.diagnostics);
+	}
+
+	it("drops jedi's compile row from the tracked snapshot and names what it withheld (#4638 F10)", async () => {
+		const jediFile = path.join(cwd, "jedi_only.py");
+		const typedFile = path.join(cwd, "typed.py");
+		fs.writeFileSync(jediFile, "def run() -> None:\n\tpass\n");
+		fs.writeFileSync(typedFile, "value: int = 1\n");
+		fs.writeFileSync(
+			path.join(cwd, "pyproject.toml"),
+			'[project]\nname = "d"\nrequires-python = ">=3.14"\n',
+		);
+
+		const envelope = await snapshotWith([
+			[jediFile, [jediCompileRow(), pyrightRow()]],
+			[typedFile, [pyrightRow()]],
+		]);
+
+		expect(resultMessages(envelope)).not.toContain(COMPILE);
+		expect(resultMessages(envelope)).toContain(PYRIGHT);
+		expect(envelope.notes).toContainEqual(
+			expect.stringContaining("1 python-jedi compile finding withheld"),
+		);
+		// The filter is what keeps the pyright-only file from paying for a walk.
+		expect(walkedDeclarations.files).not.toContain(typedFile);
+		expect(walkedDeclarations.files).toContain(jediFile);
+	});
+
+	it("cites each project's own declaration when the snapshot spans two (#4638 r4 F3)", async () => {
+		// Recurrence: the snapshot printed the FIRST file's count under the first
+		// declaration while the details carried the total, so two projects read as
+		// one level and the text and the details disagreed.
+		const a = path.join(cwd, "a");
+		const b = path.join(cwd, "b");
+		for (const [dir, level] of [
+			[a, "3.14"],
+			[b, "3.15"],
+		] as const) {
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(
+				path.join(dir, "pyproject.toml"),
+				`[project]\nname = "d"\nrequires-python = ">=${level}"\n`,
+			);
+			fs.writeFileSync(
+				path.join(dir, "app.py"),
+				"def run() -> None:\n\tpass\n",
+			);
+		}
+
+		const envelope = await snapshotWith([
+			[path.join(a, "app.py"), [jediCompileRow()]],
+			[path.join(b, "app.py"), [jediCompileRow()]],
+		]);
+
+		const note = (envelope.notes as string[]).find((entry) =>
+			entry.includes("withheld"),
+		);
+		expect(note).toContain(
+			"2 python-jedi compile findings withheld across 2 declarations",
+		);
+		expect(note).toContain(
+			`1 under Python 3.14 (requires-python) in ${path.join(a, "pyproject.toml")}`,
+		);
+		expect(note).toContain(
+			`1 under Python 3.15 (requires-python) in ${path.join(b, "pyproject.toml")}`,
+		);
+	});
+
+	it("names the withheld row on the single-file path read (#4638 r3 N2)", async () => {
+		// Recurrence: the path route filtered the row and returned a bare empty
+		// answer (`empty_result`), indistinguishable from "no findings published".
+		const jediFile = path.join(cwd, "jedi_only.py");
+		fs.writeFileSync(jediFile, "def run() -> None:\n\tpass\n");
+		fs.writeFileSync(
+			path.join(cwd, "pyproject.toml"),
+			'[project]\nname = "d"\nrequires-python = ">=3.14"\n',
+		);
+		const service = mocked.service as {
+			getWorkspaceDiagnosticsSupport: unknown;
+			getDiagnostics: unknown;
+		};
+		service.getWorkspaceDiagnosticsSupport = vi
+			.fn()
+			.mockResolvedValue({ mode: "pull" });
+		service.getDiagnostics = vi.fn().mockResolvedValue([jediCompileRow()]);
+
+		const result = await createLspNavigationTool(
+			(flag) => flag === "lens-lsp",
+		).execute(
+			"nav-4638-path",
+			{ operation: "workspaceDiagnostics", path: jediFile },
+			new AbortController().signal,
+			null,
+			{ cwd },
+		);
+
+		const envelope = parseToolJson(result);
+		expect(resultMessages(envelope)).not.toContain(COMPILE);
+		expect(envelope.notes).toContainEqual(
+			expect.stringContaining(
+				"1 python-jedi compile finding withheld: the project declares Python 3.14 (requires-python)",
+			),
+		);
+		// One shape on every tool (#4638 r4 F2): the object the other two tools
+		// carry, never a bare count.
+		expect(result.details?.withheldCompile).toEqual({
+			count: 1,
+			declared: expect.objectContaining({
+				major: 3,
+				minor: 14,
+				source: "requires-python",
+				file: path.join(cwd, "pyproject.toml"),
+			}),
+		});
+	});
+
+	it("still delivers jedi's compile row blocking while the project declares 3.13 (#4638 F10)", async () => {
+		const jediFile = path.join(cwd, "jedi_only.py");
+		fs.writeFileSync(jediFile, "def run() -> None:\n\tpass\n");
+		fs.writeFileSync(
+			path.join(cwd, "pyproject.toml"),
+			'[project]\nname = "d"\nrequires-python = ">=3.13"\n',
+		);
+
+		const envelope = await snapshotWith([
+			[jediFile, [jediCompileRow(), pyrightRow()]],
+		]);
+
+		expect(snapshotRows(envelope)).toContainEqual(
+			expect.objectContaining({ message: COMPILE, semantic: "blocking" }),
+		);
+	});
+});
+
+/**
+ * #4577 M2: `path` is a host-supplied tool path, so it resolves through the
+ * shared host resolver. A bare `path.resolve(ctx.cwd, path)` turned `~/x` into
+ * `<cwd>/~/x`, so the server was asked about a document nothing had opened.
+ * The `rename_file` destination (`newFilePath`) keeps its bare join: it is a
+ * mutation target, filed as #4578.
+ */
+describe("lsp_navigation path resolution (#4577 M2)", () => {
+	// #4723 F2: this block installs its own service. It used to inherit the
+	// last block's double; under --sequence.shuffle (seed 424) that was the
+	// delivery-gate double, whose hasLSP is false, so `references` never ran.
+	beforeEach(() => {
+		mocked.service = installLspService(
+			makeLspServiceDouble({
+				supportsLSP: vi.fn().mockReturnValue(true),
+				hasLSP: vi.fn().mockResolvedValue(true),
+				getOperationSupport: vi.fn().mockResolvedValue(null),
+			}),
+		);
+	});
+
+	it("resolves a ~ path to $HOME, not under the cwd", async () => {
+		const { home, restore } = pinFixtureHome("nav-tilde");
+		const filePath = path.join(home, "proj", "refs.ts");
+		fs.mkdirSync(path.dirname(filePath), { recursive: true });
+		fs.writeFileSync(filePath, "const a = normalizeMapKey('x');\n");
+		try {
+			expect(os.homedir()).toBe(home);
+			const tool = createLspNavigationTool((flag) => flag === "lens-lsp");
+			await tool.execute(
+				"refs-tilde",
+				{
+					operation: "references",
+					path: "~/proj/refs.ts",
+					line: 1,
+					character: 12,
+				},
+				new AbortController().signal,
+				null,
+				{ cwd: path.join(home, "proj") },
+			);
+			const references = (
+				mocked.service as { references: ReturnType<typeof vi.fn> }
+			).references;
+			expect(references.mock.calls[0]?.[0]).toBe(filePath);
+		} finally {
+			restore();
+		}
+	});
 });

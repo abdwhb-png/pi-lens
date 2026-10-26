@@ -1,20 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { suspendAt } from "../interleaving-kit.js";
-const recordDegradation = vi.hoisted(() => vi.fn());
-vi.mock("../../../clients/degradation-ledger.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../../clients/degradation-ledger.js")
-	>()),
-	recordDegradation,
-}));
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
@@ -66,9 +54,11 @@ function configureServer(
 }
 
 describe("LSP idle eviction (#1332 b2)", () => {
-	beforeEach(() => {
-		recordDegradation.mockClear();
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		process.env.PI_LENS_TS_IDLE_EVICT_MS = "20";
@@ -195,11 +185,20 @@ describe("LSP idle eviction (#1332 b2)", () => {
 		expect(first.shutdown).toHaveBeenCalledWith({
 			reason: "idle_eviction",
 		});
-		expect(recordDegradation).toHaveBeenCalledWith({
-			kind: "lsp-idle-eviction",
-			subject: expect.stringMatching(/^typescript:.*repo$/),
-			reason: "idle LSP client released to bound memory",
-		});
+		// The ledger the service wrote to is the one loaded after this case's
+		// `vi.resetModules()`, so it is read back through the same registry.
+		const { getDegradationSummary } =
+			await import("../../../clients/degradation-ledger.js");
+		expect(
+			getDegradationSummary().find(
+				(group) => group.kind === "lsp-idle-eviction",
+			)?.latestReasons,
+		).toEqual([
+			{
+				subject: expect.stringMatching(/^typescript:.*repo$/),
+				reason: "idle LSP client released to bound memory",
+			},
+		]);
 
 		expect((await service.getClientForFile("/repo/main.ts"))?.client).toBe(
 			rebuilt,
@@ -282,13 +281,15 @@ describe("LSP idle eviction (#1332 b2)", () => {
 		const service = new LSPService();
 		await service.getClientForFile("/repo/main.ts");
 		const gateHolder = service as unknown as {
-			withClientSpawnGate<T>(op: () => Promise<T>): Promise<T>;
+			clientRegistry: {
+				withClientSpawnGate<T>(op: () => Promise<T>): Promise<T>;
+			};
 		};
 		let open!: () => void;
 		const held = new Promise<void>((resolve) => {
 			open = resolve;
 		});
-		const gate = gateHolder.withClientSpawnGate(() => held);
+		const gate = gateHolder.clientRegistry.withClientSpawnGate(() => held);
 		await vi.advanceTimersByTimeAsync(20); // the timer fires; its callback queues behind the gate
 		await vi.advanceTimersByTimeAsync(5);
 		await service.getClientForFile("/repo/main.ts"); // a fresh use refreshes clientLastUsedAt
@@ -332,7 +333,9 @@ describe("LSP idle eviction (#1332 b2)", () => {
 		const service = new LSPService();
 		const harness = service as unknown as {
 			state: { clients: Map<string, typeof client> };
-			idleEvictionTimers: Map<string, ReturnType<typeof setTimeout>>;
+			clientRegistry: {
+				idleEvictionTimers: Map<string, ReturnType<typeof setTimeout>>;
+			};
 			recordNotifyWriteBackpressure(
 				key: string,
 				entry: unknown,
@@ -341,7 +344,7 @@ describe("LSP idle eviction (#1332 b2)", () => {
 		};
 		const entry = await service.getClientForFile("/repo/main.ts");
 		expect(entry).toBeDefined();
-		expect(harness.idleEvictionTimers.size).toBe(1);
+		expect(harness.clientRegistry.idleEvictionTimers.size).toBe(1);
 		const key = [...harness.state.clients.keys()][0];
 		expect(key).toBeDefined();
 
@@ -353,7 +356,7 @@ describe("LSP idle eviction (#1332 b2)", () => {
 			);
 		}
 
-		expect(harness.idleEvictionTimers.size).toBe(0);
+		expect(harness.clientRegistry.idleEvictionTimers.size).toBe(0);
 		await vi.advanceTimersByTimeAsync(20);
 		expect(client.shutdown).toHaveBeenCalledTimes(1);
 	});
@@ -462,16 +465,18 @@ describe("LSP idle eviction (#1332 b2)", () => {
 		const { LSPService } = await import("../../../clients/lsp/index.js");
 		const service = new LSPService();
 		const harness = service as unknown as {
-			idleEvictionTimers: Map<string, ReturnType<typeof setTimeout>>;
+			clientRegistry: {
+				idleEvictionTimers: Map<string, ReturnType<typeof setTimeout>>;
+			};
 		};
 		await service.getClientForFile("/repo/main.ts");
 
-		const timer = [...harness.idleEvictionTimers.values()][0];
+		const timer = [...harness.clientRegistry.idleEvictionTimers.values()][0];
 		expect(timer).toBeDefined();
 		expect(timer.hasRef?.()).toBe(false);
 		await service.shutdown();
 
 		expect(clearTimeoutSpy).toHaveBeenCalledWith(timer);
-		expect(harness.idleEvictionTimers.size).toBe(0);
+		expect(harness.clientRegistry.idleEvictionTimers.size).toBe(0);
 	});
 });

@@ -90,6 +90,14 @@ the docs refresh commits the confirmed class and the marker must move with it.
 A single-night flip remains in the refresh-state JSON below and does not change
 the census's confirmed population.
 
+The class is defined on a DIRTY file — is the first publish for a file that HAS
+findings the answer, or an empty placeholder while a one-time index builds? — so
+the probe takes it from a dirty fixture and never from a `clean: true` one: a
+clean file has no finding to publish, so its trace can only ever be `empty-only`.
+Before #4615 the clean fixture supplied both axes, which is how a publish that
+belonged to another live client of the same server id became `typescript`'s
+`empty-first`.
+
 ## The strategies
 
 | Tier | Signal | Affirmative clean? | Example |
@@ -131,12 +139,16 @@ Two bounded guards keep that preservation from hiding a dead instrument
 re-observe is stamped once with the date of its first miss and degrades to
 `unknown` once five calendar days have elapsed since it (skipped nights do not
 stall it, and a re-observation clears the stamp). `empty-first` cells are never
-expired: they back the live `emptyFirstPublish` markers (php, terraform) and
-expiring one would erase the measurement behind a marker. A `clean-behavior`/
-`tier` change is written only after two consecutive nightly runs observe the
-same new value, so one flapping nightly (ast-grep went 2 → 2* → 3 → 2* across
-four runs) cannot rewrite a cell; a night that measured nothing for the lang
-resets the hold. A subset probe (`probe-clean-signal.mjs <langs>`) leaves the
+expired: they back the live `emptyFirstPublish` markers (php) and
+expiring one would erase the measurement behind a marker. That exception is
+bounded too (#4615): the refresh stamps the FIRST night it does not re-observe an
+`empty-first` cell, and the first-publish census reds once that stamp is five
+days old, so the cell+marker pair cannot outlive the instrument that produced it
+— a cell with no live measurement behind it is no longer indistinguishable from
+a healthy one. A `clean-behavior`/`tier` change is written only after two
+consecutive nightly runs observe the same new value, so one flapping nightly
+(ast-grep went 2 → 2* → 3 → 2* across four runs) cannot rewrite a cell; a night
+that measured nothing for the lang resets the hold. A subset probe (`probe-clean-signal.mjs <langs>`) leaves the
 bookkeeping of the langs it did not probe untouched.
 
 The bookkeeping lives in the generated `## Capability matrix refresh state`
@@ -167,7 +179,7 @@ carries the named admission until then.
 | deno | deno (alt of typescript) | pull | — | n/a (pull) | 1 | dev+ci |
 | ruby | ruby-lsp | pull | — | n/a (pull) | 1 | ci |
 | csharp | csharp-ls | pull | — | n/a (pull) | 1 | ci |
-| typescript | typescript-language-server | push-only | silent | empty-first | 3 | dev+ci |
+| typescript | typescript-language-server | push-only | silent | direct | 3 | dev+ci |
 | markdown | marksman | push-only | silent | direct | 3 | ci |
 | lua | lua-language-server | push-only | silent | direct | 3 | dev+ci |
 | python | pyright | push-only | publishes-versioned | direct | 2 | dev+ci |
@@ -177,7 +189,7 @@ carries the named admission until then.
 | dockerfile | docker-langserver | push-only | publishes-unversioned | direct | 2* | dev+ci |
 | dockerfile-official | docker-language-server (official) | push-only | publishes-versioned | direct | 2 | dev+ci |
 | toml | taplo | push-only | publishes-unversioned | direct | 2* | dev+ci |
-| terraform | terraform-ls | push-only | publishes-unversioned | empty-first | 2* | dev+ci |
+| terraform | terraform-ls | push-only | publishes-unversioned | direct | 2* | dev+ci |
 | prisma | @prisma/language-server | push-only | publishes-unversioned | direct | 2* | dev+ci |
 | php | intelephense | push-only | publishes-unversioned | empty-first | 2* | dev+ci |
 | zig | zls | push-only | publishes-unversioned | direct | 2* | dev+ci |
@@ -201,8 +213,9 @@ and were characterized `push-only` in the run above).
 - **Mode ≠ tier, and the split needs BOTH axes.** Push-only further splits along
   latency (does anything publish on a clean transition? — silence is the only
   budget-wait case, because pi-lens's publish handler emits and early-returns the
-  wait on every publish, versioned or not, with the single #3310 exception of a
-  held empty FIRST publish from an `empty-first` server) and currency-proof (is the publish
+  wait on every publish, versioned or not, with two exceptions: #3310's held
+  empty FIRST publish from an `empty-first` server, and #4763's held empty
+  publish from opengrep before `semgrep/rulesRefreshed`) and currency-proof (is the publish
   versioned, i.e. provably about the live edit?). The 4-way
   `probe-clean-signal.mjs` measurement drives this: ast-grep → 2, yaml/opengrep →
   2\*, typescript (clean file) → 3.
@@ -211,6 +224,32 @@ and were characterized `push-only` in the run above).
   `pubVersion=undefined`, so currency is only temporally correlated, not proven —
   a staleness-risk note, not a latency cost. An earlier hand-note called it Tier 2
   on the "re-publishes" observation alone; the phase-aware probe refines it to 2\*.
+- **opengrep's first publish depends on its config (#4763).** With a local rule
+  file the rules load before the first scan and `semgrep/rulesRefreshed` precedes
+  the first publish (`direct`, the column above). With `--config auto` (the
+  default pi-lens launch) opengrep scans the opened document before its rules
+  load, logs "Rules not loaded yet, not scanning anything" and publishes `[]`;
+  it then sends `semgrep/rulesRefreshed` and republishes every open document
+  (opengrep@60ed3b3 `Scan_helpers.run_semgrep` / `refresh_rules`, unchanged since
+  v1.0.0). Cold, online, 1.30.0 x3 and 1.32.0 x2: `[]` at +11..18 ms, the
+  notification at +0.7..1.0 s, the findings 0.25..0.5 s later. Warm: `didChange`
+  publishes nothing; the reopen pi-lens sends instead (`reopenOnResync`)
+  publishes the fresh scan once, +0.25..0.4 s on both versions; a reopen with
+  `didSave` publishes twice (+0.3..0.9 s), a lone `didSave` once (+0.25..0.5 s).
+  Rules that never load (offline) leave the `[]` as the only publish and
+  `window/showMessage` carries the error after it (#4764). Measured offline on
+  the built tree, nine touches: the edit path (`with-auxiliary`) waits the
+  aux grace ceiling (about 2 s) for six touches, then the existing demotion
+  (`aux_wait_demoted`) skips the wait (0 ms); the explicit all-scope
+  `lsp_diagnostics` call waits the full wait budget (3 s) every time and
+  reports the coverage notice. The strategy marker
+  `emptyUntilRulesRefreshed` holds that `[]`, released by the notification, not
+  by a timer. The other three auxiliaries do not need it, measured in
+  `tests/fixtures/opengrep-lsp-trace/auxiliary-first-publish.json`: ast-grep
+  compiles its rules before the first parse (3/3, first publish carries the
+  findings at +30..35 ms), zizmor audits inline and publishes once (3/3, +3 ms;
+  its source runs every audit, online ones included, before the one publish),
+  typos has the dictionary compiled in (3/3, +0..1 ms).
 - **typescript's clean behavior is diagnostic-set-dependent (major probe finding).**
   On a DIRTY file it re-publishes (version-lessly) after every change — the dirty
   fixture measures 2\*. On a genuinely CLEAN file (the `typescript-clean` fixture)
@@ -241,6 +280,60 @@ and were characterized `push-only` in the run above).
 - **ast-grep (Phase 2 / #239) is Tier 2** — it self-signals clean on every scan, so it
   is not the bottleneck. The cost on a clean with-auxiliary touch is the *silent
   primary* (typescript), a pre-existing Tier-3 cost independent of ast-grep.
+
+## Save-triggered servers: per-server verdict (#3405)
+
+Population: every server that declares `textDocumentSync.save` in
+`docs/servercapabilities.md` (15 `save`, 5 `save+text`), plus zizmor, which
+registers `textDocument/didSave` dynamically. Verdicts are moved from the #4768
+PR body (merged as 11cf30f8d) and re-read on origin/master d21f7d267: each
+server's registry entry is in `clients/lsp/server.ts`, and each save declaration
+matches `docs/servercapabilities.md`. `publishes after save only` is `no` when
+the server publishes without a save, `yes` when only a save publishes, and
+`unknown` when nothing was measured. A `source` row cites an external
+repository at the pinned commit; those commits were not re-fetched here.
+
+| server | save as declared | publishes after save only | verdict | evidence |
+|---|---|---|---|---|
+| expert | `save` | no | Measured: answers with no `didSave` once the seed is under `lib/`. Gated (`lspGate: true`). | #4768 arms A, B, C; nightly run 39852672584 (answered on call 6, 10955 ms); `tests/fixtures/nightly-floors/expert-readiness.json` |
+| cpp (clangd 22.1.0) | `save` | no | Measured: publishes on `didOpen` alone (97 ms, 3 diagnostics). Gated. Open conflict with #4527, see note 2. | #4768 local probe; #4527 wire scenario (issue comment) |
+| lua | `save` | no | Measured: the first publish carries 6 diagnostics at 135 ms; a save adds a late republish at 3.7 s. Gated. | #4768 local probe |
+| python-jedi | `save` | no | Measured: publishes on `didOpen` alone (about 1 s). Gated. | #4768 local probe; `clients/python-environment.ts:421` (id) |
+| opengrep (aux) | `save` | no | Measured: a save rescans and republishes (#3482); it also publishes on open once its rules load. Auxiliary, not gated. | `clients/lsp/wait-policy/strategies.ts:100`; Key findings above (#4763) |
+| gleam | `save` | no | Source: a save only marks the project changed and drops the in-memory cache; the publish comes from `CompilePlease`. Gated. | gleam-lang/gleam `0d9fa18ddb69`, `language-server/src/server.rs` (`SourceFileSaved`, `discard_in_memory_cache`, `compile_please`) |
+| go (gopls) | `save` | no | Source: `DidSave` calls `didModifyFiles`, the path a change takes. Gated. | golang/tools `02c9e4cb4c2f`, `gopls/internal/server/text_synchronization.go` |
+| zig (zls) | `save` | no | Source: a save runs the build-on-save watch update and autofix; ast-check diagnostics come from changes. Gated. | zigtools/zls `82ba5351ca8a`, `src/Server.zig` (`saveDocumentHandler`) |
+| rust (rust-analyzer) | `save` | no | Source: a save starts flycheck (`cargo check`); native diagnostics come from pull mode and do not wait for it. Exempt: runner availability. | rust-lang/rust-analyzer `0c4d74686b21`, `crates/rust-analyzer/src/handlers/notification.rs` (`handle_did_save_text_document`); matrix tier 1 |
+| terraform | `save` | no | Source: `terraform validate` runs on save only with the experimental `ValidateOnSave`, off by default. Gated. | hashicorp/terraform-ls `3dbe85a2b4e1`, `internal/langserver/handlers/did_save.go` |
+| fsharp | `save+text` | no | Source: a save holds the source and refreshes code lenses; diagnostics come from open and change checks. Exempt: 0 findings in every run. | ionide/FsAutoComplete `8f011f1395a4`, `src/FsAutoComplete/LspServers/AdaptiveFSharpLspServer.fs` (`TextDocumentDidSave`); nightly run 39845687189 |
+| zizmor (dynamic) | not declared (`textDocumentSync` only) | no | Source: `didSave` is registered dynamically and pi-lens does not map that registration, so no save is sent. Auxiliary. | zizmor `crates/zizmor/src/lsp.rs` (`initialized`); `clients/lsp/wait-policy/strategies.ts:400-410` (#3548) |
+| clojure | `save+text` | unknown | Unverified: not measured. Gated; one save per write. | none |
+| fish | `save+text` | unknown | Unverified: not measured. Gated; one save per write. | none |
+| tinymist | `save` | unknown | Unverified: not measured. Gated (typst fixture); one save per write. | none |
+| cue | `save` | unknown | Unverified: not measured. Gated; one save per write. | none |
+| csharp | `save+text` | unknown | Unverified: not measured. Pull mode, so diagnostics are requested and a save is unlikely to be the only trigger. Gated. | matrix row (csharp-ls, tier 1) |
+| deno | `save` | unknown | Unverified: not measured. Pull mode. Gated. | matrix row (deno, tier 1) |
+| svelte | `save` | unknown | Unverified: not measured. Pull mode. Gated. | matrix row (svelte-language-server, tier 1) |
+| powershell | `save+text` | unknown | Unverified: not measured. Exempt: intermittent. | none |
+| cmake | `save` | unknown | Unverified: the local probe published nothing in either arm (12 s each) with an `if(` seed, so inconclusive. Exempt: upstream documents no diagnostics. | #4768 local probe (no named command) |
+
+Notes.
+
+1. Probe. The only command #4768 names is `node scripts/smoke-tools.mjs --lsp-gate`
+   (the nightly `tool-smoke.yml` step "LSP diagnostics clean-gate"). It runs
+   the gated fixture rows and does not write per-server save verdicts. The local
+   probes behind the cpp, lua, python-jedi and cmake rows, and the Expert arms
+   run outside CI, are not named in #4768's body, so no command regenerates this
+   table. Each row cites its own evidence instead.
+2. Open conflict, cpp. #4527 records a clangd 22.1.0 wire scenario in which the
+   save sender changes the outcome (base 1 of 5, head 5 of 5). #4768 records clangd
+   publishing on `didOpen` alone. The two records are not reconciled here; the row
+   keeps #4768's verdict.
+3. Citations corrected against master. #4768 cites `clients/lsp/client.ts:4410`
+   for `sendDidSave`; it is at `clients/lsp/client.ts:4909`, with the save-capability
+   gate at line 4917. The opengrep rescan claim is at
+   `clients/lsp/wait-policy/strategies.ts:100`; line 345 is the
+   `emptyUntilRulesRefreshed` hold.
 
 ## Completing the matrix
 The fixtures (`tests/fixtures/tool-smoke/<lang>/`) are durable and cover every
@@ -274,7 +367,7 @@ Telemetry only — never a CI gate. Compares each probed server's observed
 marker; a mismatch means the marker may need a human update (#529). `unknown`
 observations are never compared (a slow/absent server is not evidence either way).
 
-_None observed as of the last probe run._
+- **[silent-not-marked]** observed silent on clean transitions but wait-policy/strategies.ts has no silentOnClean marker for "typescript7" — cascade is burning the full in-lane wait it could skip (the pre-#458 situation)
 
 ## Capability matrix refresh state (nightly-generated)
 
@@ -283,5 +376,5 @@ date-based `direct` expiry (#3401) and consecutive-night `idle-eviction`
 counts (#3989). Regenerated every run; never a measurement.
 
 ```json
-{"first-publish":{"dockerfile":{"firstMissed":"2026-10-10"},"prisma":{"firstMissed":"2026-10-10"},"python":{"firstMissed":"2026-10-10"},"shell":{"firstMissed":"2026-10-10"},"terraform":{"pendingFirstPublish":"direct","runs":1},"yaml":{"firstMissed":"2026-10-10"}}}
+{"idle-eviction":{"docker-official":{"nights":[{"day":"2026-10-23","rssMb":62,"coldMs":883},{"day":"2026-10-24","rssMb":62,"coldMs":957}]},"kotlin":{"nights":[{"day":"2026-10-25","rssMb":270,"coldMs":2522}]},"powershell":{"nights":[{"day":"2026-10-25","rssMb":167,"coldMs":2967}]},"rust":{"nights":[{"day":"2026-10-25","rssMb":596,"coldMs":2927}]},"svelte":{"nights":[{"day":"2026-10-25","rssMb":232,"coldMs":2674}]},"zizmor":{"nights":[{"day":"2026-10-23","rssMb":55,"coldMs":1661},{"day":"2026-10-24","rssMb":57,"coldMs":1683}]}}}
 ```

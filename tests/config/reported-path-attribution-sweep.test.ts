@@ -51,6 +51,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -651,9 +652,6 @@ const LOCAL_COMPARE_PINS: Readonly<Record<string, number>> = {};
  * that grows a real reported path here presents a count of 1 against a pin of 1
  * and the per-runner dispatch cells are what must then change.
  *
- * - `fish-indent.ts@1` — `/\(line\s+(\d+)\)/` over the first non-blank stderr
- *   line. The matched span holds a parse POSITION and no path token;
- *   `fish_indent --check` is handed exactly one file.
  * - `shfmt.ts@1` — `/^@@\s+-(\d+)/m` over a unified diff BODY. The only path in
  *   `--diff` output is the `---`/`+++` echo of our own argv, which this parser
  *   never reads.
@@ -681,7 +679,6 @@ const LOCAL_COMPARE_PINS: Readonly<Record<string, number>> = {};
  *   cwd (#265 A3), which is the attribute policy, not a blanket stamp.
  */
 const NO_PREDICATE_PINS: Readonly<Record<string, number>> = {
-	"clients/dispatch/runners/fish-indent.ts": 1,
 	"clients/dispatch/runners/phpstan.ts": 1,
 	"clients/dispatch/runners/prisma-validate.ts": 1,
 	"clients/dispatch/runners/psscriptanalyzer.ts": 1,
@@ -717,52 +714,60 @@ function stalePins(
 }
 
 describe("runner reported-path attribution single-source-of-truth (#3278)", () => {
-	it("has no unpinned local reported-path compare in any runner or tool client", () => {
-		const { counts, scanned } = census();
-		assertNonEmptyScan(
-			"clients/dispatch/runners + clients/*-client.ts source files",
-			scanned,
-			78,
-		);
-		const pinned = { ...LOCAL_COMPARE_PINS, ...NON_MEMBER_PINS };
-		const audit = auditSymbolCounts({
-			sweepName: "local reported-path compare (#3278)",
-			counts,
-			pinned,
-			remediation: REMEDIATION,
-		});
-		expect(audit.problems).toEqual([]);
-		expect(
-			stalePins(counts, pinned),
-			"a pinned local compare is gone — good, now shrink the pin",
-		).toEqual([]);
-	}, 30_000);
+	it(
+		"has no unpinned local reported-path compare in any runner or tool client",
+		() => {
+			const { counts, scanned } = census();
+			assertNonEmptyScan(
+				"clients/dispatch/runners + clients/*-client.ts source files",
+				scanned,
+				78,
+			);
+			const pinned = { ...LOCAL_COMPARE_PINS, ...NON_MEMBER_PINS };
+			const audit = auditSymbolCounts({
+				sweepName: "local reported-path compare (#3278)",
+				counts,
+				pinned,
+				remediation: REMEDIATION,
+			});
+			expect(audit.problems).toEqual([]);
+			expect(
+				stalePins(counts, pinned),
+				"a pinned local compare is gone — good, now shrink the pin",
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("has no unpinned location parser without pathsEqual (#3295)", () => {
-		const counts: Record<string, number> = {};
-		const files = [
-			...listSourceFiles(RUNNERS_ROOT, { extensions: [".ts"] }),
-			...listSourceFiles(CLIENTS_ROOT, {
-				extensions: [TOOL_CLIENT_SUFFIX],
-				exclude: (relative) => relative.includes("/"),
-			}),
-		];
-		for (const { file, source } of readWalkedFiles(files)) {
-			const count = countLocationParsersWithoutPathsEqual(source);
-			if (count > 0) counts[relativePosix(REPO_ROOT, file)] = count;
-		}
-		const audit = auditSymbolCounts({
-			sweepName: "location parser without reported-path predicate (#3295)",
-			counts,
-			pinned: NO_PREDICATE_PINS,
-			remediation: REMEDIATION,
-		});
-		expect(audit.problems).toEqual([]);
-		expect(
-			stalePins(counts, NO_PREDICATE_PINS),
-			"a pinned non-member grew a predicate or stopped parsing — shrink the pin",
-		).toEqual([]);
-	});
+	it(
+		"has no unpinned location parser without pathsEqual (#3295)",
+		() => {
+			const counts: Record<string, number> = {};
+			const files = [
+				...listSourceFiles(RUNNERS_ROOT, { extensions: [".ts"] }),
+				...listSourceFiles(CLIENTS_ROOT, {
+					extensions: [TOOL_CLIENT_SUFFIX],
+					exclude: (relative) => relative.includes("/"),
+				}),
+			];
+			for (const { file, source } of readWalkedFiles(files)) {
+				const count = countLocationParsersWithoutPathsEqual(source);
+				if (count > 0) counts[relativePosix(REPO_ROOT, file)] = count;
+			}
+			const audit = auditSymbolCounts({
+				sweepName: "location parser without reported-path predicate (#3295)",
+				counts,
+				pinned: NO_PREDICATE_PINS,
+				remediation: REMEDIATION,
+			});
+			expect(audit.problems).toEqual([]);
+			expect(
+				stalePins(counts, NO_PREDICATE_PINS),
+				"a pinned non-member grew a predicate or stopped parsing — shrink the pin",
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	// The detector's own teeth, in both directions, on synthetic source: without
 	// these the sweep could silently stop matching and read as "family clean".
@@ -959,7 +964,7 @@ describe("runner reported-path attribution single-source-of-truth (#3278)", () =
 	});
 
 	/**
-	 * The detector's NAMED limit (AGENTS.md "detectors match code, not prose"):
+	 * The detector's NAMED limit (docs/engineering-principles.md "Detectors match code, not prose"):
 	 * it proves a `pathsEqual(` CALL exists, never that its operands are the
 	 * reported path and the dispatch target. This cell pins the hole so nobody
 	 * reads the census as stronger than it is; the direction it cannot see is
@@ -1015,9 +1020,13 @@ describe("runner reported-path attribution single-source-of-truth (#3278)", () =
 	 * is registered — the failure mode that let three shapes through in rounds
 	 * 1-3 was exactly a hand-maintained list of names.
 	 */
-	it("pins every diagnostic-producing helper the utils modules export", () => {
-		expect(diagnosticProducingUtilExports()).toEqual([...SANCTIONED_HELPERS]);
-	});
+	it(
+		"pins every diagnostic-producing helper the utils modules export",
+		() => {
+			expect(diagnosticProducingUtilExports()).toEqual([...SANCTIONED_HELPERS]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("cannot see through a pathsEqual call on unrelated operands (named limit)", () => {
 		expect(

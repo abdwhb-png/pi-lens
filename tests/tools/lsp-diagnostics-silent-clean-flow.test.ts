@@ -21,30 +21,21 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeMapKey } from "../../clients/path-utils.js";
+import { clearWidgetState } from "../../clients/widget-state.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
+import { installLspService } from "../support/lsp-service-seam.js";
+import { _setServersForFileForTests } from "../../clients/lsp/config.js";
+
+beforeEach(() => {
+	_setServersForFileForTests(getServersForFileWithConfig);
+	clearWidgetState();
+});
+afterEach(() => {
+	clearWidgetState();
+});
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-
-vi.mock("../../clients/lsp/config.js", async () => {
-	const actual = await vi.importActual<
-		typeof import("../../clients/lsp/config.js")
-	>("../../clients/lsp/config.js");
-	return {
-		...actual,
-		getServersForFileWithConfig: (filePath: string) =>
-			getServersForFileWithConfig(filePath),
-		getServerInitOverride: () => undefined,
-		// Mirrors the real implementation (first non-auxiliary server), reading
-		// the faked registry above rather than the module-local original.
-		primaryServerId: (filePath: string) =>
-			(
-				getServersForFileWithConfig(filePath) as
-					| Array<{ id: string; role?: string }>
-					| undefined
-			)?.find((server) => server.role !== "auxiliary")?.id,
-	};
-});
 
 vi.mock("../../clients/lsp/client.js", async () => {
 	const actual = await vi.importActual<
@@ -53,26 +44,7 @@ vi.mock("../../clients/lsp/client.js", async () => {
 	return { ...actual, createLSPClient };
 });
 
-const reconcileScanDiagnosticsMock = vi.fn().mockReturnValue(true);
-vi.mock("../../clients/widget-state.js", async () => {
-	const actual = await vi.importActual<
-		typeof import("../../clients/widget-state.js")
-	>("../../clients/widget-state.js");
-	return {
-		...actual,
-		reconcileScanDiagnostics: (...args: unknown[]) =>
-			reconcileScanDiagnosticsMock(...args),
-	};
-});
-
 let service: unknown;
-vi.mock("../../clients/lsp/capabilities.js", async () => {
-	const actual = await vi.importActual<
-		typeof import("../../clients/lsp/capabilities.js")
-	>("../../clients/lsp/capabilities.js");
-	return { ...actual, getLSPService: () => service };
-});
-
 function makeServer(
 	id: string,
 	root: string,
@@ -119,7 +91,10 @@ function makeSilentClient(serverId: string, root: string) {
 		getLaunchVariant: () => undefined,
 		serverId,
 		root,
-		notify: { open: vi.fn(async () => {}) },
+		notify: {
+			announceCreated: () => undefined,
+			open: vi.fn(async () => {}),
+		},
 		waitForDiagnostics: vi.fn(async (_filePath: string, ms: number) => {
 			await new Promise<void>((resolve) => {
 				const t = setTimeout(resolve, ms);
@@ -195,7 +170,7 @@ async function runTool(
 
 async function freshService(): Promise<void> {
 	const { LSPService } = await import("../../clients/lsp/index.js");
-	service = new LSPService();
+	service = installLspService(new LSPService());
 }
 
 describe("#1253 lsp_diagnostics end-to-end silent-clean confirmation", () => {
@@ -204,7 +179,6 @@ describe("#1253 lsp_diagnostics end-to-end silent-clean confirmation", () => {
 	beforeEach(async () => {
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
-		reconcileScanDiagnosticsMock.mockReset().mockReturnValue(true);
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-1253-e2e-"));
 		// Keep the silent server's real wait short — the gate under test is
 		// unchanged by the budget (see silent-clean-confirm.test.ts).

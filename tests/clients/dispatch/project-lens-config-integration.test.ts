@@ -7,8 +7,6 @@ import { applyProjectLensConfig } from "../../../clients/dispatch/integration.js
 import { FactStore } from "../../../clients/dispatch/fact-store.js";
 import { highComplexityRule } from "../../../clients/dispatch/rules/high-complexity.js";
 import { highFanOutRule } from "../../../clients/dispatch/rules/high-fan-out.js";
-import { resetHighComplexityThresholds } from "../../../clients/dispatch/rules/high-complexity.js";
-import { resetHighFanOutThreshold } from "../../../clients/dispatch/rules/high-fan-out.js";
 import {
 	resetProjectLensConfigCache,
 	type PiLensProjectConfig,
@@ -78,15 +76,11 @@ let tmpDir: string;
 
 beforeEach(() => {
 	tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-apply-cfg-"));
-	resetHighComplexityThresholds();
-	resetHighFanOutThreshold();
 	resetProjectLensConfigCache();
 });
 
 afterEach(() => {
 	removeTempDirSync(tmpDir);
-	resetHighComplexityThresholds();
-	resetHighFanOutThreshold();
 	resetProjectLensConfigCache();
 });
 
@@ -265,6 +259,43 @@ describe("applyProjectLensConfig", () => {
 		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(1);
 	});
 
+	it("a session rooted at a link resolves a nested package's root and reads its config (#4689)", (ctx) => {
+		// RECURRENCE GUARDED: review r1 F3. The language-root walk ran from the
+		// file's path identity while the workspace stayed the session's link
+		// spelling, so `path.relative` read every nested package as outside
+		// the workspace: `ctx.cwd` collapsed to the workspace and the package's
+		// own `.pi-lens.json` (and each runner's spawn root) was never used.
+		const real = path.join(tmpDir, "mono");
+		const alias = path.join(tmpDir, "mono-alias");
+		const app = path.join(real, "packages", "app");
+		fs.mkdirSync(path.join(app, "src"), { recursive: true });
+		fs.writeFileSync(path.join(real, "package.json"), '{"name":"mono"}');
+		fs.writeFileSync(path.join(app, "package.json"), '{"name":"app"}');
+		fs.writeFileSync(
+			path.join(app, ".pi-lens.json"),
+			JSON.stringify({ rules: { "high-complexity": { threshold: 5 } } }),
+		);
+		try {
+			fs.symlinkSync("mono", alias, "dir");
+		} catch (error) {
+			return ctx.skip(`symlinks unavailable: ${String(error)}`);
+		}
+
+		const facts = new FactStore();
+		const dispatch = createDispatchContext(
+			"packages/app/src/a.ts",
+			alias,
+			{ getFlag: () => undefined },
+			facts,
+			false,
+		);
+		expect(dispatch.cwd).toBe(fs.realpathSync.native(app).replace(/\\/g, "/"));
+		facts.setFileFact(dispatch.filePath, "file.functionSummaries", [
+			summaryWithCC(6),
+		]);
+		expect(highComplexityRule.evaluate(dispatch, facts)).toHaveLength(1);
+	});
+
 	it("ignore-only config leaves rule thresholds at defaults", () => {
 		fs.writeFileSync(
 			path.join(tmpDir, ".pi-lens.json"),
@@ -278,24 +309,5 @@ describe("applyProjectLensConfig", () => {
 		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(10)]);
 		const ctx = makeCtx(filePath, facts, config);
 		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(0);
-	});
-
-	it("resetHighComplexityThresholds restores defaults after applyProjectLensConfig", () => {
-		fs.writeFileSync(
-			path.join(tmpDir, ".pi-lens.json"),
-			JSON.stringify({
-				rules: { "high-complexity": { threshold: 5 } },
-			}),
-		);
-
-		const config = applyProjectLensConfig(tmpDir);
-		resetHighComplexityThresholds();
-
-		const filePath = "/tmp/a.ts";
-		const facts = new FactStore();
-		// Project config is context-scoped and still applies after fallback reset.
-		facts.setFileFact(filePath, "file.functionSummaries", [summaryWithCC(10)]);
-		const ctx = makeCtx(filePath, facts, config);
-		expect(highComplexityRule.evaluate(ctx, facts)).toHaveLength(1);
 	});
 });

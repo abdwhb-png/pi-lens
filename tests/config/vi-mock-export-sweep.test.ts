@@ -17,7 +17,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
 	assertNonEmptyScan,
 	listSourceFiles,
@@ -31,6 +31,7 @@ import {
 	latencyAdmissionHeader,
 	type ViMockExportFinding,
 } from "../support/vi-mock-export-gate.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(__dirname, "../..");
 const TESTS_ROOT = path.join(REPO_ROOT, "tests");
@@ -49,20 +50,29 @@ const BASELINE: Record<string, number> = JSON.parse(
  * ended: a 1,973 MB peak beside an 84 MB heap locally, and 2,026-2,049 MB over
  * 18 CI runs against the 2,048 MB per-worker budget (red at 2,049 MB). One
  * turn per file measured 930-996 MB, with the same findings and wall time.
+ *
+ * Both detectors run in the same pass: the generic and latency sweeps share
+ * one population, so the walk and the reads happen once.
  */
 async function detectAcrossFiles(
 	files: string[],
-	detect: (file: string, source: string) => ViMockExportFinding[],
-): Promise<ViMockExportFinding[]> {
-	const findings: ViMockExportFinding[] = [];
+): Promise<{ gaps: ViMockExportFinding[]; latency: ViMockExportFinding[] }> {
+	const gaps: ViMockExportFinding[] = [];
+	const latency: ViMockExportFinding[] = [];
+	// readWalkedFiles: a path that vanished between the walk and the read is
+	// out of the population, not a finding (#3082).
 	for (const { file, source } of readWalkedFiles(files)) {
-		findings.push(...detect(file, source));
+		gaps.push(...findViMockExportGaps(file, source));
+		latency.push(...findLatencyLoggerGapsForFile(file, source));
 		await new Promise<void>((resolve) => setImmediate(resolve));
 	}
-	return findings;
+	return { gaps, latency };
 }
 
-function scan(): Promise<ViMockExportFinding[]> {
+let sweepPromise: ReturnType<typeof detectAcrossFiles> | undefined;
+
+function sweepOnce(): ReturnType<typeof detectAcrossFiles> {
+	if (sweepPromise) return sweepPromise;
 	const files = listSourceFiles(TESTS_ROOT, {
 		extensions: [".ts"],
 		exclude: (relative) => relative.startsWith("fixtures/"),
@@ -73,26 +83,21 @@ function scan(): Promise<ViMockExportFinding[]> {
 	// which routine processes (e.g. the 4.1.4 `.changelog/` roll that consumed
 	// 151 fragments) never delete, so the floor cannot be swept away with it.
 	assertNonEmptyScan("#2281 vi.mock export sweep", files.length, 900);
-	// readWalkedFiles: a path that vanished between the walk and the read is
-	// out of the population, not a finding (#3082).
-	return detectAcrossFiles(files, (file, source) =>
-		findViMockExportGaps(file, source),
-	);
-}
-
-function scanLatencyLoggerSurface(): Promise<ViMockExportFinding[]> {
-	const files = listSourceFiles(TESTS_ROOT, {
-		extensions: [".ts"],
-		exclude: (relative) => relative.startsWith("fixtures/"),
-	});
-	// Same 1,152-file population and 900 floor as `scan()` above; see that
-	// comment for calibration. Selection lives in
+	// Same population and floor for the latency surface. Selection lives in
 	// `findLatencyLoggerGapsForFile` (which itself consumes
 	// `isLatencyLoggerSpecifier`), tested in both directions below — the sweep
 	// holds no inline predicate to delete.
 	assertNonEmptyScan("#2281 latency-logger mock surface", files.length, 900);
-	// readWalkedFiles: see `scan()` above (#3082).
-	return detectAcrossFiles(files, findLatencyLoggerGapsForFile);
+	sweepPromise = detectAcrossFiles(files);
+	return sweepPromise;
+}
+
+async function scan(): Promise<ViMockExportFinding[]> {
+	return (await sweepOnce()).gaps;
+}
+
+async function scanLatencyLoggerSurface(): Promise<ViMockExportFinding[]> {
+	return (await sweepOnce()).latency;
 }
 
 /**
@@ -199,8 +204,11 @@ function compareAgainstBaseline(
 				`${entry}: regression; missing ${finding.missing.join(", ")}`,
 			);
 		else if (finding.missing.length > admitted)
-			warnings.push(
-				`${entry}: missing count rose from ${admitted} to ${finding.missing.length}; missing ${finding.missing.join(", ")}`,
+			// Recurrence #4411 round 2 F6 (mocks): a rise only warned, so adding an
+			// export to a module that ~17 admitted partial mocks omit stayed green.
+			// A rise is a regression like a new key; a fall stays a warning.
+			problems.push(
+				`${entry}: missing count rose from ${admitted} to ${finding.missing.length}; missing ${finding.missing.join(", ")}. Spread \`importOriginal()\` into the factory, or admit the rise with \`npm run test:regen -- vi-mock\``,
 			);
 		else if (finding.missing.length < admitted)
 			warnings.push(
@@ -214,11 +222,21 @@ function compareAgainstBaseline(
 }
 
 describe("#2281 whole-module vi.mock export ratchet", () => {
-	it("keeps every latency-logger mock on the real export surface", async () => {
-		// Recurrence guard for #2272 and #2281: a whole-module factory mock can
-		// stay green until an untested production call reaches a newly added export.
-		expect(await scanLatencyLoggerSurface()).toEqual([]);
-	}, 60_000);
+	// The shared pass walks ~1,150 files once for both detectors, so whichever
+	// test ran first paid for both and crossed its 60 s budget on the Windows
+	// advisory lane (#4549 run 38954829528). Pay it here, under its own budget,
+	// so test order (including the shuffle census) cannot move the cost.
+	beforeAll(() => sweepOnce(), 120_000);
+
+	it(
+		"keeps every latency-logger mock on the real export surface",
+		async () => {
+			// Recurrence guard for #2272 and #2281: a whole-module factory mock can
+			// stay green until an untested production call reaches a newly added export.
+			expect(await scanLatencyLoggerSurface()).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("every latency pin carries a reason and the file carries its header", () => {
 		// Shape 38: a latency baseline pin without two-part admission reds.
@@ -307,6 +325,50 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 			expect(findViMockExportGaps(testFile, source)).toMatchObject([
 				{ missing: ["b"] },
 			]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("reads a typed vi.mock(import(...)) specifier at the gap site (#4429 review F7)", () => {
+		// #4429 review F7: the gap loop read the specifier through
+		// `unquote(text)`, so a typed `vi.mock(import("./module.js"), …)` had no
+		// specifier and its omitted export passed silently.
+		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		try {
+			fs.writeFileSync(path.join(root, "module.ts"), "export const b = 1;\n");
+			fs.writeFileSync(
+				path.join(root, "importer.ts"),
+				'import { b } from "./module.js"; export { b };\n',
+			);
+			const source =
+				'import "./importer.js";\nvi.mock(import("./module.js"), () => ({ a: 1 }));\n';
+			const testFile = path.join(root, "case.test.ts");
+			fs.writeFileSync(testFile, source);
+			expect(findViMockExportGaps(testFile, source)).toMatchObject([
+				{ line: 2, specifier: "./module.js", missing: ["b"] },
+			]);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("skips an importer mocked through a typed import(...) (#4429 review F7)", () => {
+		// #4429 review F7: the mocked-specifier set read `unquote(text)`, so an
+		// importer mocked as `vi.mock(import("./importer.js"), …)` was still
+		// walked and its real imports were demanded from the module's mock.
+		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		try {
+			fs.writeFileSync(path.join(root, "module.ts"), "export const b = 1;\n");
+			fs.writeFileSync(
+				path.join(root, "importer.ts"),
+				'import { b } from "./module.js"; export { b };\n',
+			);
+			const source =
+				'import "./importer.js";\nvi.mock(import("./importer.js"), () => ({ b: 1 }));\nvi.mock("./module.js", () => ({ a: 1 }));\n';
+			const testFile = path.join(root, "case.test.ts");
+			fs.writeFileSync(testFile, source);
+			expect(findViMockExportGaps(testFile, source)).toEqual([]);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -591,6 +653,70 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	// Recurrence #4411 round 2 F5 / #4435 review: two lsp/config.js baseline
+	// rows were detector false positives. Both tests spread
+	// `await vi.importActual<typeof import(spec)>(spec)`, runtime-complete like
+	// the factory-parameter `importOriginal()`, but the detector only knew the
+	// parameter spelling.
+	const importActualFactories: Array<[string, string, boolean]> = [
+		[
+			"a typed vi.importActual alias",
+			'async () => { const actual = await vi.importActual<typeof import("./module.js")>("./module.js"); return { ...actual, a: 1 }; }',
+			true,
+		],
+		[
+			"an untyped vi.importActual alias",
+			'async () => { const actual = await vi.importActual("./module.js"); return { ...actual, a: 1 }; }',
+			true,
+		],
+		[
+			"an inline typed vi.importActual spread",
+			'async () => ({ ...(await vi.importActual<typeof import("./module.js")>("./module.js")), a: 1 })',
+			true,
+		],
+		[
+			'a bracket-access vi["importActual"] alias',
+			'async () => { const actual = await vi["importActual"]("./module.js"); return { ...actual, a: 1 }; }',
+			true,
+		],
+		[
+			"a vi.importActual of ANOTHER module",
+			'async () => { const actual = await vi.importActual<typeof import("./other.js")>("./other.js"); return { ...actual, a: 1 }; }',
+			false,
+		],
+		[
+			"a vi.importActual alias that is never spread",
+			'async () => { const actual = await vi.importActual("./module.js"); return { a: 1, c: actual.b }; }',
+			false,
+		],
+		[
+			"a non-vi importActual member",
+			'async () => { const actual = await other.importActual("./module.js"); return { ...actual, a: 1 }; }',
+			false,
+		],
+	];
+	it.each(importActualFactories)(
+		"vi.importActual pass-through: %s",
+		(_name, factory, complete) => {
+			const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+			try {
+				fs.writeFileSync(path.join(root, "module.ts"), "export const b = 1;\n");
+				fs.writeFileSync(
+					path.join(root, "importer.ts"),
+					'import { b } from "./module.js"; export { b };\n',
+				);
+				const source = `import "./importer.js";\nvi.mock("./module.js", ${factory});\n`;
+				const testFile = path.join(root, "case.test.ts");
+				fs.writeFileSync(testFile, source);
+				const findings = findViMockExportGaps(testFile, source);
+				if (complete) expect(findings).toEqual([]);
+				else expect(findings).toMatchObject([{ missing: ["b"] }]);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+	);
 
 	it("accepts a two-statement no-argument importOriginal binding spread", () => {
 		// The PREMISE transcript's seventh shape: the alias idiom without a
@@ -1103,7 +1229,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 		}
 	});
 
-	it("warns when production gains an omitted export", () => {
+	it("reds when production gains an omitted export", () => {
 		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
 		try {
 			const moduleFile = path.join(root, "module.ts");
@@ -1119,8 +1245,34 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 			expect(
 				compareAgainstBaseline(finding, { [admissionKey]: 0 }),
 			).toMatchObject({
+				problems: [expect.stringMatching(/missing count rose from 0 to 1.*b/)],
+				warnings: [],
+			});
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("only warns when an admitted missing count falls", () => {
+		// The ratchet-down side of #4411 round 2 F6 (mocks): making a rise red
+		// must not turn a mock that gained an export into a red; the fall stays
+		// a warning until the baseline row is regenerated.
+		const root = fs.mkdtempSync(path.join(REPO_ROOT, ".probe-vi-mock-"));
+		try {
+			const moduleFile = path.join(root, "module.ts");
+			const testFile = path.join(root, "case.test.ts");
+			const source = 'vi.mock("./module.js", () => ({ a: 1 }));\n';
+			fs.writeFileSync(
+				moduleFile,
+				"export const a = 1;\nexport const b = 2;\n",
+			);
+			fs.writeFileSync(testFile, source);
+			const finding = findViMockExportGaps(testFile, source, "all");
+			expect(
+				compareAgainstBaseline(finding, { [key(finding[0])]: 2 }),
+			).toMatchObject({
 				problems: [],
-				warnings: [expect.stringContaining("b")],
+				warnings: [expect.stringContaining("fell from 2 to 1")],
 			});
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
@@ -1205,7 +1357,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 	});
 
 	it.skipIf(!!process.env.VI_MOCK_EXPORT_REGEN)(
-		"reports every omitted production export and warns on newly omitted exports",
+		"reports every omitted production export and reds on newly omitted exports",
 		async () => {
 			const findings = await scan();
 			const result = compareAgainstBaseline(findings, BASELINE);
@@ -1218,7 +1370,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 			);
 			expect(result.problems, result.problems.join("\n")).toEqual([]);
 		},
-		60_000,
+		TREE_WALK_TIMEOUT_MS,
 	);
 
 	it.skipIf(!!process.env.VI_MOCK_EXPORT_REGEN)(
@@ -1229,7 +1381,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 			const dead = Object.keys(BASELINE).filter((entry) => !live.has(entry));
 			expect(dead).toEqual([]);
 		},
-		60_000,
+		TREE_WALK_TIMEOUT_MS,
 	);
 
 	it.skipIf(!process.env.VI_MOCK_EXPORT_REGEN)(
@@ -1240,7 +1392,7 @@ describe("#2281 whole-module vi.mock export ratchet", () => {
 				`${JSON.stringify(baselineFrom(await scan()), null, "\t")}\n`,
 			);
 		},
-		60_000,
+		TREE_WALK_TIMEOUT_MS,
 	);
 });
 

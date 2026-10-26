@@ -29,10 +29,6 @@ import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 function makeMarksmanServer() {
@@ -48,8 +44,11 @@ function makeMarksmanServer() {
 
 describe("runWorkspaceDiagnostics — sweep-scoped index gate for workspaceIndexing servers (#645)", () => {
 	let tmp: string;
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-indexgate-"));
@@ -78,7 +77,10 @@ describe("runWorkspaceDiagnostics — sweep-scoped index gate for workspaceIndex
 			}),
 			getOperationSupport: () => ({}),
 			serverId: "marksman",
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn(async (filePath: string, ms: number) => {
 				waitCalls.push({ filePath, ms });
 				fileIndex += 1;
@@ -166,7 +168,10 @@ describe("runWorkspaceDiagnostics — sweep-scoped index gate for workspaceIndex
 			}),
 			getOperationSupport: () => ({}),
 			serverId: "python",
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn(async (_filePath: string, ms: number) => {
 				waitCalls.push(ms);
 				return undefined;

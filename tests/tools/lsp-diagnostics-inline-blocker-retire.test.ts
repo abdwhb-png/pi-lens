@@ -28,27 +28,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeMapKey } from "../../clients/path-utils.js";
 import { CacheManager } from "../../clients/cache-manager.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
+import { installLspService } from "../support/lsp-service-seam.js";
+import { _setServersForFileForTests } from "../../clients/lsp/config.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-
-vi.mock("../../clients/lsp/config.js", async () => {
-	const actual = await vi.importActual<
-		typeof import("../../clients/lsp/config.js")
-	>("../../clients/lsp/config.js");
-	return {
-		...actual,
-		getServersForFileWithConfig: (filePath: string) =>
-			getServersForFileWithConfig(filePath),
-		getServerInitOverride: () => undefined,
-		primaryServerId: (filePath: string) =>
-			(
-				getServersForFileWithConfig(filePath) as
-					| Array<{ id: string; role?: string }>
-					| undefined
-			)?.find((server) => server.role !== "auxiliary")?.id,
-	};
-});
 
 vi.mock("../../clients/lsp/client.js", async () => {
 	const actual = await vi.importActual<
@@ -73,13 +57,6 @@ vi.mock("../../clients/widget-state.js", async () => {
 });
 
 let service: unknown;
-vi.mock("../../clients/lsp/capabilities.js", async () => {
-	const actual = await vi.importActual<
-		typeof import("../../clients/lsp/capabilities.js")
-	>("../../clients/lsp/capabilities.js");
-	return { ...actual, getLSPService: () => service };
-});
-
 function makeServer(
 	id: string,
 	root: string,
@@ -112,7 +89,10 @@ function makeSilentClient(serverId: string, root: string) {
 		getLaunchVariant: () => undefined,
 		serverId,
 		root,
-		notify: { open: vi.fn(async () => {}) },
+		notify: {
+			announceCreated: () => undefined,
+			open: vi.fn(async () => {}),
+		},
 		waitForDiagnostics: vi.fn(async (_filePath: string, ms: number) => {
 			await new Promise<void>((resolve) => {
 				const t = setTimeout(resolve, ms);
@@ -243,7 +223,7 @@ async function runTool(
 
 async function freshService(): Promise<void> {
 	const { LSPService } = await import("../../clients/lsp/index.js");
-	service = new LSPService();
+	service = installLspService(new LSPService());
 }
 
 describe("#1561 lsp_diagnostics retires a stale inline blocker", () => {
@@ -254,6 +234,7 @@ describe("#1561 lsp_diagnostics retires a stale inline blocker", () => {
 	>;
 
 	beforeEach(async () => {
+		_setServersForFileForTests(getServersForFileWithConfig);
 		const { RuntimeCoordinator } =
 			await import("../../clients/runtime-coordinator.js");
 		getServersForFileWithConfig.mockReset();

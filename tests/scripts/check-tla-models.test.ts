@@ -5,23 +5,37 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import yaml from "../../clients/deps/js-yaml.js";
 import {
+	MODEL_COSTS_FILE,
 	TLA_TOOLS,
 	buildJavaArgs,
 	classifyTlcOutput,
 	computeConcurrency,
 	formatSummary,
 	listModelConfigs,
+	loadModelCosts,
 	parseCliArgs,
 	parseConcurrencyArg,
+	parseDistinctStates,
 	parseModelHeader,
 	parseShardArg,
 	resolveConcurrency,
 	resolveJarPath,
 	runPool,
 	selectConfigs,
+	STATE_COUNT_FACTOR,
 	selectShard,
+	stateCountJumps,
+	formatStateJump,
+	unrecordedStateCounts,
 	verdictMatches,
 } from "../../scripts/check-tla-models.mjs";
+
+const FIXTURES_TLA_COSTS = path.join(
+	import.meta.dirname,
+	"..",
+	"fixtures",
+	"tla-model-costs",
+);
 import { assertNonEmptyScan } from "../support/sweep-kit.js";
 
 // The two doubles below stand in for the only two things `main` cannot run in
@@ -32,6 +46,9 @@ import { assertNonEmptyScan } from "../support/sweep-kit.js";
 // pinned digest; the default empty string leaves every other `createHash`
 // caller untouched.
 const cryptoState = vi.hoisted(() => ({ digest: "" }));
+// #4714 F1: the TLC stdout the doubled `java` child emits. Empty means the
+// default pass line, so the unchanged caller-wiring case sees no count.
+const tlcState = vi.hoisted(() => ({ output: "" }));
 
 vi.mock("node:child_process", async () => {
 	const { makeFakeChild } = await import("../support/fake-child.js");
@@ -41,7 +58,8 @@ vi.mock("node:child_process", async () => {
 			queueMicrotask(() => {
 				child.stdout.emit(
 					"data",
-					"Model checking completed. No error has been found.\n",
+					tlcState.output ||
+						"Model checking completed. No error has been found.\n",
 				);
 				child.emit("close", 0);
 			});
@@ -325,10 +343,112 @@ describe("parseShardArg (#3918)", () => {
 describe("selectShard (#3918)", () => {
 	const items = ["a", "b", "c", "d", "e", "f", "g"];
 
-	it("steps through the list round-robin, so a directory's configs spread across shards", () => {
+	it("steps through the list round-robin when no cost table is given, so a directory's configs spread across shards", () => {
 		expect(selectShard(items, { index: 1, total: 3 })).toEqual(["a", "d", "g"]);
 		expect(selectShard(items, { index: 2, total: 3 })).toEqual(["b", "e"]);
 		expect(selectShard(items, { index: 3, total: 3 })).toEqual(["c", "f"]);
+	});
+
+	// #4672: with the measured table the split is by COST, which is the whole
+	// point -- round-robin by count gave four shards of 733/1255/1617/2148 s.
+	it("packs the measured cost, so equal counts do not mean equal work", () => {
+		// The measured shape of the corpus (#4672): a handful of very heavy
+		// configs and a long cheap tail. A count-based split gives every shard
+		// the same number of configs and wildly different work; the LPT pack
+		// puts each heavy config in the lightest shard at the time it is placed,
+		// so the cheap tail fills around them.
+		// Keys are REPO-RELATIVE (the table's own form): `costOf` resolves each
+		// config against the root before the lookup.
+		const files: Record<string, number> = {
+			"formal/heavy/heavy1.cfg": 400,
+			"formal/heavy/heavy2.cfg": 300,
+		};
+		for (let index = 0; index < 16; index += 1) {
+			files[`formal/cheap/cheap${String(index).padStart(2, "0")}.cfg`] = 10;
+		}
+		const costs = { root: "/repo", files, max: 400 };
+		const configs = Object.keys(files)
+			.sort()
+			.map((relative) => `/repo/${relative}`);
+		const shards = [1, 2, 3, 4].map((index) =>
+			selectShard(configs, { index, total: 4 }, costs),
+		);
+		// Exactly once, everywhere: the partition property does not soften.
+		expect(shards.flat().sort()).toEqual(configs);
+		const loads = shards.map((picked) =>
+			picked.reduce(
+				(sum, config) => sum + files[config.slice("/repo/".length)],
+				0,
+			),
+		);
+		// Total 860 s over four shards. 400 s is indivisible, so the best any
+		// partition can do is the heavy shard at 400 s: greedy LPT reaches it, and
+		// the cheap tail spreads evenly around it instead of piling onto one
+		// shard (the old count-based split's failure mode).
+		// The exact pack: one shard carries the 400 s config alone, one the 300 s
+		// config alone, and the 16 cheap configs split 8/8 across the other two.
+		expect([...loads].sort((a, b) => a - b)).toEqual([80, 80, 300, 400]);
+		// The two heavy configs never share a shard: their wall clocks add.
+		expect(
+			shards.filter((picked) =>
+				picked.includes("/repo/formal/heavy/heavy1.cfg"),
+			).length,
+		).toBe(1);
+		expect(
+			shards.find((picked) => picked.includes("/repo/formal/heavy/heavy1.cfg")),
+		).not.toContain("/repo/formal/heavy/heavy2.cfg");
+	});
+
+	// A config the table does not know costs the table's MAX, never zero and
+	// never the median: a new model is usually a heavy one, and under-pricing it
+	// is how the next tail shard appears (#4672).
+	it("prices an unmeasured config at the table's maximum, not as free", () => {
+		// Two 1 s configs, one unmeasured, max 10 s, two shards. Priced at max the
+		// unknown takes a shard of its own; priced at 0 (or at the median, 1) it
+		// would share with a known config and the placement changes.
+		const costs = {
+			root: "/repo",
+			files: { "formal/a/a.cfg": 1, "formal/b/b.cfg": 1 },
+			max: 10,
+		};
+		const configs = [
+			"/repo/formal/a/a.cfg",
+			"/repo/formal/b/b.cfg",
+			"/repo/formal/new/new.cfg",
+		];
+		const shards = [1, 2].map((index) =>
+			selectShard(configs, { index, total: 2 }, costs),
+		);
+		const withNew = shards.find((picked) =>
+			picked.includes("/repo/formal/new/new.cfg"),
+		);
+		expect(withNew).toEqual(["/repo/formal/new/new.cfg"]);
+	});
+
+	// The table is the shard's only cost input, so a malformed one must be loud:
+	// a silent fallback to equal costs would quietly restore the old tail.
+	it("refuses a malformed cost table", () => {
+		// The fixture root is removed on EVERY path, green or red: a straggler
+		// under the shared tmp root is what the tmp-fixture-hygiene owner reds on,
+		// and a throwing assertion would otherwise skip the cleanup below.
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-check-tla-models-costs-"),
+		);
+		try {
+			fs.mkdirSync(path.join(dir, "scripts"));
+			const file = path.join(dir, MODEL_COSTS_FILE);
+			fs.writeFileSync(
+				file,
+				JSON.stringify({ files: { "formal/x/a.cfg": -1 } }),
+			);
+			expect(() => loadModelCosts(dir)).toThrow(/non-negative/);
+			fs.writeFileSync(file, JSON.stringify({ nope: true }));
+			expect(() => loadModelCosts(dir)).toThrow(/no "files" object/);
+			fs.rmSync(file);
+			expect(() => loadModelCosts(dir)).toThrow(/unreadable/);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -400,19 +520,34 @@ describe("selectConfigs (#3918)", () => {
 		).toThrow(/no formal\/\*\/\*\.cfg found/);
 	});
 
+	// #4672: the split is by measured cost, so it is no longer "every other
+	// config". What this pins is the property the old assertion carried -- a
+	// shard is a strict, non-empty SUBSET and the pair covers the tree exactly
+	// once.
 	it("narrows to the shard's configs with --shard", () => {
-		const all = listModelConfigs(REPO_ROOT);
-		expect(selectConfigs(["--shard", "1/2"], REPO_ROOT)).toEqual(
-			all.filter((_, position) => position % 2 === 0),
+		const all = listModelConfigs(REPO_ROOT).map((config) =>
+			path.resolve(config),
 		);
+		const first = selectConfigs(["--shard", "1/2"], REPO_ROOT).map((config) =>
+			path.resolve(config),
+		);
+		const second = selectConfigs(["--shard", "2/2"], REPO_ROOT).map((config) =>
+			path.resolve(config),
+		);
+		assertNonEmptyScan("first shard", first.length, 100);
+		expect(first.length).toBeLessThan(all.length);
+		expect([...first, ...second].sort()).toEqual([...all].sort());
+		expect(first.filter((config) => second.includes(config))).toEqual([]);
 	});
 
 	// Recurrence: `indexOf("--shard")` missed both the equals form and a
 	// misspelled flag, so the run silently selected the whole population.
 	it("narrows to the shard with the --shard= equals form", () => {
-		const all = listModelConfigs(REPO_ROOT);
 		expect(selectConfigs(["--shard=1/2"], REPO_ROOT)).toEqual(
-			all.filter((_, position) => position % 2 === 0),
+			selectConfigs(["--shard", "1/2"], REPO_ROOT),
+		);
+		expect(selectConfigs(["--shard=1/2"], REPO_ROOT)).not.toEqual(
+			listModelConfigs(REPO_ROOT),
 		);
 	});
 
@@ -476,26 +611,32 @@ describe("entry guard order (#3920)", () => {
 });
 
 describe("main() caller wiring (#3927)", () => {
-	// The extracted helpers are pinned by the cases above, but a passing helper
-	// does not prove `main` calls it: the pre-#3927 inline expressions sat
-	// behind `ensureJar`, so a caller-side change to the pool size or the
-	// summary line had no witness. Run the real entry module over the real
-	// `formal/` corpus with only the external `java`/jar boundary doubled, and
-	// read the run's own summary back. `--shard 1/<count>` selects exactly one
-	// real config, and `--concurrency 99` is a value `computeConcurrency` can
-	// never return for one config, so a `main` that inlines either expression
-	// instead of calling the helper cannot produce the observed summary.
-	it("runs the real entry and reports the pool size and summary through the extracted helpers", async () => {
+	// Runs the real entry module with only the external `java` child and the
+	// jar checksum doubled. `root` is the tree the entry is run from: the real
+	// repo for the pool-size case, and a temp copy (see `makeEntryRoot`) for the
+	// gate cases, so they never read the committed cost table (#4714 F7).
+	async function runEntry({
+		root = REPO_ROOT,
+		shard,
+		total,
+		tlcOutput = "",
+	}: {
+		root?: string;
+		shard: number;
+		total: number;
+		tlcOutput?: string;
+	}) {
 		const stubDir = fs.mkdtempSync(
 			path.join(os.tmpdir(), "pi-lens-tla-entry-"),
 		);
 		const stubJar = path.join(stubDir, "tla2tools.jar");
 		fs.writeFileSync(stubJar, "stub jar; the checksum is doubled below");
 		cryptoState.digest = TLA_TOOLS.sha256;
-		const total = listModelConfigs(REPO_ROOT).length;
-		const scriptPath = path.join(REPO_ROOT, "scripts", "check-tla-models.mjs");
+		tlcState.output = tlcOutput;
+		const scriptPath = path.join(root, "scripts", "check-tla-models.mjs");
 		const savedArgv = process.argv;
 		const savedExitCode = process.exitCode;
+		let exitCode: number | undefined;
 		const logged: string[] = [];
 		const errors: string[] = [];
 		const logSpy = vi.spyOn(console, "log").mockImplementation((...args) => {
@@ -514,17 +655,22 @@ describe("main() caller wiring (#3927)", () => {
 			"--concurrency",
 			"99",
 			"--shard",
-			`1/${total}`,
+			`${shard}/${total}`,
 		];
 		process.exitCode = undefined;
-		const isSummary = (line: string) => line.includes("wall (concurrency=");
 		try {
 			// A unique query re-evaluates the module body, so the production
-			// entry guard runs its private `main` over the real corpus.
+			// entry guard runs its private `main` over this root's corpus.
 			await import(
-				`${pathToFileURL(scriptPath).href}?caller-wiring=${Date.now()}`
+				`${pathToFileURL(scriptPath).href}?caller-wiring=${Date.now()}-${Math.random()}`
 			);
-			for (let i = 0; i < 1000 && !logged.some(isSummary); i++) {
+			// `Per-directory` is the last line `main` prints before its failure and
+			// jump reports, and those print synchronously after it.
+			for (
+				let i = 0;
+				i < 1000 && !logged.some((line) => line.startsWith("Per-directory"));
+				i++
+			) {
 				await flushMicrotasks();
 			}
 			await flushMicrotasks();
@@ -532,18 +678,77 @@ describe("main() caller wiring (#3927)", () => {
 			logSpy.mockRestore();
 			errorSpy.mockRestore();
 			process.argv = savedArgv;
+			exitCode = process.exitCode;
 			process.exitCode = savedExitCode;
 			cryptoState.digest = "";
+			tlcState.output = "";
 			fs.rmSync(stubDir, { recursive: true, force: true });
 		}
-		// The run's own per-config result lines are the independent oracle:
-		// the summary must account for exactly the configs that ran, name the
-		// shard `main` passed, and carry the pool size `main` resolved. The
-		// expected string is built from that observation and literals, not by
-		// calling `formatSummary` (which would let a caller mutation and a
-		// helper mutation cancel out).
+		return { logged, errors, exitCode };
+	}
+
+	// A temp tree with the checker's own script and its one import, two stub
+	// configs, and a fixture table: EditDuringGrace recorded at 136 and
+	// CarryOwed absent. Nothing here reads the committed table or corpus.
+	const RECORDED = "formal/late-aux-drain/EditDuringGrace.cfg";
+	const UNRECORDED = "formal/blocker-pending/CarryOwed.cfg";
+	function makeEntryRoot() {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-tla-root-"));
+		fs.mkdirSync(path.join(root, "scripts", "lib"), { recursive: true });
+		for (const rel of [
+			"scripts/check-tla-models.mjs",
+			"scripts/lib/test-shard-assignment.mjs",
+		]) {
+			fs.copyFileSync(path.join(REPO_ROOT, rel), path.join(root, rel));
+		}
+		for (const rel of [RECORDED, UNRECORDED]) {
+			const file = path.join(root, rel);
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, "\\* expect: pass\n\\* module: M\n");
+		}
+		fs.writeFileSync(
+			path.join(root, MODEL_COSTS_FILE),
+			JSON.stringify({
+				files: { [RECORDED]: 1.4, [UNRECORDED]: 5 },
+				states: { [RECORDED]: 136 },
+			}),
+		);
+		return {
+			root,
+			done: () => fs.rmSync(root, { recursive: true, force: true }),
+		};
+	}
+
+	// The shard that `--shard i/N` gives this one config. The cost table packs
+	// by LPT (`selectShard`), not by sorted position, so the index is searched
+	// with the same function `main` calls.
+	function configIndex(root: string, rel: string) {
+		const all = listModelConfigs(root);
+		const costs = { root, ...loadModelCosts(root) };
+		const abs = all.find(
+			(config) => path.relative(root, config).split(path.sep).join("/") === rel,
+		);
+		if (abs === undefined) throw new Error(`${rel} is not under formal/`);
+		for (let index = 1; index <= all.length; index++) {
+			if (selectShard(all, { index, total: all.length }, costs).includes(abs))
+				return { shard: index, total: all.length };
+		}
+		throw new Error(`no shard selects ${rel}`);
+	}
+
+	const PASS = "Model checking completed. No error has been found.\n";
+	const stats = (distinct: number) =>
+		`${distinct * 2} states generated, ${distinct} distinct states found, 0 states left on queue.\n`;
+
+	it("runs the real entry and reports the pool size and summary through the extracted helpers", async () => {
+		const total = listModelConfigs(REPO_ROOT).length;
+		const { logged, errors } = await runEntry({ shard: 1, total });
+		const isSummary = (line: string) => line.includes("wall (concurrency=");
 		const resultLines = logged.filter((line) => /^(?:ok  |FAIL) /.test(line));
 		const summary = logged.find(isSummary);
+		// The run's own per-config result lines are the independent oracle:
+		// the summary must account for exactly the configs that ran, name the
+		// shard `main` passed, and carry the pool size `main` resolved.
 		expect(errors, errors.join("\n")).toEqual([]);
 		expect(resultLines).toHaveLength(1);
 		expect(summary, errors.join("\n")).toMatch(
@@ -551,6 +756,80 @@ describe("main() caller wiring (#3927)", () => {
 				`^1 configs \\(shard 1/${total}\\), \\d+\\.\\ds wall \\(concurrency=99, 1 TLC worker/config\\)\\.$`,
 			),
 		);
+	});
+
+	// Recurrence: #4714 F1. A count past 2x the recorded 136 must fail the run,
+	// name the config with its old and new counts, and set exit code 1.
+	it("fails the run and names the config when its distinct states pass 2x the recorded count", async () => {
+		const tree = makeEntryRoot();
+		try {
+			const { logged, errors, exitCode } = await runEntry({
+				root: tree.root,
+				...configIndex(tree.root, RECORDED),
+				tlcOutput: PASS + stats(300),
+			});
+			expect(errors, errors.join("\n")).toEqual([]);
+			expect(
+				logged.some(
+					(line) =>
+						line.startsWith(`ok   ${RECORDED}: `) &&
+						line.endsWith(", 300 distinct states)"),
+				),
+			).toBe(true);
+			expect(
+				logged.filter((line) => line.startsWith("STATE-COUNT JUMP")),
+			).toEqual([
+				expect.stringContaining(`STATE-COUNT JUMP ${RECORDED}: old count 136 `),
+			]);
+			expect(logged.find((l) => l.startsWith("STATE-COUNT JUMP"))).toContain(
+				"new count 300 ",
+			);
+			expect(exitCode).toBe(1);
+		} finally {
+			tree.done();
+		}
+	});
+
+	// The factor is inclusive: 272 is exactly 2x 136, so it passes.
+	it("passes a count exactly at the factor, with the exit code unset", async () => {
+		const tree = makeEntryRoot();
+		try {
+			const { logged, exitCode } = await runEntry({
+				root: tree.root,
+				...configIndex(tree.root, RECORDED),
+				tlcOutput: PASS + stats(272),
+			});
+			expect(logged.some((line) => line.startsWith("STATE-COUNT JUMP"))).toBe(
+				false,
+			);
+			expect(exitCode).toBeUndefined();
+		} finally {
+			tree.done();
+		}
+	});
+
+	// Recurrence: #4714 F1. A config with no recorded count only reports; the
+	// run stays green however large its count is.
+	it("reports an unrecorded config's count without failing the run", async () => {
+		const tree = makeEntryRoot();
+		try {
+			const { logged, exitCode } = await runEntry({
+				root: tree.root,
+				...configIndex(tree.root, UNRECORDED),
+				tlcOutput: PASS + stats(1e9),
+			});
+			expect(logged.some((line) => line.startsWith("STATE-COUNT JUMP"))).toBe(
+				false,
+			);
+			expect(
+				logged.some((line) =>
+					line.includes("ran with no recorded distinct-state count"),
+				),
+			).toBe(true);
+			expect(exitCode).toBeUndefined();
+		} finally {
+			tree.done();
+		}
 	});
 });
 
@@ -654,6 +933,104 @@ describe("runPool (#3572)", () => {
 		const task = vi.fn(async (item: number) => `r${item}`);
 		const results = await runPool([0, 1], 10, task);
 		expect(results).toEqual(["r0", "r1"]);
+	});
+});
+
+// #4714: TLC's distinct-state count is recorded per config, and a config whose
+// count grows past the recorded one by more than the factor fails the checker.
+// Recurrence: #3836, where three processes at MaxGen=5 reached 30.8M distinct
+// states at 3.95 GB without finishing, and the seconds-only table showed
+// nothing until the shard hit its cap.
+describe("distinct-state ratchet (#4714)", () => {
+	const TLC_COUNTS =
+		"Model checking completed. No error has been found.\n" +
+		"  Finished computing initial states: 1 distinct state generated at 2026-10-24 10:00:00.\n" +
+		"3130444 states generated, 3130444 distinct states found, 0 states left on queue.\n" +
+		"The depth of the complete state graph search is 41.\n";
+
+	it("reads TLC's own distinct-state count from its statistics line", () => {
+		expect(parseDistinctStates(TLC_COUNTS)).toBe(3130444);
+		// No statistics line (a parse error) is no count, not zero.
+		expect(
+			parseDistinctStates("Error: Parsing or semantic analysis failed."),
+		).toBe(null);
+	});
+
+	// Recurrence: #4714 itself. The fixture grows GROW.cfg from its recorded
+	// 1000 states to 2001 (past 2x) and STAY.cfg from 1000 to 2000 (at 2x).
+	it("fails a config whose distinct states exceed its recorded count by the factor", () => {
+		const states = { "formal/x/Grow.cfg": 1000, "formal/x/Stay.cfg": 1000 };
+		const outcomes = [
+			{ id: "formal/x/Grow.cfg", distinctStates: 2001 },
+			{ id: "formal/x/Stay.cfg", distinctStates: 2000 },
+		];
+		expect(stateCountJumps(outcomes, states)).toEqual([
+			{ id: "formal/x/Grow.cfg", recorded: 1000, observed: 2001 },
+		]);
+	});
+
+	// Recurrence: a config added after the table was recorded has no count; the
+	// ratchet reports it, it never fails the run for lacking a number.
+	it("reports a config with no recorded count instead of failing it", () => {
+		expect(
+			stateCountJumps(
+				[
+					{ id: "formal/x/New.cfg", distinctStates: 1e9 },
+					{ id: "formal/x/Old.cfg", distinctStates: null },
+				],
+				{ "formal/x/Old.cfg": 1 },
+			),
+		).toEqual([]);
+		expect(
+			unrecordedStateCounts(
+				[
+					{ id: "formal/x/New.cfg", distinctStates: 5 },
+					{ id: "formal/x/Old.cfg", distinctStates: 5 },
+				],
+				{ "formal/x/Old.cfg": 5 },
+			),
+		).toEqual(["formal/x/New.cfg"]);
+	});
+
+	it("names the config, the old count and the new count in the message", () => {
+		const line = formatStateJump({
+			id: "formal/x/Grow.cfg",
+			recorded: 1000,
+			observed: 2001,
+		});
+		expect(line).toContain("formal/x/Grow.cfg");
+		expect(line).toContain("old count 1000");
+		expect(line).toContain("new count 2001");
+		expect(STATE_COUNT_FACTOR).toBe(2);
+	});
+
+	// Recurrence: #4714 non-goal guard. A table written before this change has
+	// no `states` key and must still load, with an empty count map.
+	it("loads a pre-#4714 cost table (no states key) and refuses a malformed count", () => {
+		const dir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-check-tla-states-"),
+		);
+		try {
+			fs.mkdirSync(path.join(dir, "scripts"));
+			const file = path.join(dir, MODEL_COSTS_FILE);
+			fs.copyFileSync(
+				path.join(FIXTURES_TLA_COSTS, "pre-4714-table.json"),
+				file,
+			);
+			const old = loadModelCosts(dir);
+			expect(Object.keys(old.files).length).toBe(823);
+			expect(old.states).toEqual({});
+			fs.writeFileSync(
+				file,
+				JSON.stringify({
+					files: { "formal/x/a.cfg": 1 },
+					states: { "formal/x/a.cfg": -3 },
+				}),
+			);
+			expect(() => loadModelCosts(dir)).toThrow(/states/);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 

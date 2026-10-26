@@ -107,9 +107,14 @@ import { launchLSP } from "./launch.js";
 import {
 	registerSessionRoot,
 	resetSessionRootsForTests,
-	sessionRootConfigEntries,
+	sessionRootConfigForFile,
 	setSessionRootConfig,
 } from "./session-roots.js";
+import {
+	fileMatchKeys,
+	fileMatchReason,
+	registeredServers,
+} from "./file-server-match.js";
 import {
 	LSP_SERVERS,
 	resetLSPCaseSensitivityState,
@@ -850,6 +855,11 @@ function normalizeWorkspacePath(cwd: string): string {
 type ProvenanceMap = ReadonlyMap<string, Provenance>;
 let unknownTrustNoticeGeneration = -1;
 
+type ServersForFile = (filePath: string) => LSPServerInfo[];
+
+/** The test-only selection `_setServersForFileForTests` arms (#4709). */
+let serversForFileOverride: ServersForFile | undefined;
+
 function sourceFor(
 	provenance: ProvenanceMap,
 	key: string,
@@ -905,28 +915,8 @@ function registryDecision(
 	}
 }
 
-function isSameOrChildPath(filePath: string, candidateRoot: string): boolean {
-	if (filePath === candidateRoot) return true;
-	return filePath.startsWith(`${candidateRoot}${path.sep}`);
-}
-
 function getConfigForFile(filePath: string): RegisteredLSPConfig {
-	const resolvedFilePath = path.resolve(filePath);
-	let bestMatch: { root: string; config: RegisteredLSPConfig } | undefined;
-
-	// #2518: the per-root configs ARE the session-root registry's values, so
-	// this walk sees a config for exactly the roots that registry still serves.
-	// `undefined` is a root whose first load is still in flight — the same
-	// "no entry yet" state this walk skipped before the two stores merged.
-	for (const [root, config] of sessionRootConfigEntries()) {
-		if (config === undefined) continue;
-		if (!isSameOrChildPath(resolvedFilePath, root)) continue;
-		if (!bestMatch || root.length > bestMatch.root.length) {
-			bestMatch = { root, config };
-		}
-	}
-
-	return bestMatch?.config ?? EMPTY_CONFIG;
+	return sessionRootConfigForFile(filePath) ?? EMPTY_CONFIG;
 }
 
 /**
@@ -953,6 +943,173 @@ function getConfigForFile(filePath: string): RegisteredLSPConfig {
  */
 export function registerLSPConfig(config: LSPConfig): RegisteredLSPConfig {
 	return compileLspRegistry(config, config.__provenance);
+}
+
+/** One trait's decision for a command-override copy (#4833). */
+interface OverrideTraitDecision {
+	/** True = the copy keeps the catalog row's value; false = it resets. */
+	readonly keep: boolean;
+	readonly why: string;
+}
+
+/**
+ * #4833: what a `lsp.serverOverrides.<id>.command` copy does with EVERY
+ * `LSPServerInfo` trait, decided once, here. The override swaps the binary and
+ * keeps the catalog row's identity, but the row's measured values were
+ * measured on the CATALOG binary, so the copy runs another binary under facts
+ * nobody measured for it. #4829 found `resendRecheck` riding the copy; this
+ * table replaces that one-off drop.
+ *
+ * The rule: a trait is KEPT only when it is routing identity (which files the
+ * entry serves) or when its failure direction is restrictive (a guard that
+ * declines or refuses, a budget that only waits longer, a ceiling that only
+ * lowers a shared default), so keeping a value measured on another binary
+ * costs speed or coverage and never a wrong verdict. Every trait that is an
+ * optimistic claim about how the binary behaves RESETS to its documented
+ * fail-safe default (absent, or `unmeasured`).
+ *
+ * Fail closed: the copy is built from the kept keys only, so a field the table
+ * does not name never reaches the copy, and the mapped type below refuses to
+ * compile until a new `LSPServerInfo` member is decided.
+ * `tests/config/lsp-override-copy-census.test.ts` holds the table to the
+ * interface's real declaration in both directions.
+ *
+ * The server-id-keyed wait strategy (`wait-policy/strategies.ts`) is not a
+ * field here: the copy's `spawn` reports `launchVariant: "override"` and
+ * `getStrategy` answers that with the default strategy, so silentOnClean,
+ * emptyFirstPublish, diagnosticsFence and workspaceIndexing (and the rest of
+ * the row) reset too.
+ */
+export const OVERRIDE_COPY_TRAITS: {
+	readonly [K in keyof LSPServerInfo]-?: OverrideTraitDecision;
+} = {
+	id: {
+		keep: true,
+		why: "Routing identity: the override is keyed by this id.",
+	},
+	name: {
+		keep: true,
+		why: "Routing identity: how the entry is named in output.",
+	},
+	extensions: {
+		keep: true,
+		why: "Routing: which files the entry serves; an override swaps the binary, not the language mapping.",
+	},
+	role: {
+		keep: true,
+		why: "Routing: primary versus auxiliary selection is a policy of the entry, not a measurement.",
+	},
+	root: {
+		keep: true,
+		why: "Routing: where the workspace is hosted; the override changes the binary only.",
+	},
+	rootMarkers: {
+		keep: true,
+		why: "Routing: the marker table behind the shared root seam.",
+	},
+	fallbackFor: {
+		keep: true,
+		why: "Routing: which preferred server this entry backs up.",
+	},
+	pathFilter: {
+		keep: true,
+		why: "Routing: the candidacy gate beyond extensions.",
+	},
+	executesProjectCode: {
+		keep: true,
+		why: "Protective: a true value refuses an untrusted spawn; resetting would widen.",
+	},
+	looseFileRoot: {
+		keep: true,
+		why: "Protective: a decline keeps a home-directory walk from starting; resetting would widen.",
+	},
+	spawnNeedsProjectFile: {
+		keep: true,
+		why: "Protective: a decline before spawn; wrongly kept it costs a spawn, never a verdict.",
+	},
+	requiresProjectRoot: {
+		keep: true,
+		why: "Restrictive: only demotes an empty answer to unconfirmed.",
+	},
+	availabilityKey: {
+		keep: true,
+		why: "Protective: the adopted-root project-local binary refusal reads it; resetting would widen.",
+	},
+	projectLocalCommand: {
+		keep: true,
+		why: "Protective: the adopted-root project-local binary refusal reads it; resetting would widen.",
+	},
+	settingsSection: {
+		keep: true,
+		why: "Documented (#4758): the section sits on the server so a command override keeps it.",
+	},
+	initializeTimeoutMs: {
+		keep: true,
+		why: "Wait budget at or above the shared default; too short kills a slow-bootstrap server, too long only waits.",
+	},
+	clientWaitTimeoutMs: {
+		keep: true,
+		why: "Wait budget; a longer wait costs time and never a wrong verdict.",
+	},
+	notifyInflightLimit: {
+		keep: true,
+		why: "Ceiling that only lowers the shared default; a lower cap costs round trips, a higher one risks the stall it bounded.",
+	},
+	idleEviction: {
+		keep: false,
+		why: "Reset to unmeasured (never evicted): 'transparent' needs per-server evidence.",
+	},
+	replyOrdering: {
+		keep: false,
+		why: "Reset to unmeasured (barrier armed): the notify barrier's soundness rests on the measured ordering.",
+	},
+	resendRecheck: {
+		keep: false,
+		why: "Reset to unmeasured (no re-send): a server that publishes nothing for unchanged bytes loses the answer (#4782).",
+	},
+	autoPropagateDiagnostics: {
+		keep: false,
+		why: "Reset (active touch of neighbours): an optimistic claim that the server pushes dependents.",
+	},
+	autoInstall: {
+		keep: false,
+		why: "Reset: it installs the catalog binary, not the override's.",
+	},
+	custom: {
+		keep: false,
+		why: "Reset: marks config-supplied rows; catalog rows never declare it.",
+	},
+	command: {
+		keep: false,
+		why: "Reset: the custom-row command token; the override's command lives in its spawn.",
+	},
+	covers: {
+		keep: false,
+		why: "Reset: the custom-row covers claim; catalog rows declare theirs in BUILTIN_SERVER_RUNNER_COVERS.",
+	},
+	trustAllowed: {
+		keep: false,
+		why: "Set by the copy: the registry admitted the override's command.",
+	},
+	spawn: {
+		keep: false,
+		why: "Set by the copy: launches the override's command.",
+	},
+};
+
+/** The kept traits of a catalog row; every key the table does not keep is absent. */
+function keptOverrideTraits(server: LSPServerInfo): Record<string, unknown> {
+	const kept: Record<string, unknown> = {};
+	for (const [trait, value] of Object.entries(server)) {
+		// A key the table does not name is dropped, not copied (fail closed).
+		if (
+			Object.hasOwn(OVERRIDE_COPY_TRAITS, trait) &&
+			OVERRIDE_COPY_TRAITS[trait as keyof LSPServerInfo].keep
+		) {
+			kept[trait] = value;
+		}
+	}
+	return kept;
 }
 
 /**
@@ -1061,14 +1218,36 @@ export function compileLspRegistry(
 		}
 	}
 
+	// #3952: the CATALOG ENTRY ITSELF for a server with no command override,
+	// never a copy. `compileLspRegistry`'s list is what
+	// `getServersForFileWithConfig` hands the service, and the service keeps
+	// that object for the client's whole lifetime (`SpawnedServer.info` →
+	// `scheduleIdleEviction`, `spawn`). A copy makes the list a second registry
+	// whose entries look identical but answer for nothing: the nightly
+	// idle-eviction probe arms `server.idleEviction` on
+	// the object `LSP_SERVERS`/`getServerById` exposes (#3645), and from
+	// 2026-10-10 (when this branch began copying) that arm never reached
+	// `scheduleIdleEviction`, so every candidate read `not-evicted` and no server
+	// could earn a promotion night. Repairing the identity here is what makes
+	// "the registry object the service reads" true again.
+	//
+	// An OVERRIDDEN server keeps its copy below: that one carries the
+	// override's `spawn` and `trustAllowed`, which must stay out of the catalog.
 	const overriddenBuiltins = LSP_SERVERS.map((server) => {
 		const override = serverOverrides.get(server.id);
-		if (!override?.command) return { ...server };
+		if (!override?.command) return server;
 		const argv = Array.isArray(override.command)
 			? override.command
 			: [override.command, "--stdio"];
+		// #4833: the copy keeps only what `OVERRIDE_COPY_TRAITS` keeps; every
+		// other measured trait of the catalog binary resets (`idleEviction` is
+		// the one required field, so its fail-safe value is spelled here).
 		return {
-			...server,
+			...(keptOverrideTraits(server) as Omit<
+				LSPServerInfo,
+				"spawn" | "trustAllowed" | "idleEviction"
+			>),
+			idleEviction: "unmeasured" as const,
 			trustAllowed: true,
 			async spawn(
 				root: string,
@@ -1082,7 +1261,9 @@ export function compileLspRegistry(
 					cwd: root,
 					env: override.env ? { ...process.env, ...override.env } : process.env,
 				});
-				return { process: proc };
+				// "override": the wait policy's server-id-keyed rows were measured on
+				// the catalog binary (`getStrategy`).
+				return { process: proc, launchVariant: "override" as const };
 			},
 		};
 	});
@@ -1166,27 +1347,11 @@ export async function initLSPConfig(cwd: string): Promise<void> {
 }
 
 /**
- * Every server a workspace knows about, in registry-then-custom order and
- * BEFORE any gate is applied.
- *
- * Spelled once because two callers need the same list for opposite purposes:
- * `getAllServers` DROPS the disabled ones, `explainServersForFile` REPORTS
- * them. A custom server that only one of the two composed would be a server
- * the runtime runs and the introspection cannot see, or the reverse.
- */
-function registeredServers(config: RegisteredLSPConfig): LSPServerInfo[] {
-	const builtins = config.registeredServers.length
-		? config.registeredServers
-		: LSP_SERVERS;
-	return [...builtins, ...config.customServers];
-}
-
-/**
  * Get all available servers (built-in + custom, minus disabled)
  */
 export function getAllServers(filePath?: string): LSPServerInfo[] {
 	const config = filePath ? getConfigForFile(filePath) : EMPTY_CONFIG;
-	return registeredServers(config).filter(
+	return registeredServers(config, LSP_SERVERS).filter(
 		(s) => !config.disabledServerIds.has(s.id),
 	);
 }
@@ -1249,21 +1414,7 @@ function selectionReason(
 	base: string,
 ): ServerSelectionReason {
 	if (config.disabledServerIds.has(server.id)) return "disabled-by-config";
-	let matched = false;
-	for (const value of server.extensions) {
-		const lower = value.toLowerCase();
-		if (lower === ext || lower === base) {
-			matched = true;
-			break;
-		}
-	}
-	if (!matched) return "extension-mismatch";
-	// #636: a server's extension match can be intentionally broader than what
-	// it can usefully act on (zizmor attaches to "yaml" but only ever reports
-	// on GitHub Actions workflow/action/dependabot paths). `pathFilter`, when
-	// present, is an ADDITIONAL narrowing gate — never a widening one.
-	if (server.pathFilter && !server.pathFilter(filePath)) return "path-filter";
-	return "selected";
+	return fileMatchReason(server, filePath, ext, base);
 }
 
 /**
@@ -1280,19 +1431,18 @@ export function explainServersForFile(
 	filePath: string,
 	config: RegisteredLSPConfig = getConfigForFile(filePath),
 ): ServerSelection[] {
-	const ext = path.extname(filePath).toLowerCase();
-	const base = path.basename(filePath).toLowerCase();
-	return registeredServers(config).map((server) => {
+	const { ext, base } = fileMatchKeys(filePath);
+	return registeredServers(config, LSP_SERVERS).map((server) => {
 		const reason = selectionReason(server, config, filePath, ext, base);
 		return { server, selected: reason === "selected", reason };
 	});
 }
 
 export function getServersForFileWithConfig(filePath: string): LSPServerInfo[] {
+	if (serversForFileOverride) return serversForFileOverride(filePath);
 	const config = getConfigForFile(filePath);
-	const ext = path.extname(filePath).toLowerCase();
-	const base = path.basename(filePath).toLowerCase();
-	return registeredServers(config).filter(
+	const { ext, base } = fileMatchKeys(filePath);
+	return registeredServers(config, LSP_SERVERS).filter(
 		(server) =>
 			selectionReason(server, config, filePath, ext, base) === "selected",
 	);
@@ -1376,7 +1526,29 @@ export function getServerInitOverride(
 	return getConfigForFile(filePath).serverOverrides.get(serverId);
 }
 
+/**
+ * Test-only server selection (#4709). Replaces `getServersForFileWithConfig`'s
+ * answer (and so `primaryServerId`, `resolveLspCwdForFile`, which derive from
+ * it) with `select(filePath)` until `resetLSPConfigStateForTests` runs.
+ * A suite that needs a per-test server list calls this instead of
+ * `vi.mock`-ing this module, so every other export stays the real one.
+ *
+ * Product paths never reach it: nothing under `clients/`, `tools/`, `mcp/` or
+ * `index.ts` imports the name (`tests/clients/lsp/config-selection-setter.test.ts`
+ * scans for that), and the setter ignores an arm outside a Vitest process.
+ * Pass `undefined` to drop the injection without resetting the rest.
+ */
+export function _setServersForFileForTests(
+	select: ServersForFile | undefined,
+): void {
+	if (select && !process.env.VITEST) return;
+	serversForFileOverride = select;
+}
+
 export function resetLSPConfigStateForTests(): void {
+	// #4709: the injected selection is test state too; a later case that
+	// resets must see the real registry's answer, not the last case's list.
+	serversForFileOverride = undefined;
 	resetLSPCaseSensitivityState();
 	// One call clears both the served roots and their configs: since #2518 they
 	// are one store, so a reset cannot leave a cleared config store beside a

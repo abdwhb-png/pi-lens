@@ -28,20 +28,11 @@ import {
 } from "../../clients/runtime-coordinator.js";
 import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { matchingCloseIndex } from "../support/sweep-kit.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
 
 const touchFileMock = vi.fn().mockResolvedValue(undefined);
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: () =>
-		makeLspServiceDouble({
-			touchFile: touchFileMock,
-			getWarmClientForFile: vi.fn().mockResolvedValue(undefined),
-		}),
-	resetLSPService: () => {},
-}));
-
 vi.mock("../../clients/bootstrap.js", async () => {
 	const { bootstrapSeamMock } = await import("../support/bootstrap-mock.js");
 	return bootstrapSeamMock(async () => ({
@@ -110,10 +101,65 @@ function baseDeps(
 	} as Parameters<typeof handleToolCall>[0];
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await installLspServiceDouble({
+		touchFile: touchFileMock,
+		getWarmClientForFile: vi.fn().mockResolvedValue(undefined),
+	});
 	resetDegradationLedger();
 	readGuardLogEntries.length = 0;
 	touchFileMock.mockClear();
+});
+
+/**
+ * #4631 — the host's two request phases own DIFFERENT structures, which is the
+ * whole reason pi-lens injects from the later one (N1: the `## Detection` gap
+ * named this file, so the contract it would have caught lives here rather than
+ * only in a #4631-specific witness).
+ *
+ * `context` (phase 1) hands a handler the conversation with system messages
+ * FILTERED OUT and, when the handler returns a changed list, rebuilds one
+ * merged system head from the transcript (`restoreSystemMessages`). That
+ * re-derived head is what broke the prompt cache on pi 0.87+. `context_with_system`
+ * (phase 2) hands over the FULL transcript and assigns the returned list
+ * verbatim, reporting `Handler removed the leading system message` if a
+ * handler's return loses it.
+ */
+describe("#4631 — the request phases own different structures", () => {
+	it("pins that `context` filters and re-derives, and `context_with_system` assigns verbatim", () => {
+		const source = readHostSource(path.join("core", "extensions", "runner.js"));
+		const phaseStart = source.indexOf(
+			'snapshotEventHandlers(this.extensions, "context")',
+		);
+		const withSystemStart = source.indexOf(
+			'snapshotEventHandlers(this.extensions, "context_with_system")',
+		);
+		expect(phaseStart).toBeGreaterThan(-1);
+		expect(withSystemStart).toBeGreaterThan(phaseStart);
+		const contextPhase = source.slice(phaseStart, withSystemStart);
+		const withSystemPhase = source.slice(withSystemStart);
+
+		// Phase 1: system messages are stripped from what the handler sees …
+		expect(contextPhase).toContain(
+			'const visibleMessages = currentMessages.filter((message) => message.role !== "system")',
+		);
+		// … and a changed return is RE-DERIVED into one merged head, which is the
+		// rebuild that invalidates the provider's cached prefix.
+		expect(contextPhase).toContain(
+			"restoreSystemMessages(currentMessages, visibleSnapshot, returned)",
+		);
+		// Phase 2: the returned list is assigned, never re-derived …
+		expect(withSystemPhase).toContain(
+			"currentMessages = handlerResult?.messages ?? currentMessages",
+		);
+		// … and losing the leading system message is reported as an error.
+		expect(withSystemPhase).toContain(
+			"Handler removed the leading system message",
+		);
+
+		// The premise that makes the split matter: phase 2 has no re-derivation.
+		expect(withSystemPhase).not.toContain("restoreSystemMessages(");
+	});
 });
 
 describe("#1655 item 1 — a throwing tool_call handler must not block the tool", () => {
@@ -496,6 +542,8 @@ describe("#1655 item 5 — pi's unicode path-variant ladder", () => {
 
 			expect(recordRead).toHaveBeenCalledWith(
 				expect.objectContaining({ filePath: onDisk }),
+				// #1649: the tool_call's one pass is the capture; the guard takes none.
+				{ captureLineHashes: false },
 			);
 			expect(
 				getDegradationSummary().find(
@@ -687,6 +735,8 @@ describe("#1655 review F1 — the base resolution pi runs BEFORE the ladder", ()
 
 				expect(recordRead).toHaveBeenCalledWith(
 					expect.objectContaining({ filePath: onDisk }),
+					// #1649: the tool_call's one pass is the capture; the guard takes none.
+					{ captureLineHashes: false },
 				);
 				expect(
 					getDegradationSummary().find(
@@ -834,19 +884,31 @@ describe("#1655 review F2 — bookkeeping must not discard a block verdict", () 
 });
 
 describe("#1655 review F3 — the bash-side path source, pinned by use", () => {
-	/** Text of every `event.toolName === "bash"` block in a source file. */
+	/**
+	 * The heads of the blocks that hold the bash command string. #4732: the
+	 * recovery block also serves other captured tools, so its head names the
+	 * command variable rather than the tool; its command is still bash's.
+	 */
+	const BASH_BLOCK_HEADS = [
+		'event.toolName === "bash"',
+		"if (bashCommand !== undefined || opaqueNonBash)",
+	];
+
+	/** Text of every bash block (`BASH_BLOCK_HEADS`) in a source file. */
 	function bashBlocks(source: string): string[] {
 		const blocks: string[] = [];
-		let from = 0;
-		for (;;) {
-			const hit = source.indexOf('event.toolName === "bash"', from);
-			if (hit === -1) break;
-			from = hit + 1;
-			const open = source.indexOf("{", source.indexOf(")", hit));
-			if (open === -1) continue;
-			const close = matchingCloseIndex(source, open, "{", "}");
-			const index = close === -1 ? source.length : close;
-			blocks.push(source.slice(open, index + 1));
+		for (const head of BASH_BLOCK_HEADS) {
+			let from = 0;
+			for (;;) {
+				const hit = source.indexOf(head, from);
+				if (hit === -1) break;
+				from = hit + 1;
+				const open = source.indexOf("{", source.indexOf(")", hit));
+				if (open === -1) continue;
+				const close = matchingCloseIndex(source, open, "{", "}");
+				const index = close === -1 ? source.length : close;
+				blocks.push(source.slice(open, index + 1));
+			}
 		}
 		return blocks;
 	}
@@ -948,7 +1010,13 @@ describe("#1655 review F3 — the bash-side path source, pinned by use", () => {
 		// one that is NOT a path source: it tokenizes the command through
 		// bash-file-access's own `tokenizeShellCommand` and returns a boolean
 		// recovery policy. It proposes no paths, so it needs no workspaceRoot
-		// pin below. Any FUTURE addition here is a path source until proven
+		// pin below.
+		// `resolveOpaqueRecoveryRoots` (#2050) is the sixth, and also not a path
+		// source: it asks `scanShellWriteScopes` for the command's `cd` targets
+		// and recognised writes, then answers WHICH checkouts the recovery runs
+		// in. It proposes no path of its own, and it resolves its operands through
+		// the same bash-file-access walk, so the second-lexer rule holds.
+		// Any FUTURE addition here is a path source until proven
 		// otherwise — pin it, then justify it in one line like this.
 		expect([...callees].sort()).toEqual([
 			"extractDeletedPathsFromCommand",
@@ -956,6 +1024,7 @@ describe("#1655 review F3 — the bash-side path source, pinned by use", () => {
 			"extractReadPathsFromCommand",
 			"extractWrittenPathsFromCommand",
 			"isFailedGitIntegrationCommand",
+			"resolveOpaqueRecoveryRoots",
 		]);
 
 		// ...and each resolves against the project root, never a ctx.cwd the

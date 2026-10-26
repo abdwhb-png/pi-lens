@@ -81,12 +81,14 @@ import {
 	dispatchLintWithResult,
 } from "../../clients/dispatch/integration.js";
 
-// Mock LSP service
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(),
-}));
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
+import { scaledTestTimeout } from "../support/test-timeout-scale.js";
 
-import { getLSPService } from "../../clients/lsp/capabilities.js";
+// #4019: the Windows lane declares PI_LENS_TEST_TIMEOUT_SCALE=3 because a
+// native path-canonicalization syscall per pipeline run makes a population
+// test cost several times its Linux time; the factor is the lane's, and
+// `scaledTestTimeout` is its one home (#4592 review F5 fold). 1 everywhere
+// else, so no POSIX budget moves.
 
 describe("Pipeline", () => {
 	let tmpDir: string;
@@ -112,11 +114,10 @@ describe("Pipeline", () => {
 				},
 			}),
 		);
-		mockLSPService = makeLspServiceDouble({
+		mockLSPService = await installLspServiceDouble({
 			supportsLSP: vi.fn().mockReturnValue(true),
 			hasLSP: vi.fn().mockResolvedValue(true),
 		});
-		vi.mocked(getLSPService).mockReturnValue(mockLSPService as any);
 		vi.mocked(dispatchLintWithResult).mockReset();
 		const { resetFormatService } =
 			await import("../../clients/format-service.js");
@@ -390,6 +391,45 @@ describe("Pipeline", () => {
 		});
 	});
 
+	it.each([2 * 1024 * 1024, 2 * 1024 * 1024 + 1])(
+		"preserves inline baseline byte boundary at %i",
+		async (size) => {
+			const filePath = createTempFile(
+				tmpDir,
+				"clean-baseline.ts",
+				"x".repeat(size),
+			);
+			vi.mocked(dispatchLintWithResult).mockImplementationOnce(async () => ({
+				diagnostics: [],
+				blockers: [],
+				warnings: [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "clean",
+				blockerOutput: "",
+				hasBlockers: false,
+			}));
+
+			const result = await runPipeline(
+				createMockContext(filePath, { allowAutonomousWriters: false }),
+				createMockDeps(),
+			);
+
+			expect(result.hasBlockers).toBe(false);
+			expect(result.inlineBlockerFileContent).toEqual(
+				size <= 2 * 1024 * 1024
+					? {
+							size,
+							sha256: createHash("sha256")
+								.update("x".repeat(size))
+								.digest("hex"),
+						}
+					: undefined,
+			);
+		},
+	);
+
 	it("states why a delta-promoted unused finding blocks in the enriched STOP block (#3218)", async () => {
 		// The turn-end replay renders through `formatDiagnostics`, but the inline
 		// tool result renders the enriched variant. Both must carry the seam's
@@ -608,7 +648,9 @@ describe("Pipeline", () => {
 				getFormatService: () => formatService,
 			});
 			formatService.formatFile = async (fp: string) => {
-				const result = await originalFormatFile(fp);
+				const result = await originalFormatFile(fp, {
+					sessionRoot: path.dirname(fp),
+				});
 				// Force a file change by writing different content
 				if (fp === filePath || path.resolve(fp) === path.resolve(filePath)) {
 					fs.writeFileSync(filePath, "const x = 1;\n");
@@ -793,68 +835,79 @@ describe("Pipeline", () => {
 			expect(result.output).not.toContain("OPAQUE-BLOCKER");
 		});
 
-		it("bounds opaque ownership telemetry across many paths (#3226 review P2)", async () => {
-			// Recurrence: per-path once keys made opaque recovery retain one hidden
-			// identity per artifact. Drive the real pipeline seam with the reviewer's
-			// 10,000-path population and inspect both hidden ledger populations and
-			// the independent public count/dropped evidence.
-			vi.mocked(dispatchLintWithResult).mockResolvedValue({
-				diagnostics: [],
-				blockers: [],
-				warnings: [],
-				baselineWarningCount: 0,
-				fixed: [],
-				resolvedCount: 0,
-				output: "",
-				blockerOutput: "",
-				hasBlockers: false,
-			});
-			const deps = createMockDeps({ getFormatService: () => ({}) as any });
-			const firstPath = path.join(tmpDir, "opaque-0.js");
-			await runPipeline(
-				createMockContext(firstPath, { allowAutonomousWriters: false }),
-				deps,
-			);
-			await runPipeline(
-				createMockContext(firstPath, { allowAutonomousWriters: false }),
-				deps,
-			);
-			for (let index = 1; index < 10_000; index++) {
+		it(
+			"bounds opaque ownership telemetry across many paths (#3226 review P2)",
+			async () => {
+				// Recurrence: per-path once keys made opaque recovery retain one hidden
+				// identity per artifact. Drive the real pipeline seam with the reviewer's
+				// 10,000-path population and inspect both hidden ledger populations and
+				// the independent public count/dropped evidence.
+				vi.mocked(dispatchLintWithResult).mockResolvedValue({
+					diagnostics: [],
+					blockers: [],
+					warnings: [],
+					baselineWarningCount: 0,
+					fixed: [],
+					resolvedCount: 0,
+					output: "",
+					blockerOutput: "",
+					hasBlockers: false,
+				});
+				const deps = createMockDeps({ getFormatService: () => ({}) as any });
+				const firstPath = path.join(tmpDir, "opaque-0.js");
 				await runPipeline(
-					createMockContext(path.join(tmpDir, `opaque-${index}.js`), {
-						allowAutonomousWriters: false,
-					}),
+					createMockContext(firstPath, { allowAutonomousWriters: false }),
 					deps,
 				);
-			}
+				await runPipeline(
+					createMockContext(firstPath, { allowAutonomousWriters: false }),
+					deps,
+				);
+				for (let index = 1; index < 10_000; index++) {
+					await runPipeline(
+						createMockContext(path.join(tmpDir, `opaque-${index}.js`), {
+							allowAutonomousWriters: false,
+						}),
+						deps,
+					);
+				}
 
-			const state = _getDegradationLedgerStateForTests();
-			expect(state.onceKeys).toBe(0);
-			expect(state.tallies).toBe(1);
-			expect(state.retainedEntries).toBe(1);
-			expect(getDegradationSummary()).toEqual([
-				expect.objectContaining({
-					kind: "opaque-mutation-ownership-boundary",
-					count: 10_001,
-					droppedCount: 10_001 - 1,
-					latestReasons: expect.arrayContaining([
-						expect.objectContaining({ subject: "pipeline" }),
-					]),
-				}),
-			]);
+				const state = _getDegradationLedgerStateForTests();
+				expect(state.onceKeys).toBe(0);
+				expect(state.tallies).toBe(1);
+				expect(state.retainedEntries).toBe(1);
+				expect(getDegradationSummary()).toEqual([
+					expect.objectContaining({
+						kind: "opaque-mutation-ownership-boundary",
+						count: 10_001,
+						droppedCount: 10_001 - 1,
+						latestReasons: expect.arrayContaining([
+							expect.objectContaining({ subject: "pipeline" }),
+						]),
+					}),
+				]);
 
-			resetDegradationLedger();
-			expect(_getDegradationLedgerStateForTests()).toEqual({
-				onceKeys: 0,
-				tallies: 0,
-				retainedEntries: 0,
-			});
-			expect(getDegradationSummary()).toEqual([]);
-			// 10,000 sequential real pipeline runs: ~0.7 s on Linux, past Vitest's
-			// 5 s default on the Windows runner where every run pays native
-			// path-canonicalization syscalls (#4019). The population is the claim, so
-			// the budget grows rather than the population shrinking.
-		}, 60_000);
+				resetDegradationLedger();
+				expect(_getDegradationLedgerStateForTests()).toEqual({
+					onceKeys: 0,
+					tallies: 0,
+					retainedEntries: 0,
+				});
+				expect(getDegradationSummary()).toEqual([]);
+				// 10,000 sequential real pipeline runs: ~0.7 s on Linux, past Vitest's
+				// 5 s default on the Windows runner where every run pays native
+				// path-canonicalization syscalls (#4019). The population is the claim, so
+				// the budget grows rather than the population shrinking.
+				//
+				// #4518: the fixed 60 s budget was still a coin flip there -- measured
+				// 36.8 s on a green master run and past 60 s on two red ones
+				// (jobs 117494029210 green, 117489510490 and 117436379966 red), which
+				// is what kept the lane red before it could gate. The lane's own scale
+				// is the margin (180 s on Windows, unchanged on POSIX) rather than a
+				// second magic constant.
+			},
+			scaledTestTimeout(60_000),
+		);
 
 		it("surfaces formatter failures instead of plain clean output", async () => {
 			const filePath = createTempFile(
@@ -962,7 +1015,9 @@ describe("Pipeline", () => {
 			const originalFormatFile = formatService.formatFile.bind(formatService);
 			const deps = createMockDeps({ getFormatService: () => formatService });
 			formatService.formatFile = async (fp: string) => {
-				const result = await originalFormatFile(fp);
+				const result = await originalFormatFile(fp, {
+					sessionRoot: path.dirname(fp),
+				});
 				if (fp === filePath || path.resolve(fp) === path.resolve(filePath)) {
 					fs.writeFileSync(filePath, "const x = 1;\n");
 					return {
@@ -1092,7 +1147,9 @@ describe("Pipeline", () => {
 			const originalFormatFile = formatService.formatFile.bind(formatService);
 			const deps = createMockDeps({ getFormatService: () => formatService });
 			formatService.formatFile = async (fp: string) => {
-				const result = await originalFormatFile(fp);
+				const result = await originalFormatFile(fp, {
+					sessionRoot: path.dirname(fp),
+				});
 				if (fp === filePath || path.resolve(fp) === path.resolve(filePath)) {
 					fs.writeFileSync(filePath, "const x = 1;\n");
 					return {
@@ -1635,6 +1692,183 @@ describe("Pipeline", () => {
 			expect(result.output).toContain("✓");
 			expect(result.hasBlockers).toBe(false);
 			expect(result.isError).toBe(false);
+		});
+
+		// Recurrence: #4734 review F1 and Greptile "Unchecked edits look checked".
+		// `tool_result` read "found nothing" off `output` being empty, but a clean
+		// run's output is the all-clear line, and an empty output is a format-only
+		// change whose primary may never have answered. #4734 r3: the all-clear
+		// line is not the verdict either; it also ends a run with only warnings,
+		// one no language server answered, and one without authorship holding a
+		// blocker. Each cell below is a row of the round-3 state table.
+		const cleanDispatch = (
+			shape: {
+				unconfirmedStatus?: string;
+				primaryLspChecked?: true;
+				warnings?: Diagnostic[];
+				heldBackBlockers?: Diagnostic[];
+			} = {},
+		) =>
+			({
+				diagnostics: shape.warnings ?? [],
+				blockers: [],
+				warnings: shape.warnings ?? [],
+				baselineWarningCount: 0,
+				fixed: [],
+				resolvedCount: 0,
+				output: "",
+				blockerOutput: "",
+				hasBlockers: false,
+				...(shape.unconfirmedStatus !== undefined && {
+					unconfirmedStatus: shape.unconfirmedStatus,
+				}),
+				...(shape.primaryLspChecked && { primaryLspChecked: true }),
+				...(shape.heldBackBlockers && {
+					heldBackBlockers: shape.heldBackBlockers,
+				}),
+			}) as Awaited<ReturnType<typeof dispatchLintWithResult>>;
+		const answered = { primaryLspChecked: true } as const;
+		const verdictOf = async (
+			filePath: string,
+			dispatched: Awaited<ReturnType<typeof dispatchLintWithResult>>,
+			overrides?: Partial<PipelineContext>,
+		) => {
+			vi.mocked(dispatchLintWithResult).mockResolvedValue(dispatched);
+			const result = await runPipeline(
+				createMockContext(filePath, overrides),
+				createMockDeps(),
+			);
+			return [result.output.split(" · ")[0], result.checkedClean];
+		};
+
+		it("reports a checked clean verdict with the clean line, and none for an unconfirmed one", async () => {
+			const filePath = createTempFile(tmpDir, "app.ts", "const x = 1;");
+			// A file no language covers ends with a bare timing line, no "clean".
+			const unknownPath = createTempFile(tmpDir, "notes.zzz", "x\n");
+
+			expect({
+				// Row 14, the one cell: a language server answered, nothing recorded.
+				clean: await verdictOf(filePath, cleanDispatch(answered)),
+				// Row 7.
+				unconfirmed: (
+					await verdictOf(
+						filePath,
+						cleanDispatch({
+							unconfirmedStatus: "no language server answered (disabled)",
+						}),
+					)
+				).map((v) => (typeof v === "string" ? v.split(" — ")[0] : v)),
+				// Row 9: the dispatcher sets no language-server verdict without a kind.
+				unknown: (await verdictOf(unknownPath, cleanDispatch())).map((v) =>
+					typeof v === "string" ? v.includes("clean") : v,
+				),
+			}).toEqual({
+				clean: ["✓ JavaScript/TypeScript clean", true],
+				unconfirmed: ["⚠ JavaScript/TypeScript unconfirmed", false],
+				unknown: [false, false],
+			});
+		});
+
+		it("reports no checked clean verdict for a run with only a warning behind the clean line", async () => {
+			// Row 6 (verify r2 F1): the dispatcher renders no text for a warning, so
+			// the run ends with the clean line while it recorded a finding.
+			const filePath = createTempFile(tmpDir, "warn.ts", "const x = 1;");
+			const warning: Diagnostic = {
+				id: "lsp-unused",
+				message: "'x' is declared but never read",
+				filePath,
+				line: 1,
+				severity: "warning",
+				semantic: "warning",
+				tool: "lsp",
+			};
+
+			expect(
+				await verdictOf(
+					filePath,
+					cleanDispatch({ ...answered, warnings: [warning] }),
+				),
+			).toEqual(["✓ JavaScript/TypeScript clean", false]);
+		});
+
+		it("reports no checked clean verdict for a clean line no language server answered", async () => {
+			// Rows 8 and 10-13 (verify r2 F4): `--no-lsp`, a CLI primary, a fallback
+			// linter, a deferred or a latched silent server all reach the pipeline
+			// as this shape, no `unconfirmedStatus` and no language-server verdict
+			// (the dispatcher cells in coverage-notice-runner-outcome.test.ts).
+			const filePath = createTempFile(tmpDir, "nolsp.ts", "const x = 1;");
+
+			expect(await verdictOf(filePath, cleanDispatch())).toEqual([
+				"✓ JavaScript/TypeScript clean",
+				false,
+			]);
+		});
+
+		it("reports no checked clean verdict for a run without authorship that keeps a blocker", async () => {
+			// Row 5: without authorship (#3226) a held-back blocker renders no text,
+			// so the run ends with the clean line while the file's record keeps it.
+			const filePath = createTempFile(
+				tmpDir,
+				"held.ts",
+				"const x: number = 'a';",
+			);
+			const blocker: Diagnostic = {
+				id: "lsp-2322",
+				message: "Type 'string' is not assignable to type 'number'.",
+				filePath,
+				line: 1,
+				severity: "error",
+				semantic: "blocking",
+				tool: "lsp",
+			};
+
+			expect(
+				await verdictOf(
+					filePath,
+					cleanDispatch({ ...answered, heldBackBlockers: [blocker] }),
+					{ allowAutonomousWriters: false },
+				),
+			).toEqual(["✓ JavaScript/TypeScript clean", false]);
+		});
+
+		it("reports no checked clean verdict for a format-only change whose primary did not answer", async () => {
+			const filePath = createTempFile(tmpDir, "fmt.ts", "const x=1;\n");
+			vi.mocked(dispatchLintWithResult).mockResolvedValue(
+				cleanDispatch({
+					unconfirmedStatus: "no language server answered (disabled)",
+				}),
+			);
+			const formatFile = vi.fn(async (fp: string) => {
+				fs.writeFileSync(fp, "const x = 1;\n");
+				return {
+					filePath: fp,
+					formatters: [
+						{
+							name: "biome",
+							success: true,
+							changed: true,
+							outcome: "formatted" as const,
+						},
+					],
+					anyChanged: true,
+					allSucceeded: true,
+				};
+			});
+
+			const result = await runPipeline(
+				createMockContext(filePath, {
+					getFlag: (name) => name === "immediate-format",
+				}),
+				createMockDeps({
+					getFormatService: () => ({ recordRead: vi.fn(), formatFile }) as any,
+				}),
+			);
+
+			// The shape the consumer used to read as "found nothing": no output.
+			expect(formatFile).toHaveBeenCalled();
+			expect(result.output).toBe("");
+			expect(result.postAutofixNotice).toBeDefined();
+			expect(result.checkedClean).toBe(false);
 		});
 	});
 

@@ -1,6 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 import { gitExecFileSync } from "./git-fixture-env.mjs";
+import { scratchHomeEnv } from "./scratch-home-env.mjs";
 import { assertFixtureWorkspaceRegistered } from "./lsp-fixture-session-guard.mjs";
 import { safeRm } from "./safe-rm.mjs";
 import {
@@ -8,6 +10,50 @@ import {
 	SCRATCH_DIR_ROOT,
 	sweepScratchDirs,
 } from "./scratch-dir.mjs";
+const importProjectTrust = (repoRoot) =>
+	import(
+		pathToFileURL(path.join(repoRoot, "dist", "clients", "project-trust.js"))
+			.href
+	);
+
+/**
+ * #4514 (folds the three inline copies in smoke-tools.mjs, #4261/#4301). The
+ * one place a script that drives the built LSP service, or any registry
+ * dispatch seam, adopts project trust. These scripts are standalone hosts, not
+ * pi: with trust left at "unknown", `launchLSP` refuses every project-local
+ * candidate (#4248) and every `executesProjectCode` server (#4269), so the
+ * nightly measured `unknown` for ~30 of 54 rows and stayed green. Their copied
+ * fixtures represent a trusted project, so the adoption goes through the same
+ * host accessor seam pi uses (`adoptProjectTrustFromContext`,
+ * clients/project-trust.ts). It adds no pi-lens trust policy and bypasses no
+ * gate. `tests/config/lsp-script-trust-census.test.ts` fails a
+ * `scripts/*.mjs` that imports `dist/clients/lsp/` without calling this.
+ *
+ * `adopt` is the test seam smoke-tools.mjs's `deps` already carries; omitted,
+ * the built module is imported from `repoRoot/dist`. Call it before the first
+ * touch: the latch is process-global, so one call per process is enough.
+ */
+export async function adoptFixtureProjectTrust({ repoRoot, adopt }) {
+	const adoptFn =
+		adopt ?? (await importProjectTrust(repoRoot)).adoptProjectTrustFromContext;
+	adoptFn({ isProjectTrusted: () => true });
+}
+
+/**
+ * #4514 acceptance 2. The reason a row that observed nothing was refused by
+ * trust, or `undefined` when trust is not the cause. A server that never
+ * launched reads exactly like a slow one ("no publish observed", mode
+ * "unknown"); that wording hid the missing adoption for six days. Under
+ * adopted trust this is always `undefined`, so it fires only when an
+ * adoption regresses. Public signal only (`getProjectTrustState`): the
+ * launch gate's per-candidate refusal lives in the frozen clients/lsp.
+ */
+export async function fixtureTrustRefusal(repoRoot) {
+	const { getProjectTrustState } = await importProjectTrust(repoRoot);
+	const state = getProjectTrustState();
+	return state === "trusted" ? undefined : `refused: project trust is ${state}`;
+}
+
 /**
  * #2670 (folds #2658). The one "copy fixture → register session root →
  * optional `.pi-lens/lsp.json` disable + reload → optional `git init` →
@@ -179,7 +225,11 @@ export function withScratchHome(opts = {}) {
 	// itself (#2670 review F2).
 	sweepScratchDirs(SCRATCH_DIR_ROOT, tmpPrefix);
 	const dir = claimScratchDir(SCRATCH_DIR_ROOT, tmpPrefix);
-	process.env.PI_LENS_HOME = dir;
+	const pin = scratchHomeEnv(dir);
+	const priorEnv = Object.fromEntries(
+		Object.keys(pin).map((key) => [key, process.env[key]]),
+	);
+	Object.assign(process.env, pin);
 	const dataDirWasUnset = !process.env.PILENS_DATA_DIR?.trim();
 	if (dataDirWasUnset) process.env.PILENS_DATA_DIR = dir;
 	// #2670 review F3: the redirect otherwise announces itself nowhere — the
@@ -202,7 +252,10 @@ export function withScratchHome(opts = {}) {
 		dir,
 		pinned: true,
 		restore() {
-			delete process.env.PI_LENS_HOME;
+			for (const [key, value] of Object.entries(priorEnv)) {
+				if (value === undefined) delete process.env[key];
+				else process.env[key] = value;
+			}
 			if (dataDirWasUnset) delete process.env.PILENS_DATA_DIR;
 			process.off("exit", announceEnd);
 			announceEnd();

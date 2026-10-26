@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { AstGrepClient } from "../../clients/ast-grep-client.js";
 import { CacheManager } from "../../clients/cache-manager.js";
 import {
@@ -21,7 +21,7 @@ import { handleToolCall } from "../../clients/runtime-tool-call.js";
 import type { TreeSitterClient } from "../../clients/tree-sitter-client.js";
 import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
 import { createTempFile, setupTestEnvironment } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
 
 // handleToolCall calls getLSPService() directly (not via DI, matching the
@@ -30,14 +30,12 @@ import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
 // touchFile that resolves immediately is enough to observe its call args.
 const touchFileMock = vi.fn().mockResolvedValue(undefined);
 const getWarmClientForFileMock = vi.fn().mockResolvedValue(undefined);
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: () =>
-		makeLspServiceDouble({
-			touchFile: touchFileMock,
-			getWarmClientForFile: getWarmClientForFileMock,
-		}),
-	resetLSPService: () => {},
-}));
+beforeEach(async () => {
+	await installLspServiceDouble({
+		touchFile: touchFileMock,
+		getWarmClientForFile: getWarmClientForFileMock,
+	});
+});
 
 vi.mock("../../clients/bootstrap.js", async () => {
 	const { bootstrapSeamMock } = await import("../support/bootstrap-mock.js");
@@ -319,6 +317,8 @@ describe("handleToolCall", () => {
 					provisional: true,
 					source: "native-read:read-call:provisional",
 				}),
+				// #1649: the handler's one pass is the capture; the guard takes none.
+				{ captureLineHashes: false },
 			);
 			expect(recordRead.mock.calls[0]?.[0]).not.toHaveProperty("toolCallId");
 			expect(touchFileMock).toHaveBeenCalled();
@@ -1754,6 +1754,48 @@ describe("#4187 R4-1 — a bytes-less write advances only what its own call name
 					toolCallId: "call-reuse",
 				}),
 			).toBe(true);
+			expect(runtime.readGuard.checkEdit(filePath, [2, 2]).action).toBe(
+				"block",
+			);
+		} finally {
+			bridgeRuntime = undefined;
+			bridgeRoot = "";
+			env.cleanup();
+		}
+	});
+
+	it("spends an observed bridge license after one whole-file write (SpendLicense)", async () => {
+		// #4393 pin for formal/read-guard SpendLicense (== BridgeNoAdvance): a
+		// whole-file record keeps the authorship's whole-file scope, so only the
+		// spent license refuses the second writer's line. Recurrence: a reusable
+		// (call,path) license survived every suite (#4399 review F2).
+		const env = setupTestEnvironment("pi-lens-4393-license-spend-whole-");
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			bridgeRuntime = runtime;
+			bridgeRoot = env.tmpDir;
+			const filePath = createTempFile(env.tmpDir, "whole.ts", LICENSE_FIXTURE);
+			bashAuthor(runtime, filePath, "call-whole-bash");
+			await callTool(runtime, env.tmpDir, {
+				toolName: "ast_grep_replace",
+				toolCallId: "call-whole",
+				input: { apply: true, paths: ["whole.ts"] },
+			});
+			const bridge = getMutationBridge();
+			const record = () =>
+				bridge?.recordMutation({
+					filePath,
+					kind: "write",
+					consumer: "observed-license-spend-whole",
+					provenance: "observed",
+					toolCallId: "call-whole",
+				});
+			toolRewriteLine3(filePath);
+			expect(record()).toBe(true);
+			foreignWriteLine2(filePath);
+			toolRewriteLine3(filePath);
+			expect(record()).toBe(true);
 			expect(runtime.readGuard.checkEdit(filePath, [2, 2]).action).toBe(
 				"block",
 			);

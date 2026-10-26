@@ -27,10 +27,6 @@ import { removeTempDirSync } from "../test-utils.js";
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 const logLatency = vi.fn();
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 // Partial mock, not a whole-module replacement (#1723): `() => ({ logLatency })`
 // replaces the ENTIRE module, so the day `clients/lsp/index.ts` imports one
@@ -72,7 +68,10 @@ function makeFakeClient(root: string, serverId = "typescript") {
 			getRawCapabilityKeys: () => [],
 			serverId,
 			root,
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn(async (filePath: string, ms: number) => {
 				waitCalls.push({ filePath, ms });
 				return undefined;
@@ -85,8 +84,11 @@ function makeFakeClient(root: string, serverId = "typescript") {
 
 describe("LSPService.ensureWarmForSweep (#667)", () => {
 	let tmp: string;
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-warmup-"));
@@ -198,8 +200,11 @@ describe("LSPService.ensureWarmForSweep (#667)", () => {
 
 describe("runWorkspaceDiagnostics sweep-level warm-up behavior (#667)", () => {
 	let tmp: string;
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-warmup-sweep-"));
@@ -327,7 +332,10 @@ function makeControlledClient(
 			getOperationSupport: () => ({}),
 			serverId,
 			root,
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn(async (filePath: string, ms: number) => {
 				const outcome = plan[Math.min(call, plan.length - 1)] ?? "warm";
 				call += 1;
@@ -351,8 +359,11 @@ function makeControlledClient(
 
 describe("LSPService.ensureWarmForSweep warm-up retry/skip (#744)", () => {
 	let tmp: string;
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-warmup-744-"));
@@ -493,8 +504,11 @@ describe("LSPService.ensureWarmForSweep warm-up retry/skip (#744)", () => {
  */
 describe("LSPService.ensureWarmForSweep negative cache (#799)", () => {
 	let tmp: string;
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-warmup-799-"));
@@ -630,8 +644,11 @@ describe("LSPService.ensureWarmForSweep negative cache (#799)", () => {
  */
 describe("ensureWarmForSweep warmupOverride floor scoping (#799)", () => {
 	let tmp: string;
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(
@@ -679,8 +696,11 @@ describe("ensureWarmForSweep warmupOverride floor scoping (#799)", () => {
 describe("LSP warm-up telemetry pairing (#1374)", () => {
 	let tmp: string;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		logLatency.mockReset();
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
@@ -812,8 +832,11 @@ describe("LSP warm-up telemetry pairing (#1374)", () => {
  */
 describe("LSPService.ensureWarmForSweep fallbackFor family (#3939)", () => {
 	let tmp: string;
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-lsp-warmup-3939-"));

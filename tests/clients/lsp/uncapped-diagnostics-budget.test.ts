@@ -24,11 +24,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", async (importOriginal) => ({
-	...(await importOriginal<typeof import("../../../clients/lsp/config.js")>()),
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../../../clients/lsp/client.js")>()),
 	createLSPClient,
@@ -96,6 +91,7 @@ function makeSilentClient(serverId: string, budgets: number[]) {
 		getAllDiagnostics: vi.fn(() => new Map()),
 		getDiagnosticBinding: vi.fn(() => undefined),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {}),
 			change: vi.fn(async () => {}),
 			close: vi.fn(async () => {}),
@@ -151,9 +147,12 @@ async function measure(
 }
 
 describe("#3402 — uncapped lsp_diagnostics wait on a no-publication server", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 	});

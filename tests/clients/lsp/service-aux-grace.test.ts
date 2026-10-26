@@ -31,17 +31,11 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	logLatency,
 }));
 
-// importActual spread: the #2776 test loads the REAL tools/lens-diagnostics.js,
-// whose config.js import surface grows over time — a closed factory breaks on
-// every added export (resolveLspCwdForFile, #2777). The bare spread is also
-// the spelling the #2281 detector recognizes as pass-through, so this mock
-// needs no baseline admission. The overrides below stay explicit.
-vi.mock("../../../clients/lsp/config.js", async (importActual) => ({
-	...(await importActual()),
-	getServersForFileWithConfig,
-	primaryServerId: vi.fn(() => "ts-primary"),
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
+// Server selection is injected through the config module's own setter
+// (`_setServersForFileForTests`), not a module mock: the #2776 test loads the
+// REAL tools/lens-diagnostics.js, whose config.js import surface grows over
+// time, and `primaryServerId` / `resolveLspCwdForFile` derive from the
+// injected list like production (#4709).
 
 vi.mock("../../../clients/lsp/client.js", () => ({
 	createLSPClient,
@@ -188,6 +182,7 @@ function makeClient(
 		// matching real client behaviour (server pushes → client caches → wait resolves).
 		getDiagnostics: vi.fn(() => (waitSettled ? diags : [])),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {}),
 			change: vi.fn(async () => {}),
 			close: vi.fn(async () => {}),
@@ -228,6 +223,7 @@ function makeLateBoundClient(content: string, serverId = "opengrep") {
 			published ? { contentHash: hashDiagnosticContent(content) } : undefined,
 		),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {
 				published = false;
 			}),
@@ -306,6 +302,7 @@ function makeVersionlessLateClient(serverId = "opengrep") {
 		getDiagnostics: vi.fn(() => (published ? [diagnostic] : [])),
 		getDiagnosticBinding: vi.fn(() => undefined),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {
 				published = false;
 			}),
@@ -341,6 +338,7 @@ function makeWedgeableAux(
 	const client = {
 		...makeClient(delayMs, diags, { serverId }),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn((filePath: string) =>
 				filePath === wedgePath
 					? new Promise<void>((resolve) => {
@@ -497,9 +495,12 @@ async function exerciseDemotedCoverageCell({
 }
 
 describe("R8 — aux grace: touchFile with-auxiliary path", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();
@@ -723,7 +724,13 @@ describe("R8 — aux grace: touchFile with-auxiliary path", () => {
 				(entry: { serverId: string }) => entry.serverId === "typos",
 			);
 		expect(demoted).toEqual(
-			expect.objectContaining({ outcome: "demoted", elapsedMs: 0 }),
+			// #4763: the demoted row carries the count too (0: it published nothing
+			// for this touch).
+			expect.objectContaining({
+				outcome: "demoted",
+				elapsedMs: 0,
+				publishedCount: 0,
+			}),
 		);
 		expect(auxiliaryClient.waitForDiagnostics).toHaveBeenCalledTimes(5);
 		expect(drainPendingAuxiliaryCoverage()).toEqual(
@@ -1867,9 +1874,12 @@ describe("R8 — aux grace: touchFile with-auxiliary path", () => {
 });
 
 describe("R8 — aux grace: getDiagnostics with-auxiliary path (#1458 S2 extend)", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();
@@ -1930,6 +1940,12 @@ describe("R8 — aux grace: raceToCompletion per-role unit tests", () => {
 	});
 
 	afterEach(() => {
+		// The "primary-only" case spies on `setTimeout` while fake timers are
+		// installed. Restoring the spy AFTER `useRealTimers` (as the next
+		// describe's `restoreAllMocks` did) put the stale fake `setTimeout` back
+		// on globalThis, and the real-timer #2776 case then never woke (#4709:
+		// red under shuffle seeds 202 and 424 on base too).
+		vi.restoreAllMocks();
 		vi.useRealTimers();
 	});
 
@@ -2104,9 +2120,12 @@ describe("R8 — aux grace: raceToCompletion per-role unit tests", () => {
  * to budget and published an empty set is covered, and its touch stays clean.
  */
 describe("#1470 — cut-off auxiliary honesty", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();
@@ -2579,9 +2598,12 @@ describe("#1470 — cut-off auxiliary honesty", () => {
  * all.
  */
 describe('#1533 — silent auxiliary honesty on clientScope "all"', () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();
@@ -2819,6 +2841,7 @@ describe('#1533 — silent auxiliary honesty on clientScope "all"', () => {
 			const auxClient = {
 				...makeClient(9000, [], { serverId: "opengrep" }),
 				notify: {
+					announceCreated: () => undefined,
 					open: vi.fn(() => new Promise<void>(() => {})),
 					change: vi.fn(async () => {}),
 					close: vi.fn(async () => {}),
@@ -2880,7 +2903,7 @@ describe('#1533 — silent auxiliary honesty on clientScope "all"', () => {
 	// BLAST-RADIUS PINS (#1533 review). The highest-frequency `"all"` caller is the
 	// cascade per-edit neighbour fan-out, which caps the touch at 1000/2000ms and
 	// does NOT exclude opengrep. The concern raised was that newly-`silent` verdicts
-	// there would block `recentlyCleanNeighborCache` seeding via
+	// there would block `recentlyCleanNeighborCache` (deleted since, #4486) seeding via
 	// `isConfirmedTouch`.
 	//
 	// The answer has TWO cases, and stating only the first would be the same
@@ -3060,6 +3083,7 @@ describe('#1533 — silent auxiliary honesty on clientScope "all"', () => {
 			getOperationSupport: () => ({}),
 			getDiagnostics: vi.fn(() => []),
 			notify: {
+				announceCreated: () => undefined,
 				open: vi.fn(async () => {}),
 				change: vi.fn(async () => {}),
 				close: vi.fn(async () => {}),
@@ -3173,9 +3197,12 @@ describe('#1533 — silent auxiliary honesty on clientScope "all"', () => {
  * ordering: the mark it would race has not been written yet.
  */
 describe("R8 — aux grace: ast-grep napi/aux-grace mark ordering (#2324 R2-A)", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();
@@ -3340,9 +3367,12 @@ describe("R8 — aux grace: ast-grep napi/aux-grace mark ordering (#2324 R2-A)",
  * stamp union flips its `publishedThisContent` to true and reds its test.
  */
 describe("#2914 — non-demoted aux rows stay binding-only", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();
@@ -3451,5 +3481,145 @@ describe("#2914 — non-demoted aux rows stay binding-only", () => {
 		expect(result?.unconfirmedServerIds).toBeUndefined();
 		// The pin: the row itself stays binding-only.
 		expect(outcomes?.[0]?.publishedThisContent).toBe(false);
+	});
+});
+
+describe("#4763 — published-diagnostic count on lsp_aux_wait_outcome", () => {
+	beforeEach(async () => {
+		vi.useFakeTimers();
+		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
+		getServersForFileWithConfig.mockReset();
+		createLSPClient.mockReset();
+		logLatency.mockReset();
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+		vi.restoreAllMocks();
+	});
+
+	type CountRow = {
+		serverId: string;
+		outcome: string;
+		publishedCount?: number;
+	};
+	const countRows = (): CountRow[] =>
+		logLatency.mock.calls
+			.map(([entry]) => entry)
+			.filter((entry) => entry.phase === "lsp_aux_wait_outcome")
+			.flatMap((entry) => (entry.metadata?.outcomes ?? []) as CountRow[]);
+
+	/** One `clientScope: "all"` touch over a 100 ms primary and the given opengrep client. */
+	async function touchAll(auxClient: ReturnType<typeof makeClient>) {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		getServersForFileWithConfig.mockReturnValue([
+			makePrimaryServer("ts-primary"),
+			makeAuxServer("opengrep"),
+		]);
+		createLSPClient.mockImplementation(
+			async (options: { serverId?: string }) =>
+				options?.serverId === "opengrep"
+					? auxClient
+					: makeClient(100, [], { serverId: "ts-primary" }),
+		);
+		const touch = service.touchFile(FILE, "count-probe", {
+			clientScope: "all",
+			collectDiagnostics: true,
+			diagnostics: "document",
+		});
+		await vi.advanceTimersByTimeAsync(5000);
+		await touch;
+	}
+
+	it("records how many diagnostics an auxiliary published on the aggregate path", async () => {
+		await touchAll(
+			makeClient(900, [makeDiagnostic("one"), makeDiagnostic("two")], {
+				serverId: "opengrep",
+			}),
+		);
+
+		expect(countRows()).toEqual([
+			expect.objectContaining({
+				serverId: "opengrep",
+				outcome: "answered",
+				publishedCount: 2,
+			}),
+		]);
+	});
+
+	it("records 0 for an auxiliary that answered clean, and 0 for one that never spoke", async () => {
+		// Recurrence: "answered with nothing" and "never answered" are both an
+		// empty result downstream; the row is what tells a field query apart
+		// (`outcome` names which, `publishedCount` how much).
+		await touchAll(
+			makeClient(900, [], { serverId: "opengrep", publishesWhenClean: true }),
+		);
+		await touchAll(makeClient(900, [], { serverId: "opengrep" }));
+
+		expect(countRows()).toEqual([
+			expect.objectContaining({ outcome: "answered", publishedCount: 0 }),
+			expect.objectContaining({ outcome: "silent", publishedCount: 0 }),
+		]);
+	});
+
+	it("does not count a cache entry the auxiliary never published for this touch", async () => {
+		// Recurrence: reading the cache without the publication evidence would
+		// report an earlier revision's findings as this touch's publication. The
+		// double settles without a stamp (it published nothing for this touch)
+		// while its cache still holds two findings.
+		const stale = {
+			...makeClient(900, [], { serverId: "opengrep" }),
+			getDiagnostics: vi.fn(() => [makeDiagnostic("a"), makeDiagnostic("b")]),
+		};
+		await touchAll(stale);
+
+		expect(countRows()).toEqual([
+			expect.objectContaining({ outcome: "silent", publishedCount: 0 }),
+		]);
+	});
+
+	it("records the count on the with-auxiliary grace path too", async () => {
+		const { LSPService } = await import("../../../clients/lsp/index.js");
+		const service = new LSPService();
+		getServersForFileWithConfig.mockReturnValue([
+			makePrimaryServer("ts-primary"),
+			makeAuxServer("opengrep"),
+		]);
+		createLSPClient
+			.mockResolvedValueOnce(
+				makeClient(800, [makeDiagnostic("primary error")], {
+					serverId: "ts-primary",
+				}),
+			)
+			.mockResolvedValueOnce(
+				makeClient(900, [makeDiagnostic("aux finding")], {
+					serverId: "opengrep",
+				}),
+			);
+		await service.getClientsForFile(FILE);
+
+		const touch = service.touchFile(FILE, "grace-count", {
+			clientScope: "with-auxiliary",
+			auxiliaryServerIds: ["opengrep"],
+			collectDiagnostics: true,
+			diagnostics: "document",
+		});
+		await vi.advanceTimersByTimeAsync(2000);
+		await touch;
+
+		const row = logLatency.mock.calls
+			.map(([entry]) => entry)
+			.find((entry) => entry.phase === "lsp_aux_wait_outcome");
+		expect(row?.metadata?.waitShape).toBe("aux_grace");
+		expect(countRows()).toEqual([
+			expect.objectContaining({
+				outcome: "answered",
+				publishedCount: 1,
+			}),
+		]);
 	});
 });

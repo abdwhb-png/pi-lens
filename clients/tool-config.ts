@@ -156,6 +156,16 @@ export const PI_LENS_TOOL_NAMES = TOOL_REGISTRY.flatMap((tool) =>
 	tool.piName === undefined ? [] : [tool.piName],
 ) as readonly string[];
 
+/**
+ * Whether pi-lens registers this tool on pi. Its mixed read/write operations
+ * are never promoted by the third-party learning mechanism (#4139), and it is
+ * never diffed as an opaque call (#4732): each is read-only or records its
+ * writes through the mutation bridge.
+ */
+export function isPiLensToolName(toolName: string): boolean {
+	return PI_LENS_TOOL_NAMES.includes(toolName);
+}
+
 export type ToolRegistryEntry = (typeof TOOL_REGISTRY)[number];
 
 export type LensToolHost = "pi" | "mcp";
@@ -211,6 +221,27 @@ export function translateGuidanceToolNames(
 ): string {
 	if (host === "pi") return content;
 	let text = content;
+	// #4682 (maintainer decision 2026-10-24, #2535 F3): the situational bullet
+	// names only MCP-callable tools. A pi-only row (no mcpName) is dropped from
+	// its list, and the bullet goes when none of its names survives. Derived
+	// from the registry's mcpName field, never a hand list.
+	const piOnly: string[] = [];
+	for (const entry of TOOL_REGISTRY) {
+		if (typeof entry.piName === "string" && typeof entry.mcpName !== "string") {
+			piOnly.push(entry.piName);
+		}
+	}
+	text = text.replace(
+		/\n?• Situational \(([^)]*)\): ([^.]*)\.( Use [^\n]*)?/,
+		(_match, clause: string, list: string, hint: string | undefined) => {
+			const kept: string[] = [];
+			for (const name of list.split(", ")) {
+				if (!piOnly.includes(name)) kept.push(name);
+			}
+			if (kept.length === 0) return "";
+			return `\n• Situational (${clause}): ${kept.join(", ")}.${hint ?? ""}`;
+		},
+	);
 	const byLength = [...TOOL_REGISTRY].sort(
 		(a, b) => (b.piName?.length ?? 0) - (a.piName?.length ?? 0),
 	);
@@ -223,7 +254,11 @@ export function translateGuidanceToolNames(
 			entry.mcpName,
 		);
 	}
-	return text.replace("activate via pi_lens_activate_tools", "call directly");
+	// #4682 (PR #4730 F1): the longer qualified clause first, so MCP never
+	// renders a condition it cannot satisfy ("if unlisted" with every tool listed).
+	return text
+		.replace("activate via pi_lens_activate_tools if unlisted", "call directly")
+		.replace("activate via pi_lens_activate_tools", "call directly");
 }
 
 export function toolRegistryEntryForPi(

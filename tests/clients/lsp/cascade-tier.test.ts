@@ -18,23 +18,12 @@ const registerQuietWindowTask = vi.fn();
 // different spy than the code under test called.
 const logCascade = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-}));
-
 vi.mock("../../../clients/quiet-window.js", () => ({
 	registerQuietWindowTask,
 }));
 
 vi.mock("../../../clients/cascade-logger.js", () => ({
 	logCascade,
-}));
-
-vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
-	...(await importActual<
-		typeof import("../../../clients/latency-logger.js")
-	>()),
-	logLatency: vi.fn(),
 }));
 
 const FILE = "C:/repo/neighbor.ts";
@@ -67,6 +56,9 @@ describe("classifyCascadeWaitTier", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		registerQuietWindowTask.mockReset();
 		mod = await import("../../../clients/lsp/cascade-tier.js");
@@ -88,10 +80,15 @@ describe("classifyCascadeWaitTier", () => {
 		expect(tier).toBe("tier3-silent");
 	});
 
-	it("keeps TypeScript's empty-first hold and silent-clean cascade markers together", () => {
+	it("keeps TypeScript's silent-clean cascade tier while its first publish is measured direct (#4615)", () => {
+		// The two axes are independent: `first-publish=direct` in
+		// docs/lsp-capability-matrix.md is the dirty-file measurement, so no hold
+		// marker exists, and `silentOnClean` still makes the cascade skip its
+		// in-lane wait (tier 3). Losing either half is a cascade regression.
 		getServersForFileWithConfig.mockReturnValue([server("typescript")]);
 		const strategy = getStrategy("typescript", "classic");
-		expect(strategy.emptyFirstPublish).toBe("indexing");
+		expect(strategy.emptyFirstPublish).toBeUndefined();
+		expect(strategy.silentOnClean).toBe(true);
 		expect(
 			mod.classifyServerWaitTier("typescript", {
 				serverId: "typescript",
@@ -110,6 +107,36 @@ describe("classifyCascadeWaitTier", () => {
 	// Classic is confirmed silentOnClean (re-measured 2026-07-12, unaffected by
 	// the native-ts7 drift below) — the classifier's `launchVariant` branch
 	// keeps the classic/unmarked path exactly as before, pinned unchanged.
+	// Recurrence (#4485): classic tsserver neighbours were deferred to the
+	// quiet window (77% of real outcomes), which mostly never came, while the
+	// #707 sync confirm that answers them in ~320 ms sat unused in the
+	// in-lane touch.
+	it("classifies a silent classic typescript server that advertises typescript.tsserverRequest as command-pull", () => {
+		getServersForFileWithConfig.mockReturnValue([server("typescript")]);
+		const snapshot = (advertisedCommands: string[]) => [
+			{
+				serverId: "typescript",
+				root: "C:/repo",
+				operationSupport: {} as any,
+				workspaceDiagnosticsSupport: { mode: "push-only" as const },
+				launchVariant: "classic",
+				advertisedCommands,
+				rawCapabilityKeys: [],
+			},
+		];
+		expect(
+			mod.classifyCascadeWaitTier(
+				{} as any,
+				FILE,
+				snapshot(["typescript.tsserverRequest"]) as any,
+			),
+		).toBe("command-pull");
+		// Without the command there is nothing to pull with: still silent.
+		expect(
+			mod.classifyCascadeWaitTier({} as any, FILE, snapshot([]) as any),
+		).toBe("tier3-silent");
+	});
+
 	it("classifies a classic-variant typescript snapshot with silentOnClean as tier3-silent (pinned, unchanged)", () => {
 		getServersForFileWithConfig.mockReturnValue([server("typescript")]);
 		const snapshots = [
@@ -310,6 +337,9 @@ describe("outstanding touch registry + reconcile", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		registerQuietWindowTask.mockReset();
 		mod = await import("../../../clients/lsp/cascade-tier.js");
@@ -593,6 +623,9 @@ describe("registerCascadeTierReconcileTask", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		registerQuietWindowTask.mockReset();
 		mod = await import("../../../clients/lsp/cascade-tier.js");
@@ -807,6 +840,9 @@ describe("isTierAwareCascadeEnabled kill switch", () => {
 
 	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		delete process.env.PI_LENS_TIER_AWARE_CASCADE;
 		mod = await import("../../../clients/lsp/cascade-tier.js");
 		mod._resetTierAwareCascadeEnabledForTests();

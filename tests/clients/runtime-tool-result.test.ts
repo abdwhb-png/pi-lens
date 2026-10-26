@@ -1,16 +1,23 @@
 // lane: windows-vitest — #3294's case-spelling cell asserts the host
 // filesystem's own answer; no external toolchain is required because the
 // production handleToolResult path and pipeline boundary are in-process.
+import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CacheManager } from "../../clients/cache-manager.js";
+import { evaluateGitGuard } from "../../clients/git-guard.js";
+import {
+	AgentBehaviorClient,
+	type BehaviorWarning,
+} from "../../clients/agent-behavior-client.js";
 import {
 	_resetAgentNudgeForTests,
 	consumeAgentNudge,
 } from "../../clients/agent-nudge.js";
+import { PI_LENS_SYNTHETIC_MUTATION_FIELD } from "../../clients/mutating-tool.js";
 import { readChangesSince } from "../../clients/project-changes.js";
 import {
 	MAX_PENDING_CASCADE_RUNS,
@@ -21,6 +28,7 @@ import {
 	registerPrimarySession,
 	releasePrimarySession,
 } from "../../clients/session-lifecycle.js";
+import { resetSessionScopedState } from "../../clients/runtime-session.js";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
@@ -40,7 +48,20 @@ import {
 	getProjectDataDir,
 	getProjectIgnoreMatcher,
 } from "../../clients/file-utils.js";
-import { normalizeFilePath } from "../../clients/path-utils.js";
+import {
+	normalizeFilePath,
+	normalizeMapKey,
+	resolveHostToolPath,
+} from "../../clients/path-utils.js";
+import { pinFixtureHome } from "./test-utils.js";
+import {
+	captureFileStats,
+	getOpaqueBaselineStore,
+	opaqueBaselineSlot,
+} from "../../clients/opaque-mutation-scan.js";
+import { getLSPService } from "../../clients/lsp/capabilities.js";
+import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { runPipeline } from "../../clients/pipeline.js";
 import { resolveAnalysisRoot } from "../../clients/analysis-root.js";
 import {
 	getVerifiedPathAttributionGuessCount,
@@ -57,6 +78,10 @@ import {
 	createReadToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
+import {
+	installLspService,
+	installLspServiceDouble,
+} from "../support/lsp-service-seam.js";
 
 const readFileSyncSpy = vi.hoisted(() => vi.fn());
 vi.mock("node:fs", async (importOriginal) => {
@@ -93,17 +118,14 @@ vi.mock("../../clients/pipeline.js", () => ({
 }));
 
 const notifyExternalFileChange = vi.hoisted(() => vi.fn(async () => undefined));
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	notifyExternalFileChange,
-}));
-
 const readdirMock = vi.mocked(fsp.readdir);
 const realReaddir = readdirMock.getMockImplementation()!;
 
-beforeEach(() => {
+beforeEach(async () => {
+	// `notifyExternalFileChange` is the spy above: the double answers it for the
+	// production export. The install is not eager, so `peekLSPService()` stays
+	// undefined until a case builds a service (#4504 r1 builds one below).
+	await installLspServiceDouble({ notifyExternalFileChange });
 	requestBootstrapClients.mockClear();
 	readdirMock.mockImplementation(realReaddir);
 	readdirMock.mockClear();
@@ -113,10 +135,19 @@ beforeEach(() => {
 it("notices once when an edit is outside the session root (#4218)", async () => {
 	resetDegradationLedger();
 	const env = setupTestEnvironment("pi-lens-4218-outside-root-");
+	// #4560: the sibling must stay a DIRECT child of the tmp root — a
+	// `pi-lens-`-prefixed fixture under it would be classified as pi-owned
+	// scratch (`isPiOwnedTempPath`) and never notify. It is removed here, so
+	// the widened tmp-root census never sees a leftover.
+	const captureRoot = path.join(
+		env.tmpDir,
+		"..",
+		`capture-4218-${process.pid}`,
+	);
 	try {
 		const runtime = new RuntimeCoordinator();
 		runtime.projectRoot = env.tmpDir;
-		const outsidePath = path.join(env.tmpDir, "..", "capture", "outside.ts");
+		const outsidePath = path.join(captureRoot, "outside.ts");
 		fs.mkdirSync(path.dirname(outsidePath), { recursive: true });
 		fs.writeFileSync(outsidePath, "export const value = 1;\n");
 
@@ -152,6 +183,7 @@ it("notices once when an edit is outside the session root (#4218)", async () => 
 		expect(consumeAgentNudge(undefined, runtime.sessionScope)).toBeUndefined();
 	} finally {
 		env.cleanup();
+		fs.rmSync(captureRoot, { recursive: true, force: true });
 	}
 });
 
@@ -192,6 +224,307 @@ it("keeps intended vendor skips silent (#4218)", async () => {
 	}
 });
 
+/**
+ * A checkout with one linked worktree, written as git writes it: `<repo>/.git`
+ * is a directory (the shared commondir), `<worktree>/.git` is a file holding
+ * `gitdir: <repo>/.git/worktrees/<name>`, that gitdir's `commondir` points
+ * back at the shared `.git`, and each gitdir holds a `HEAD`. `resolveGitCheckout`/`resolveLinkedWorktreeOwner`
+ * read exactly these files, so no `git` child is needed to classify the file.
+ */
+function writeLinkedWorktree(root: string): { repo: string; worktree: string } {
+	const repo = path.join(root, "repo");
+	const worktree = path.join(root, "repo-wt");
+	const gitDir = path.join(repo, ".git");
+	const linkedGitDir = path.join(gitDir, "worktrees", "repo-wt");
+	fs.mkdirSync(linkedGitDir, { recursive: true });
+	fs.mkdirSync(worktree, { recursive: true });
+	fs.writeFileSync(path.join(repo, "package.json"), "{}\n");
+	fs.writeFileSync(path.join(worktree, ".git"), `gitdir: ${linkedGitDir}\n`);
+	fs.writeFileSync(path.join(linkedGitDir, "commondir"), "../..\n");
+	// git writes a HEAD in both gitdirs, and a `.git` directory without one is
+	// not a repository to `resolveGitCheckout` (#4508).
+	fs.writeFileSync(path.join(gitDir, "HEAD"), "ref: refs/heads/main\n");
+	fs.writeFileSync(path.join(linkedGitDir, "HEAD"), "ref: refs/heads/wt\n");
+	return { repo, worktree };
+}
+
+/**
+ * What `runPipeline` returns for a linked-worktree edit, by verdict: the
+ * shapes `tests/clients/pipeline.test.ts` pins on the real pipeline (its
+ * "All-clear output" cells). A clean run's output is the all-clear line,
+ * never empty (#4734 review F1), and that line is not the verdict (r3).
+ */
+const linkedWorktreeResult = {
+	clean: () => ({
+		output: "✓ JavaScript/TypeScript clean · 5ms",
+		hasBlockers: false,
+		isError: false,
+		fileModified: false,
+		checkedClean: true,
+	}),
+	/**
+	 * The same clean line with no clean verdict: a run that recorded only a
+	 * warning (the dispatcher renders no text for one), or one no language
+	 * server answered (#4734 r3 state table, rows 5, 6, 8, 10-13).
+	 */
+	uncheckedCleanLine: () => ({
+		output: "✓ JavaScript/TypeScript clean · 5ms",
+		hasBlockers: false,
+		isError: false,
+		fileModified: false,
+		checkedClean: false,
+	}),
+	/** A format-only change whose primary did not answer: no output at all. */
+	formatOnlyUnconfirmed: (targetPath: string) => ({
+		output: "",
+		hasBlockers: false,
+		isError: false,
+		fileModified: true,
+		checkedClean: false,
+		postAutofixNotice: { targetPath, changedFiles: [targetPath] },
+	}),
+};
+
+/**
+ * One linked worktree of a session checkout at `checkoutRoot`, its session
+ * coordinator, and an edit `tool_result` for one file in the worktree.
+ */
+function linkedWorktreeEdit(checkoutRoot: string) {
+	const { repo, worktree } = writeLinkedWorktree(checkoutRoot);
+	const worktreeFile = path.join(worktree, "src", "sibling.ts");
+	fs.mkdirSync(path.dirname(worktreeFile), { recursive: true });
+	fs.writeFileSync(worktreeFile, "export const value = 1;\n");
+	const runtime = new RuntimeCoordinator();
+	runtime.projectRoot = repo;
+	const editResult = () =>
+		({
+			event: {
+				toolName: "edit",
+				input: { path: worktreeFile },
+				content: [{ type: "text", text: "ok" }],
+			},
+			getFlag: () => false,
+			dbg: () => {},
+			runtime,
+			cacheManager: new CacheManager(false),
+			resetLSPService: () => {},
+			readGuard: runtime.readGuard,
+			agentBehaviorRecord: () => [],
+			formatBehaviorWarnings: () => "",
+			// The pipeline is doubled, so these three only satisfy
+			// `ensureToolResultClients` (`deps.biomeClient && deps.ruffClient &&
+			// deps.metricsClient`): the dispatch itself must be REACHED for the
+			// delivery rung to be the thing under test, and a failed bootstrap
+			// demand would skip it.
+			biomeClient: {},
+			ruffClient: {},
+			metricsClient: {},
+		}) as never;
+	return { repo, worktree, worktreeFile, runtime, editResult };
+}
+
+it("announces a linked-worktree edit the pipeline found nothing in (#2050 AC3)", async () => {
+	resetDegradationLedger();
+	const env = setupTestEnvironment("pi-lens-2050-worktree-delivery-");
+	// A linked worktree of the session's checkout, written as the metadata git
+	// itself writes (`<worktree>/.git` names a worktree-private gitdir whose
+	// `commondir` points at the shared `.git`), so no child process is needed.
+	// The class assertion below reds if the fixture stops resolving as a
+	// worktree. The checkout is a DIRECT child of the temp root with no
+	// `pi-lens-` prefix: a pi-owned temp path is the intended-skip class, not
+	// the linked-worktree class this rung is about (#4560). Removed here, so the
+	// widened tmp-root census never sees a leftover.
+	const checkoutRoot = path.join(
+		env.tmpDir,
+		"..",
+		`capture-2050-worktree-${process.pid}`,
+	);
+	const { repo, worktree, worktreeFile, runtime, editResult } =
+		linkedWorktreeEdit(checkoutRoot);
+	try {
+		expect(resolveAnalysisRoot(worktreeFile, repo)).toBe("linked-worktree");
+		vi.mocked(runPipeline).mockResolvedValue(linkedWorktreeResult.clean());
+		const runsBefore = vi.mocked(runPipeline).mock.calls.length;
+
+		await handleToolResult(editResult());
+
+		// One bounded row names the root the session analysed, so "the analysis
+		// ran on a worktree foreign to the session" is not only in latency.log.
+		const worktreeRows = getDegradationSummary().filter(
+			(entry) => entry.kind === "tool-result-linked-worktree",
+		);
+		expect(worktreeRows).toHaveLength(1);
+		expect(worktreeRows[0]?.latestReasons[0]?.subject).toContain(
+			path.basename(worktree),
+		);
+		// The advisory is gated by its own once-per-root row, and that record is
+		// what a reader can count: one clean run, one row.
+		expect(
+			getDegradationSummary()
+				.filter((entry) => entry.kind === "tool-result-linked-worktree-clean")
+				.map((entry) => entry.count),
+		).toEqual([1]);
+		// The run produced nothing, so silence would be ambiguous: the agent is
+		// told the analysis RAN and found nothing.
+		expect(
+			consumeAgentNudge(undefined, runtime.sessionScope)?.messages,
+		).toEqual([
+			expect.objectContaining({
+				content: expect.stringContaining(path.basename(worktree)),
+			}),
+		]);
+		expect(consumeAgentNudge(undefined, runtime.sessionScope)).toBeUndefined();
+
+		// Bounded: a second silent run in the same worktree is covered by the
+		// first row and advisory, not by a second pair. Each later edit writes
+		// new bytes: an unchanged file never reaches the pipeline, so the run
+		// below would observe nothing (the pipeline-call count proves it ran).
+		fs.writeFileSync(worktreeFile, "export const value = 2;\n");
+		await handleToolResult(editResult());
+		expect(vi.mocked(runPipeline).mock.calls).toHaveLength(runsBefore + 2);
+		expect(
+			getDegradationSummary().filter(
+				(entry) => entry.kind === "tool-result-linked-worktree",
+			),
+		).toHaveLength(1);
+		expect(consumeAgentNudge(undefined, runtime.sessionScope)).toBeUndefined();
+
+		// The same clean line from a run that recorded a warning, or that no
+		// language server answered, states nothing: the line is not the verdict.
+		resetDegradationLedger();
+		vi.mocked(runPipeline).mockResolvedValue(
+			linkedWorktreeResult.uncheckedCleanLine(),
+		);
+		fs.writeFileSync(worktreeFile, "export const value = 3;\n");
+		await handleToolResult(editResult());
+		expect(vi.mocked(runPipeline).mock.calls).toHaveLength(runsBefore + 3);
+		expect(consumeAgentNudge(undefined, runtime.sessionScope)).toBeUndefined();
+	} finally {
+		vi.mocked(runPipeline).mockReset();
+		env.cleanup();
+		fs.rmSync(checkoutRoot, { recursive: true, force: true });
+	}
+});
+
+// Recurrence: #4734 Greptile "Unchecked edits look checked". An empty output
+// is a format-only change, and here the primary never answered: telling the
+// agent the analysis ran and found nothing would read an unavailable check as
+// a clean one (AGENTS.md shape 10).
+it("states nothing for a linked-worktree format-only change whose primary did not answer", async () => {
+	resetDegradationLedger();
+	const env = setupTestEnvironment("pi-lens-2657-worktree-unconfirmed-");
+	const checkoutRoot = path.join(
+		env.tmpDir,
+		"..",
+		`capture-2657-unconfirmed-${process.pid}`,
+	);
+	const { repo, worktreeFile, runtime, editResult } =
+		linkedWorktreeEdit(checkoutRoot);
+	try {
+		expect(resolveAnalysisRoot(worktreeFile, repo)).toBe("linked-worktree");
+		vi.mocked(runPipeline).mockResolvedValue(
+			linkedWorktreeResult.formatOnlyUnconfirmed("src/sibling.ts"),
+		);
+		const runsBefore = vi.mocked(runPipeline).mock.calls.length;
+
+		await handleToolResult(editResult());
+
+		expect(vi.mocked(runPipeline).mock.calls).toHaveLength(runsBefore + 1);
+		expect(
+			getDegradationSummary()
+				.filter((entry) => entry.kind.startsWith("tool-result-linked-worktree"))
+				.map((entry) => entry.kind),
+		).toEqual(["tool-result-linked-worktree"]);
+		expect(
+			(
+				consumeAgentNudge(undefined, runtime.sessionScope)?.messages ?? []
+			).filter((message) => String(message.content).includes("found nothing")),
+		).toEqual([]);
+	} finally {
+		vi.mocked(runPipeline).mockReset();
+		env.cleanup();
+		fs.rmSync(checkoutRoot, { recursive: true, force: true });
+	}
+});
+
+// Recurrence: #4734 Sourcery thread 3. The row's root came from the
+// out-of-session eligibility rule, which refuses a pi-owned temp path, so a
+// worktree the class served in full was analysed in silence.
+it("records the linked-worktree row for a worktree under a pi-owned temp dir", async () => {
+	resetDegradationLedger();
+	const env = setupTestEnvironment("pi-lens-2657-pi-owned-worktree-");
+	// A `pi-` prefix directly under the temp root is pi-owned
+	// (`isPiOwnedTempPath`); removed here, as in the AC3 cell.
+	const checkoutRoot = path.join(
+		env.tmpDir,
+		"..",
+		`pi-2657-worktree-${process.pid}`,
+	);
+	const { repo, worktree, worktreeFile, editResult } =
+		linkedWorktreeEdit(checkoutRoot);
+	try {
+		expect(resolveAnalysisRoot(worktreeFile, repo)).toBe("linked-worktree");
+		vi.mocked(runPipeline).mockResolvedValue(linkedWorktreeResult.clean());
+
+		await handleToolResult(editResult());
+
+		expect(
+			getDegradationSummary()
+				.filter((entry) => entry.kind === "tool-result-linked-worktree")
+				.map((entry) => path.basename(entry.latestReasons[0]?.subject ?? "")),
+		).toEqual([path.basename(worktree)]);
+	} finally {
+		vi.mocked(runPipeline).mockReset();
+		env.cleanup();
+		fs.rmSync(checkoutRoot, { recursive: true, force: true });
+	}
+});
+
+// Recurrence: #4734 Sourcery thread 4. The row was written after the pipeline
+// await without the #3596 liveness check, so a replaced session's handler
+// latched its once-key in the new session's ledger.
+it("a linked-worktree result settling after a replacement records nothing in the new session", async () => {
+	resetDegradationLedger();
+	const env = setupTestEnvironment("pi-lens-2657-worktree-replaced-");
+	const checkoutRoot = path.join(
+		env.tmpDir,
+		"..",
+		`capture-2657-replaced-${process.pid}`,
+	);
+	const { repo, worktreeFile, runtime, editResult } =
+		linkedWorktreeEdit(checkoutRoot);
+	const entered = gatedPromise<void>();
+	const release = gatedPromise<void>();
+	try {
+		expect(resolveAnalysisRoot(worktreeFile, repo)).toBe("linked-worktree");
+		vi.mocked(runPipeline).mockImplementation(async () => {
+			entered.resolve();
+			await release.promise;
+			return linkedWorktreeResult.clean();
+		});
+
+		const handler = handleToolResult(editResult());
+		await entered.promise;
+		// session_start: the coordinator and the ledger reset for session 2.
+		runtime.resetForSession();
+		resetDegradationLedger();
+		release.resolve();
+		await handler;
+
+		expect(vi.mocked(runPipeline).mock.calls.length).toBeGreaterThan(0);
+		expect(
+			getDegradationSummary()
+				.filter((entry) => entry.kind.startsWith("tool-result-linked-worktree"))
+				.map((entry) => entry.kind),
+		).toEqual([]);
+		expect(consumeAgentNudge(undefined, runtime.sessionScope)).toBeUndefined();
+	} finally {
+		vi.mocked(runPipeline).mockReset();
+		env.cleanup();
+		fs.rmSync(checkoutRoot, { recursive: true, force: true });
+	}
+});
+
 it("classifies outside-root path families through the real tool-result seam (#4230)", async () => {
 	resetDegradationLedger();
 	const env = setupTestEnvironment("pi-lens-4230-path-families-");
@@ -217,6 +550,7 @@ it("classifies outside-root path families through the real tool-result seam (#42
 		hasBlockers: false,
 		isError: false,
 		fileModified: false,
+		checkedClean: false,
 	});
 	process.env.PILENS_DATA_DIR = dataDir;
 	try {
@@ -339,7 +673,7 @@ it("classifies outside-root path families through the real tool-result seam (#42
 	}
 });
 
-it("adopts a home sibling but refuses home, ancestors, and a home symlink (#4230 D1)", () => {
+it("adopts a home sibling but refuses home, ancestors, and a home symlink (#4230 D1)", (ctx) => {
 	const env = setupTestEnvironment("pi-lens-4230-home-boundary-");
 	const previousHome = process.env.HOME;
 	const previousUserProfile = process.env.USERPROFILE;
@@ -348,7 +682,16 @@ it("adopts a home sibling but refuses home, ancestors, and a home symlink (#4230
 	// os.homedir() reads USERPROFILE rather than HOME. Keep this fake home
 	// outside the OS temp tree and pin both environment spellings so the D1
 	// boundary is testing home ownership, not the temp-root refusal (#4230).
-	const home = fs.mkdtempSync(path.join(process.cwd(), ".analysis-root-home-"));
+	// Shape 73: it must also sit outside the session's own checkout. In a
+	// git-worktree lane `process.cwd()` IS that checkout's root, so the parent
+	// of a fixture there resolves a linked worktree of the same repository and
+	// the ancestor case below would read `linked-worktree` instead of `none`.
+	// A direct child of the OS temp root has a parent that is no checkout.
+	const home = path.join(
+		path.dirname(env.tmpDir),
+		`capture-4230-home-${process.pid}`,
+	);
+	fs.mkdirSync(home, { recursive: true });
 	const sessionRoot = path.join(home, "code", "a");
 	const siblingRoot = path.join(home, "code", "b");
 	const homeLink = path.join(env.tmpDir, "home-link");
@@ -362,13 +705,12 @@ it("adopts a home sibling but refuses home, ancestors, and a home symlink (#4230
 	process.env.TMPDIR = isolatedTmpDir;
 	try {
 		fs.symlinkSync(home, homeLink, "dir");
-	} catch {
-		expect(true).toBe(true);
+	} catch (error) {
 		if (previousTmpDir === undefined) delete process.env.TMPDIR;
 		else process.env.TMPDIR = previousTmpDir;
 		fs.rmSync(home, { recursive: true, force: true });
 		env.cleanup();
-		return;
+		ctx.skip(`symlinks are unavailable here: ${String(error)}`);
 	}
 	process.env.HOME = home;
 	process.env.USERPROFILE = home;
@@ -456,6 +798,7 @@ describe("bash grep searchReads registration", () => {
 					hasBlockers: false,
 					isError: false,
 					fileModified: false,
+					checkedClean: false,
 				});
 				const filePath = path.join(env.tmpDir, "changed.ts");
 				fs.writeFileSync(filePath, "export const before = true;\n");
@@ -629,6 +972,7 @@ describe("bash grep searchReads registration", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: false,
+				checkedClean: false,
 			});
 			expect(await handleToolResult(base)).toEqual(
 				expect.objectContaining({
@@ -642,6 +986,7 @@ describe("bash grep searchReads registration", () => {
 				hasBlockers: false,
 				isError: true,
 				fileModified: false,
+				checkedClean: false,
 			});
 			expect(await handleToolResult(base)).toEqual(
 				expect.objectContaining({
@@ -1287,6 +1632,8 @@ describe("bash grep searchReads registration", () => {
 						effectiveLimit: 1,
 						toolCallId: "codemode-1",
 					}),
+					// #1649: hashed from the file's one pass, not re-captured.
+					{ captureLineHashes: false },
 				);
 			} finally {
 				env.cleanup();
@@ -1530,6 +1877,7 @@ describe("bash grep searchReads registration", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: false,
+				checkedClean: false,
 			});
 			const filePath = path.join(env.tmpDir, "unknown.ts");
 			fs.writeFileSync(filePath, "const a = 1;\n", "utf8");
@@ -1643,6 +1991,7 @@ describe("bash grep searchReads registration", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 		const env = setupTestEnvironment("pi-lens-1603-tool-result-");
 		try {
@@ -1688,6 +2037,7 @@ describe("bash grep searchReads registration", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 		const env = setupTestEnvironment("pi-lens-1603-rewrite-");
 		try {
@@ -1749,6 +2099,7 @@ describe("bash grep searchReads registration", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 		const env = setupTestEnvironment("pi-lens-1603-removal-");
 		try {
@@ -1815,6 +2166,7 @@ describe("bash grep searchReads registration", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: false,
+				checkedClean: false,
 				changedFiles: [configPath],
 			});
 			await handleToolResult({
@@ -1839,6 +2191,7 @@ describe("bash grep searchReads registration", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 		const env = setupTestEnvironment("pi-lens-2071-tool-result-");
 		try {
@@ -2013,6 +2366,7 @@ describe("bash grep searchReads registration", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 		const env = setupTestEnvironment("pi-lens-native-edit-hash-");
 		try {
@@ -2131,6 +2485,8 @@ describe("bash grep searchReads registration", () => {
 						reason: "match-lines-only",
 					},
 				}),
+				// #1649: hashed from the file's one pass, not re-captured.
+				{ captureLineHashes: false },
 			);
 		} finally {
 			env.cleanup();
@@ -2180,6 +2536,8 @@ describe("bash grep searchReads registration", () => {
 						reason: "delivered-context-flags",
 					},
 				}),
+				// #1649: hashed from the file's one pass, not re-captured.
+				{ captureLineHashes: false },
 			);
 		} finally {
 			env.cleanup();
@@ -2383,6 +2741,7 @@ describe("monorepo turn-state cwd alignment", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 
 		const env = setupTestEnvironment("pi-lens-monorepo-cwd-");
@@ -2468,6 +2827,7 @@ describe("monorepo turn-state cwd alignment", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 
 		const env = setupTestEnvironment("pi-lens-monorepo-dispatch-");
@@ -2540,6 +2900,7 @@ describe("monorepo turn-state cwd alignment", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 		const env = setupTestEnvironment("pi-lens-3512-dispatch-generation-");
 		try {
@@ -2628,6 +2989,7 @@ describe("monorepo turn-state cwd alignment", () => {
 					hasBlockers: false,
 					isError: false,
 					fileModified: false,
+					checkedClean: false,
 					cascadePromise: Promise.resolve(sessionOneRun),
 				};
 			});
@@ -2729,6 +3091,7 @@ describe("monorepo turn-state cwd alignment", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 			cascadePromise: Promise.resolve(sessionOneRun),
 		}));
 		const entered = gatedPromise<void>();
@@ -2809,6 +3172,7 @@ describe("monorepo turn-state cwd alignment", () => {
 					hasBlockers: false,
 					isError: false,
 					fileModified: false,
+					checkedClean: false,
 				};
 			});
 			const existingPath = createTempFile(
@@ -2975,6 +3339,7 @@ describe("runtime-tool-result writers across a replacement (#3596)", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 		const entered = gatedPromise<void>();
 		const release = gatedPromise<void>();
@@ -3087,6 +3452,7 @@ describe("runtime-tool-result writers across a replacement (#3596)", () => {
 				hasBlockers: false,
 				isError: true,
 				fileModified: false,
+				checkedClean: false,
 			};
 		});
 		await acrossReplacement(
@@ -3109,6 +3475,566 @@ describe("runtime-tool-result writers across a replacement (#3596)", () => {
 			},
 		);
 	});
+	it("drops another session's git-guard section only for a write that reached a whole-file clean verdict (#4733 r1 F2)", async () => {
+		// RECURRENCE GUARDED: #4733 r1 F2 (Greptile "Unanswered checks clear
+		// blockers"). Every live write under `--lens-guard` called
+		// `syncGitGuardRecord` with no verdict, so a write whose runners reached
+		// none (timed out, unanswered, a coverage gap) dropped another
+		// session's section for the file, and the last one cleared the record.
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		await acrossReplacement(
+			"4733-verdict",
+			async ({ tmpDir, filePath, runtime, cacheManager }) => {
+				runtime.setTelemetryIdentity({ sessionId: "session-A" });
+				const section = `${filePath}: 🔴 STOP — 1 issue(s) must be fixed:\n  L1: Debugger statement`;
+				const seed = () =>
+					cacheManager.writeCache(
+						"turn-end-findings",
+						{
+							content: section,
+							blockerContent: section,
+							blockingFiles: [filePath],
+							hasBlockers: true,
+							affectedFiles: [filePath],
+							sessionId: "an-earlier-session",
+							projectSeqStart: 0,
+							projectSeqEnd: 0,
+							fileSeqByPath: {},
+							fileContentHashes: {},
+							consumed: true,
+						},
+						tmpDir,
+					);
+				const stored = () =>
+					cacheManager.readCache<{ blockerContent?: string }>(
+						"turn-end-findings",
+						tmpDir,
+						Number.POSITIVE_INFINITY,
+					)?.data;
+				const clean = {
+					output: "",
+					hasBlockers: false,
+					isError: false,
+					fileModified: false,
+					currentBlockerCount: 0,
+				};
+				const verdicts: Array<[string, Record<string, unknown>]> = [
+					["no verdict field", clean],
+					[
+						"observation still holds a blocker",
+						{ ...clean, fileVerdictComplete: true, currentBlockerCount: 1 },
+					],
+					[
+						"pipeline error",
+						{ ...clean, isError: true, fileVerdictComplete: true },
+					],
+					["whole-file clean verdict", { ...clean, fileVerdictComplete: true }],
+				];
+				const kept: Array<[string, boolean]> = [];
+				for (const [label, result] of verdicts) {
+					seed();
+					vi.mocked(runPipeline).mockReset();
+					vi.mocked(runPipeline).mockResolvedValue(result as never);
+					runtime.beginTurn();
+					// index.ts' turn_start clears the already-analysed latch.
+					clearLastAnalyzedStateCache();
+					await handleToolResult(
+						toolResultDeps({
+							filePath,
+							runtime,
+							cacheManager,
+							flags: ["lens-guard"],
+						}),
+					);
+					kept.push([label, stored()?.blockerContent === section]);
+				}
+				expect(kept).toEqual([
+					["no verdict field", true],
+					["observation still holds a blocker", true],
+					["pipeline error", true],
+					["whole-file clean verdict", false],
+				]);
+			},
+		);
+	});
+
+	it("keeps this session's own git-guard section after a write that reached no whole-file verdict (#4733 r2 F11)", async () => {
+		// RECURRENCE GUARDED: #4733 r2 F11. The section trim asked for a whole-file
+		// verdict only of another session's record, so a write of a file that
+		// reached none dropped this session's own section, and the next clean
+		// write of another file deleted the record and the commit ran. A run with
+		// no verdict observes nothing (AGENTS.md shape 10), on either session axis.
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		await acrossReplacement(
+			"4733-own-verdict",
+			async ({ tmpDir, filePath, runtime, cacheManager }) => {
+				runtime.setTelemetryIdentity({ sessionId: "session-A" });
+				const other = createTempFile(
+					tmpDir,
+					"other.ts",
+					"export const y = 1;\n",
+				);
+				fs.utimesSync(other, LONG_AGO, LONG_AGO);
+				const section = (file: string) =>
+					`${file}: 🔴 STOP — 1 issue(s) must be fixed:\n  L1: Debugger statement`;
+				const blockerContent = `${section(filePath)}\n\n${section(other)}`;
+				cacheManager.writeCache(
+					"turn-end-findings",
+					{
+						content: blockerContent,
+						blockerContent,
+						blockingFiles: [filePath, other],
+						hasBlockers: true,
+						affectedFiles: [filePath, other],
+						sessionId: "session-A",
+						projectSeqStart: 0,
+						projectSeqEnd: 0,
+						fileSeqByPath: {},
+						fileContentHashes: {},
+						consumed: true,
+					},
+					tmpDir,
+				);
+				const stored = () =>
+					cacheManager.readCache<{ blockerContent?: string }>(
+						"turn-end-findings",
+						tmpDir,
+						Number.POSITIVE_INFINITY,
+					)?.data;
+				const clean = {
+					output: "",
+					hasBlockers: false,
+					isError: false,
+					fileModified: false,
+					currentBlockerCount: 0,
+				};
+				const write = async (file: string, result: Record<string, unknown>) => {
+					vi.mocked(runPipeline).mockReset();
+					vi.mocked(runPipeline).mockResolvedValue(result as never);
+					runtime.beginTurn();
+					clearLastAnalyzedStateCache();
+					await handleToolResult(
+						toolResultDeps({
+							filePath: file,
+							runtime,
+							cacheManager,
+							flags: ["lens-guard"],
+						}),
+					);
+				};
+
+				await write(filePath, clean);
+				expect(stored()?.blockerContent).toContain(section(filePath));
+
+				await write(other, { ...clean, fileVerdictComplete: true });
+				expect(stored()?.blockerContent).toBe(section(filePath));
+				expect(evaluateGitGuard(runtime, cacheManager, tmpDir).block).toBe(
+					true,
+				);
+			},
+		);
+	});
+
+	it("keeps another session's section when a superseded write reaches a whole-file clean verdict (#4733 r6 F22)", async () => {
+		// RECURRENCE GUARDED: #4733 r6 F22. `wholeFileClean` reads only a verdict
+		// that applied. An older write of a file that settles after a newer one
+		// has its clear refused by the write order (#3507); without that conjunct
+		// its whole-file clean result dropped another session's section anyway.
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		await acrossReplacement(
+			"4733-superseded-verdict",
+			async ({ tmpDir, filePath, runtime, cacheManager }) => {
+				runtime.setTelemetryIdentity({ sessionId: "session-A" });
+				const other = createTempFile(
+					tmpDir,
+					"other.ts",
+					"export const y = 1;\n",
+				);
+				fs.utimesSync(other, LONG_AGO, LONG_AGO);
+				const section = (file: string) =>
+					`${file}: 🔴 STOP — 1 issue(s) must be fixed:\n  L1: Debugger statement`;
+				const blockerContent = `${section(filePath)}\n\n${section(other)}`;
+				cacheManager.writeCache(
+					"turn-end-findings",
+					{
+						content: blockerContent,
+						blockerContent,
+						blockingFiles: [filePath, other],
+						hasBlockers: true,
+						affectedFiles: [filePath, other],
+						sessionId: "an-earlier-session",
+						projectSeqStart: 0,
+						projectSeqEnd: 0,
+						fileSeqByPath: {},
+						fileContentHashes: {},
+						consumed: true,
+					},
+					tmpDir,
+				);
+				const stored = () =>
+					cacheManager.readCache<{ blockerContent?: string }>(
+						"turn-end-findings",
+						tmpDir,
+						Number.POSITIVE_INFINITY,
+					)?.data;
+				runtime.beginTurn();
+				// One order turn for both writes, so only their write index orders them.
+				const orderTurn = runtime.writeOrderTurn;
+				const write = async (result: Record<string, unknown>) => {
+					vi.mocked(runPipeline).mockReset();
+					vi.mocked(runPipeline).mockResolvedValue({
+						output: "",
+						hasBlockers: false,
+						isError: false,
+						fileModified: false,
+						currentBlockerCount: 0,
+						orderTurn,
+						...result,
+					} as never);
+					clearLastAnalyzedStateCache();
+					await handleToolResult(
+						toolResultDeps({
+							filePath,
+							runtime,
+							cacheManager,
+							flags: ["lens-guard"],
+						}),
+					);
+				};
+
+				// The newer write settles first, with no whole-file verdict.
+				await write({ writeIndex: 900 });
+				expect(stored()?.blockerContent).toContain(section(filePath));
+				// The older write settles after it, with a whole-file clean verdict.
+				await write({ writeIndex: 100, fileVerdictComplete: true });
+				expect(stored()?.blockerContent ?? "").toContain(section(filePath));
+				expect(stored()?.blockerContent).toContain(section(other));
+			},
+		);
+	});
+
+	it.each([
+		["this session's own record", "session-A", {}, false, false],
+		["another session's record", "an-earlier-session", {}, false, true],
+		// An errored run cleared the entry but observed nothing: the next
+		// no-verdict write would otherwise find no entry and the section gone.
+		[
+			"this session's own record, errored run",
+			"session-A",
+			{ isError: true },
+			false,
+			true,
+		],
+		// #4733 r5 F20: the clear is refused (the observation still holds a
+		// blocker it rendered no summary for), so it retired nothing and the
+		// section stays. The entry is policy-suppressed, so it does not rewrite
+		// the record itself and the write's file argument alone decides.
+		[
+			"this session's own record, refused clear",
+			"session-A",
+			{ currentBlockerCount: 1 },
+			true,
+			true,
+		],
+	] as const)(
+		"%s: a file's section leaves only when the write retired that file's own blocker, without a whole-file verdict (#4733 r3 F15)",
+		async (_label, owner, fix, suppress, kept) => {
+			// RECURRENCE GUARDED: #4733 r3 F15 (#4509 row 31b). The write that
+			// fixed a file's blocker while a language server was cut off reached no
+			// whole-file verdict, so the caller passed no file and the record kept a
+			// section its own observation had retired: every commit stayed refused.
+			// The own section leaves with the inline-blocker entry this write retired
+			// (the rule the sibling callers use); another session's section still
+			// waits for a whole-file clean verdict.
+			const { runPipeline } = await import("../../clients/pipeline.js");
+			await acrossReplacement(
+				`4733-f15-${owner}`,
+				async ({ tmpDir, filePath, runtime, cacheManager }) => {
+					runtime.setTelemetryIdentity({ sessionId: "session-A" });
+					const other = createTempFile(
+						tmpDir,
+						"other.ts",
+						"export const y = 1;\n",
+					);
+					fs.utimesSync(other, LONG_AGO, LONG_AGO);
+					const summary =
+						"🔴 STOP — 1 issue(s) must be fixed:\n  L1: eval() is banned";
+					const otherSection = `${other}: 🔴 STOP — 1 issue(s) must be fixed:\n  L1: Debugger statement`;
+					const stored = () =>
+						cacheManager.readCache<{
+							blockerContent?: string;
+							sessionId?: string;
+						}>("turn-end-findings", tmpDir, Number.POSITIVE_INFINITY)?.data;
+					const write = async (
+						file: string,
+						result: Record<string, unknown>,
+					) => {
+						vi.mocked(runPipeline).mockReset();
+						vi.mocked(runPipeline).mockResolvedValue(result as never);
+						runtime.beginTurn();
+						clearLastAnalyzedStateCache();
+						await handleToolResult(
+							toolResultDeps({
+								filePath: file,
+								runtime,
+								cacheManager,
+								flags: ["lens-guard"],
+							}),
+						);
+					};
+
+					await write(filePath, {
+						output: summary,
+						hasBlockers: true,
+						isError: false,
+						fileModified: false,
+						currentBlockerCount: 1,
+						inlineBlockerSummary: summary,
+						inlineBlockerSources: ["ast-grep-napi"],
+						inlineBlockerLines: [1],
+					});
+					expect(stored()?.blockerContent).toContain(`${filePath}:`);
+					// The record as its owner left it: this session's, or another
+					// session's that wrote over it since (its section for the file is
+					// that session's evidence, not the entry this session retires).
+					const fileSection = `${filePath}: ${summary}`;
+					const blockerContent = `${fileSection}\n\n${otherSection}`;
+					cacheManager.writeCache(
+						"turn-end-findings",
+						{
+							content: blockerContent,
+							blockerContent,
+							blockingFiles: [filePath, other],
+							hasBlockers: true,
+							affectedFiles: [filePath, other],
+							sessionId: owner,
+							projectSeqStart: 0,
+							projectSeqEnd: 0,
+							fileSeqByPath: {},
+							fileContentHashes: {},
+							consumed: true,
+						},
+						tmpDir,
+					);
+
+					if (suppress) runtime.applyInlineBlockerPolicyVerdicts([filePath]);
+					// The fix: no blocker left, but no whole-file verdict either (a
+					// server went unconfirmed), so `fileVerdictComplete` is absent.
+					await write(filePath, {
+						output: "",
+						hasBlockers: false,
+						isError: false,
+						fileModified: false,
+						currentBlockerCount: 0,
+						...fix,
+					});
+					expect(
+						stored()?.blockerContent?.includes(`${filePath}:`) ?? false,
+					).toBe(kept);
+					expect(stored()?.blockerContent).toContain(otherSection);
+				},
+			);
+		},
+	);
+
+	it.each([
+		["crashed", "pipeline_crash"],
+		["errored", "pipeline_error"],
+	] as const)(
+		"keeps a %s dispatch's latch through other files' clean writes until that file's own dispatch returns (#4733 r2 F12)",
+		async (failure, reason) => {
+			// RECURRENCE GUARDED: #4733 r2 F12 (Greptile "Unrelated writes erase
+			// failed checks"). The latch held one reason and no file, and every record
+			// write or delete cleared it, so after one file's pipeline crashed a clean
+			// write of another file let the commit run with the crashed file never
+			// re-checked.
+			const { runPipeline } = await import("../../clients/pipeline.js");
+			await acrossReplacement(
+				`4733-${failure}-latch`,
+				async ({ tmpDir, filePath, runtime, cacheManager }) => {
+					runtime.setTelemetryIdentity({ sessionId: "session-A" });
+					const crashed = createTempFile(
+						tmpDir,
+						"crashed.ts",
+						"export const z = 1;\n",
+					);
+					fs.utimesSync(crashed, LONG_AGO, LONG_AGO);
+					const clean = {
+						output: "",
+						hasBlockers: false,
+						isError: false,
+						fileModified: false,
+						currentBlockerCount: 0,
+						fileVerdictComplete: true,
+					};
+					const write = async (file: string, outcome: "fail" | "clean") => {
+						vi.mocked(runPipeline).mockReset();
+						if (outcome === "fail" && failure === "crashed")
+							vi.mocked(runPipeline).mockRejectedValue(
+								new Error("runner exploded"),
+							);
+						else if (outcome === "fail")
+							vi.mocked(runPipeline).mockResolvedValue({
+								output: "pipeline error",
+								hasBlockers: false,
+								isError: true,
+								fileModified: false,
+							} as never);
+						else vi.mocked(runPipeline).mockResolvedValue(clean as never);
+						runtime.beginTurn();
+						clearLastAnalyzedStateCache();
+						await handleToolResult(
+							toolResultDeps({
+								filePath: file,
+								runtime,
+								cacheManager,
+								flags: ["lens-guard"],
+							}),
+						);
+					};
+					const gate = () => evaluateGitGuard(runtime, cacheManager, tmpDir);
+					// Another session's record whose only section is the clean file, so its
+					// clean write deletes the record (the delete site the latch must survive).
+					const section = `${filePath}: 🔴 STOP — 1 issue(s) must be fixed:\n  L1: Debugger statement`;
+					cacheManager.writeCache(
+						"turn-end-findings",
+						{
+							content: section,
+							blockerContent: section,
+							blockingFiles: [filePath],
+							hasBlockers: true,
+							affectedFiles: [filePath],
+							sessionId: "an-earlier-session",
+							projectSeqStart: 0,
+							projectSeqEnd: 0,
+							fileSeqByPath: {},
+							fileContentHashes: {},
+							consumed: true,
+						},
+						tmpDir,
+					);
+
+					await write(crashed, "fail");
+					// The gate names one cause at a time: the record's own refusal
+					// (another session's section) may come first.
+					expect(gate().block).toBe(true);
+
+					await write(filePath, "clean");
+					expect(
+						cacheManager.readCache(
+							"turn-end-findings",
+							tmpDir,
+							Number.POSITIVE_INFINITY,
+						)?.data,
+					).toBeUndefined();
+					const refusal = gate();
+					expect(refusal.block).toBe(true);
+					expect(refusal.reason).toContain(reason);
+					expect(refusal.reason).toContain("crashed.ts");
+
+					await write(crashed, "clean");
+					expect(gate()).toEqual({ block: false });
+				},
+			);
+		},
+	);
+
+	it.each([
+		["crash", true],
+		["errored run", false],
+	] as const)(
+		"drops a replaced session's late pipeline %s instead of latching the live session (#4733 r5 G2)",
+		async (outcome, rejects) => {
+			// RECURRENCE GUARDED: #4733 r5 G2 (AGENTS.md shape 22). The crash latch
+			// was written in the catch after `await pipelinePromise` without the
+			// captured session generation, so session 1's late rejection latched
+			// session 2's gate for a file session 2 never dispatched. The errored-run
+			// mark, now on the same shared path (r5 G1), takes the same fence.
+			const { runPipeline } = await import("../../clients/pipeline.js");
+			const entered = gatedPromise<void>();
+			const release = gatedPromise<void>();
+			vi.mocked(runPipeline).mockReset();
+			vi.mocked(runPipeline).mockImplementationOnce(async () => {
+				entered.resolve();
+				await release.promise;
+				if (rejects) throw new Error("runner exploded");
+				return {
+					output: "",
+					hasBlockers: false,
+					isError: true,
+					fileModified: false,
+				} as never;
+			});
+			await acrossReplacement(
+				`4733-late-${outcome.replace(" ", "-")}`,
+				async ({ tmpDir, filePath, runtime, cacheManager }) => {
+					const handler = handleToolResult(
+						toolResultDeps({
+							filePath,
+							runtime,
+							cacheManager,
+							flags: ["lens-guard"],
+						}),
+					);
+					await entered.promise;
+					runtime.resetForSession();
+					runtime.beginTurn();
+					release.resolve();
+					await handler;
+					expect(runtime.gitGuardUnansweredDispatches).toEqual([]);
+					expect(evaluateGitGuard(runtime, cacheManager, tmpDir).block).toBe(
+						false,
+					);
+				},
+			);
+		},
+	);
+
+	it("a replaced session's late clean verdict leaves the live session's commit gate as it was (#4737 r2)", async () => {
+		// RECURRENCE GUARDED: #4737 r2. The verdict publisher both callers share
+		// re-derives the gate's status and rewrites the record. Run for a dead
+		// handler, its no-blocker sync cleared the live session's unknown-state
+		// latch, and the next commit ran on state no one had re-checked.
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const entered = gatedPromise<void>();
+		const release = gatedPromise<void>();
+		vi.mocked(runPipeline).mockReset();
+		vi.mocked(runPipeline).mockImplementationOnce(async () => {
+			entered.resolve();
+			await release.promise;
+			return {
+				output: "",
+				hasBlockers: false,
+				isError: false,
+				fileModified: false,
+				currentBlockerCount: 0,
+				fileVerdictComplete: true,
+			} as never;
+		});
+		await acrossReplacement(
+			"4737-late-clean",
+			async ({ tmpDir, filePath, runtime, cacheManager }) => {
+				const handler = handleToolResult(
+					toolResultDeps({
+						filePath,
+						runtime,
+						cacheManager,
+						flags: ["lens-guard"],
+					}),
+				);
+				await entered.promise;
+				runtime.resetForSession();
+				runtime.beginTurn();
+				runtime.markGitGuardCacheUnknown("cache_corrupt");
+				release.resolve();
+				await handler;
+				expect(evaluateGitGuard(runtime, cacheManager, tmpDir).block).toBe(
+					true,
+				);
+			},
+		);
+	});
+
 	it("a session-1 pipeline finishing in session 2's turn does not mark session 2's bytes analysed (#3763)", async () => {
 		// #3763 item 2: the already-analysed latch is keyed by the LIVE turn
 		// index, so a dead pipeline that settled after session 2's turn_start
@@ -3132,6 +4058,7 @@ describe("runtime-tool-result writers across a replacement (#3596)", () => {
 						hasBlockers: false,
 						isError: false,
 						fileModified: false,
+						checkedClean: false,
 					};
 				});
 				const handler = handleToolResult(
@@ -3177,6 +4104,7 @@ describe("runtime-tool-result writers across a replacement (#3596)", () => {
 						hasBlockers: false,
 						isError: false,
 						fileModified: false,
+						checkedClean: false,
 					};
 				});
 				const handler = handleToolResult({
@@ -3222,6 +4150,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 
 		const env = setupTestEnvironment("pi-lens-runtime-tool-change-log-");
@@ -3286,6 +4215,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 
 		const env = setupTestEnvironment("pi-lens-runtime-tool-deferred-format-");
@@ -3384,6 +4314,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: true,
+				checkedClean: false,
 				changedFiles: [filePath],
 				postMutation: {
 					filePath,
@@ -3438,6 +4369,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: true,
+				checkedClean: false,
 				// A side-effect file changed, but the target write has no owned hash.
 				changedFiles: [path.join(env.tmpDir, "helper.rs")],
 			});
@@ -3472,6 +4404,189 @@ describe("runtime-tool-result inline behavior warnings", () => {
 		}
 	});
 
+	// A bash result fans out into per-file write results. Counting those replays
+	// used to evict the real bash call from the five-call BLIND WRITE window.
+	it.each([1, 11])(
+		"counts one bash call across %i per-file diagnostic results",
+		async (fileCount) => {
+			const env = setupTestEnvironment("pi-lens-bash-behavior-count-");
+			try {
+				vi.mocked(runPipeline).mockImplementation(async (ctx) => ({
+					output: `diagnostics for ${path.basename(ctx.filePath)}`,
+					hasBlockers: false,
+					isError: false,
+					fileModified: false,
+					checkedClean: false,
+				}));
+				const paths = Array.from({ length: fileCount }, (_, index) =>
+					createTempFile(env.tmpDir, `bash-${index}.ts`, "export {};\n"),
+				);
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				const behavior = new AgentBehaviorClient();
+				const base: Omit<Parameters<typeof handleToolResult>[0], "event"> = {
+					getFlag: () => false,
+					dbg: () => {},
+					runtime,
+					cacheManager: new CacheManager(false),
+					resetLSPService: () => {},
+					agentBehaviorRecord: (name, filePath) =>
+						behavior.recordToolCall(name, filePath),
+					formatBehaviorWarnings: (warnings) =>
+						behavior.formatWarnings(warnings as BehaviorWarning[]),
+				};
+				const returned = await handleToolResult({
+					...base,
+					event: {
+						toolName: "bash",
+						input: {
+							command: paths
+								.map((file) => `echo x > "${toPosix(file)}"`)
+								.join("; "),
+						},
+						content: [{ type: "text", text: "bash ok" }],
+					},
+				});
+				const text = returned?.content.map((part) => part.text).join("\n");
+				expect(text).not.toContain("BLIND WRITE");
+				expect(text).not.toContain("THRASHING");
+				for (const filePath of paths) {
+					expect(text).toContain(`diagnostics for ${path.basename(filePath)}`);
+					expect(runtime.getFileSeq(filePath)).toBe(1);
+				}
+				expect(
+					readChangesSince(env.tmpDir, 0).map((change) => change.filePath),
+				).toEqual(paths);
+
+				// The real bash must still provide knowledge for later real calls.
+				// Dropping it as well would warn on the third edit of a new file.
+				for (let index = 0; index < 3; index++) {
+					const filePath = createTempFile(
+						env.tmpDir,
+						`edit-${index}.ts`,
+						"export {};\n",
+					);
+					const edited = await handleToolResult({
+						...base,
+						event: { toolName: "edit", input: { path: filePath }, content: [] },
+					});
+					expect(
+						edited?.content.map((part) => part.text).join("\n"),
+					).not.toContain("BLIND WRITE");
+				}
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
+
+	// The replay guard must not silence warnings from separate host calls.
+	it.each(["write", "edit"])(
+		"keeps BLIND WRITE and THRASHING warnings for real %s calls",
+		async (toolName) => {
+			const env = setupTestEnvironment("pi-lens-native-behavior-count-");
+			try {
+				vi.mocked(runPipeline).mockResolvedValue({
+					output: "diagnostics complete",
+					hasBlockers: false,
+					isError: false,
+					fileModified: false,
+					checkedClean: false,
+				});
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				const behavior = new AgentBehaviorClient();
+				const base: Omit<Parameters<typeof handleToolResult>[0], "event"> = {
+					getFlag: () => false,
+					dbg: () => {},
+					runtime,
+					cacheManager: new CacheManager(false),
+					resetLSPService: () => {},
+					agentBehaviorRecord: (name, filePath) =>
+						behavior.recordToolCall(name, filePath),
+					formatBehaviorWarnings: (warnings) =>
+						behavior.formatWarnings(warnings as BehaviorWarning[]),
+				};
+				for (let index = 0; index < 6; index++) {
+					const filePath = createTempFile(
+						env.tmpDir,
+						index < 3 ? `storm-${index}.ts` : "thrash.ts",
+						`export const value = ${index};\n`,
+					);
+					const returned = await handleToolResult({
+						...base,
+						event: { toolName, input: { path: filePath }, content: [] },
+					});
+					const text = returned?.content.map((part) => part.text).join("\n");
+					if (index === 2) expect(text).toContain("BLIND WRITE");
+					if (index === 5) expect(text).toContain("THRASHING");
+				}
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
+
+	// #4623: the guard asks `mutating-tool.ts` which results are bash replays, and
+	// only the exact marker keeps a result out of the behavior history. A
+	// look-alike marker is still the host call it is: all three writes below
+	// are recorded, so the third one warns BLIND WRITE.
+	it.each<[string, unknown, boolean]>([
+		["the exact bash value", "bash", false],
+		["another case", "BASH", true],
+		["another replay source", "opaque-script", true],
+		["a boolean", true, true],
+	])(
+		"counts a write result carrying %s as a host call only when it is not the bash marker",
+		async (_label, marker, isRecorded) => {
+			const env = setupTestEnvironment("pi-lens-replay-marker-behavior-");
+			try {
+				vi.mocked(runPipeline).mockResolvedValue({
+					output: "diagnostics complete",
+					hasBlockers: false,
+					isError: false,
+					fileModified: false,
+					checkedClean: false,
+				});
+				const runtime = new RuntimeCoordinator();
+				runtime.projectRoot = env.tmpDir;
+				const behavior = new AgentBehaviorClient();
+				let text: string | undefined;
+				for (let index = 0; index < 3; index++) {
+					const filePath = createTempFile(
+						env.tmpDir,
+						`marked-${index}.ts`,
+						"export {};\n",
+					);
+					const returned = await handleToolResult({
+						getFlag: () => false,
+						dbg: () => {},
+						runtime,
+						cacheManager: new CacheManager(false),
+						resetLSPService: () => {},
+						agentBehaviorRecord: (name, recordedPath) =>
+							behavior.recordToolCall(name, recordedPath),
+						formatBehaviorWarnings: (warnings) =>
+							behavior.formatWarnings(warnings as BehaviorWarning[]),
+						event: {
+							toolName: "write",
+							input: { path: filePath },
+							content: [],
+							[PI_LENS_SYNTHETIC_MUTATION_FIELD]: marker,
+						},
+					});
+					text = returned?.content.map((part) => part.text).join("\n");
+				}
+				// The diagnostics still render for every marker: only the history differs.
+				expect(text).toContain("diagnostics complete");
+				if (isRecorded) expect(text).toContain("BLIND WRITE");
+				else expect(text).not.toContain("BLIND WRITE");
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
+
 	it("runs bash synthetic writes immediately and returns authoritative content", async () => {
 		const { runPipeline } = await import("../../clients/pipeline.js");
 		const env = setupTestEnvironment("pi-lens-runtime-tool-bash-write-");
@@ -3486,6 +4601,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: true,
+				checkedClean: false,
 				changedFiles: [filePath],
 				postMutation:
 					ctx.autofixMode === "immediate"
@@ -3535,6 +4651,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: false,
+				checkedClean: false,
 			}));
 			const existingPath = createTempFile(
 				env.tmpDir,
@@ -3613,6 +4730,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 			// refresh names none and keeps it, handing over the bytes it hashed.
 			expect(recordWritten).toHaveBeenCalledWith(directPath, {
 				authorship: "unknown",
+				advanceAuthorship: false,
 				stampFileTime: false,
 				toolCallId: "3226-opaque",
 			});
@@ -3660,6 +4778,95 @@ describe("runtime-tool-result inline behavior warnings", () => {
 		}
 	});
 
+	// #4387: an UNKNOWN credit now advances a whole-file authorship when its
+	// writer checked the path. The opaque recovery's bytes had no such check,
+	// so this credit sends advanceAuthorship: false and still ends the
+	// authorship. Recurrence: without it, a script the parser cannot see would
+	// re-baseline bytes the conversation never wrote.
+	it("ends an existing authorship when a bash write comes with opaque recovery (#4387)", async () => {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const env = setupTestEnvironment("pi-lens-4387-opaque-authored-");
+		try {
+			vi.mocked(runPipeline).mockImplementation(async () => ({
+				output: "",
+				hasBlockers: false,
+				isError: false,
+				fileModified: false,
+				checkedClean: false,
+			}));
+			const existingPath = createTempFile(
+				env.tmpDir,
+				"extracted/existing.js",
+				"(function(){ return 1; })();\n",
+			);
+			const directPath = createTempFile(
+				env.tmpDir,
+				"direct.js",
+				"const direct = 1;\n",
+			);
+			const command = `echo direct > "${directPath}"; node opaque-extractor.js`;
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			// An earlier own write authored the file whole.
+			runtime.readGuard.recordWritten(directPath, {
+				authorship: "whole-file",
+				toolCallId: "4387-earlier-write",
+			});
+			expect(runtime.readGuard.exportAuthorship().written).toEqual([
+				normalizeFilePath(directPath),
+			]);
+			await runHandlerExpectingNoThrow(() =>
+				handleToolCall({
+					event: {
+						toolName: "bash",
+						toolCallId: "4387-opaque",
+						input: { command },
+					},
+					ctx: { cwd: env.tmpDir },
+					lensEnabled: true,
+					getFlag: () => false,
+					dbg: () => {},
+					runtime,
+					cacheManager: new CacheManager(false),
+					ensureLSPConfigInitialized: async () => {},
+					updateLspStatus: () => {},
+					resetLSPService: () => {},
+				} as any),
+			);
+			fs.writeFileSync(existingPath, "(function(){ return 2; })();\n");
+			fs.writeFileSync(directPath, "const direct = 2;\n");
+			await handleToolResult({
+				event: {
+					toolName: "bash",
+					toolCallId: "4387-opaque",
+					input: { command },
+					content: [{ type: "text", text: "extracted" }],
+				},
+				getFlag: () => false,
+				dbg: () => {},
+				runtime,
+				cacheManager: new CacheManager(false),
+				resetLSPService: () => {},
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+				readGuard: runtime.readGuard,
+			} as any);
+
+			expect(
+				readChangesSince(env.tmpDir, 0).some(
+					(change) =>
+						change.source === "opaque-script" &&
+						change.filePath === existingPath,
+				),
+			).toBe(true);
+			const verdict = runtime.readGuard.checkEdit(directPath, [1, 1]);
+			expect(verdict.action).toBe("block");
+			expect(verdict.reason).toContain("File modified since your write");
+		} finally {
+			env.cleanup();
+		}
+	});
+
 	it("shares one authoritative-content budget across a multi-file bash write", async () => {
 		const { runPipeline } = await import("../../clients/pipeline.js");
 		const env = setupTestEnvironment("pi-lens-runtime-tool-bash-budget-");
@@ -3676,6 +4883,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: true,
+				checkedClean: false,
 				changedFiles: [ctx.filePath],
 				postMutation: {
 					filePath: ctx.filePath,
@@ -3731,6 +4939,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: false,
+				checkedClean: false,
 			});
 			const runtime = new RuntimeCoordinator();
 			runtime.projectRoot = env.tmpDir;
@@ -3812,6 +5021,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 					hasBlockers: false,
 					isError: false,
 					fileModified: false,
+					checkedClean: false,
 				};
 			});
 			await handleToolResult({
@@ -3843,6 +5053,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: false,
+				checkedClean: false,
 			});
 			const runtime = new RuntimeCoordinator();
 			runtime.projectRoot = env.tmpDir;
@@ -3882,6 +5093,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 					hasBlockers: false,
 					isError: false,
 					fileModified: true,
+					checkedClean: false,
 					changedFiles: [boundaryPath],
 					postMutation: {
 						filePath: boundaryPath,
@@ -3894,6 +5106,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 					hasBlockers: false,
 					isError: false,
 					fileModified: true,
+					checkedClean: false,
 					changedFiles: [filePath],
 					postMutation: { filePath, content, source: "autofix" },
 				});
@@ -3968,6 +5181,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 		const formatEventsPublish =
 			await import("../../clients/format-events-publish.js");
@@ -4068,6 +5282,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 			hasBlockers: true,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 
 		const env = setupTestEnvironment("pi-lens-runtime-tool-");
@@ -4142,6 +5357,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 
 		const env = setupTestEnvironment("pi-lens-runtime-tool-");
@@ -4216,6 +5432,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 
 		const env = setupTestEnvironment("pi-lens-runtime-tool-");
@@ -4309,6 +5526,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 
 		const env = setupTestEnvironment("pi-lens-runtime-tool-dedupe-");
@@ -4392,6 +5610,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: true,
+				checkedClean: false,
 				changedFiles: [filePath, sideEffectPath],
 			});
 
@@ -4471,6 +5690,12 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: true,
+				checkedClean: false,
+				// runPipeline reports the target's post-write hash whenever its own
+				// write touched the target (pipeline.ts, #2499).
+				postWriteStateHash: createHash("sha256")
+					.update(fs.readFileSync(filePath))
+					.digest("hex"),
 				changedFiles: [filePath, siblingPath],
 			});
 			const runtime = new RuntimeCoordinator();
@@ -4526,6 +5751,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: true,
+				checkedClean: false,
 				// A cwd-relative workspace-edit spelling must be resolved against
 				// the workspace passed to applyWorkspaceEdit, not process.cwd().
 				changedFiles: ["src/main.rs"],
@@ -4611,6 +5837,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				hasBlockers: false,
 				isError: false,
 				fileModified: true,
+				checkedClean: false,
 				changedFiles: [caseVariantPath],
 			});
 
@@ -4813,6 +6040,7 @@ describe("runtime-tool-result inline behavior warnings", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 
 		const env = setupTestEnvironment("pi-lens-runtime-tool-path-");
@@ -4891,6 +6119,7 @@ describe("#484 turn-summary collection gate", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: true,
+			checkedClean: false,
 			diagnostics: [
 				{
 					id: "d1",
@@ -4951,6 +6180,7 @@ describe("#484 turn-summary collection gate", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: true,
+			checkedClean: false,
 			diagnostics: [
 				{
 					id: "d1",
@@ -5045,6 +6275,7 @@ describe("#3246 inline blocker provenance", () => {
 				hasBlockers: true,
 				isError: false,
 				fileModified: false,
+				checkedClean: false,
 				inlineBlockerSummary:
 					"🔴 STOP — 1 issue(s) must be fixed:\n  L1: eval() is banned",
 				inlineBlockerSources: ["ast-grep"],
@@ -5094,6 +6325,7 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 			hasBlockers: false,
 			isError: false,
 			fileModified: false,
+			checkedClean: false,
 		});
 		logLatency.mockClear();
 	});
@@ -5725,6 +6957,393 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 			} else {
 				process.env.PILENS_DATA_DIR = previousDataDir;
 			}
+			env.cleanup();
+		}
+	});
+});
+
+/**
+ * #4576: `~` on a host-supplied tool path. The tool_call seam
+ * (`resolveToolCallFilePath` -> `resolveHostToolPath`) expands it, but the
+ * tool_result seam used a bare `path.resolve`, so `~/proj/a.ts` became
+ * `<projectRoot>/~/proj/a.ts` — a path that never existed — and that phantom
+ * reached runner dispatch (biome `internalError/io`, then a synthetic
+ * `coverage-unavailable` notice for a file the agent never touched).
+ *
+ * HOME/USERPROFILE are pinned to a directory below the test tmp root so
+ * `os.homedir()` points there: the real maintainer home is never read or
+ * written.
+ */
+describe("host tool path resolution on the tool_result side (#4576)", () => {
+	function callDeps(runtime: RuntimeCoordinator, event: unknown) {
+		return {
+			event,
+			ctx: { cwd: runtime.projectRoot },
+			lensEnabled: true,
+			getFlag: (name: string) => name === "no-lsp" || name === "no-complexity",
+			dbg: () => {},
+			runtime,
+			cacheManager: new CacheManager(false),
+			ensureLSPConfigInitialized: async () => {},
+			updateLspStatus: () => {},
+			resetLSPService: () => {},
+		} as never;
+	}
+	function resultDeps(runtime: RuntimeCoordinator, event: unknown) {
+		return {
+			event,
+			getFlag: (name: string) => name === "no-lsp" || name === "no-complexity",
+			dbg: () => {},
+			runtime,
+			cacheManager: new CacheManager(false),
+			biomeClient: {},
+			ruffClient: {},
+			metricsClient: {},
+			resetLSPService: () => {},
+			readGuard: runtime.readGuard,
+			agentBehaviorRecord: () => [],
+			formatBehaviorWarnings: () => "",
+		} as never;
+	}
+	async function writeThroughRealSeams(
+		runtime: RuntimeCoordinator,
+		toolCallId: string,
+		spelling: string,
+	) {
+		const input = { path: spelling, content: "export const value = 1;\n" };
+		await runHandlerExpectingNoThrow(() =>
+			handleToolCall(
+				callDeps(runtime, { toolName: "write", toolCallId, input }),
+			),
+		);
+		await handleToolResult(
+			resultDeps(runtime, {
+				toolName: "write",
+				toolCallId,
+				input,
+				content: [{ type: "text", text: "ok" }],
+			}),
+		);
+	}
+	/** The `filePath` every runner dispatch was handed, in call order. */
+	function dispatchedPaths(): string[] {
+		return vi
+			.mocked(runPipeline)
+			.mock.calls.map(([ctx]) => (ctx as { filePath?: string }).filePath ?? "");
+	}
+
+	it("dispatches the expanded home path, never the phantom <root>/~/ path", async () => {
+		const env = setupTestEnvironment("pi-lens-4576-tilde-");
+		// The fixture HOME lives outside the fixture root (#4591): the write path
+		// spawns children that inherit HOME and `cwd`, and one of them writing after
+		// this file's teardown sweep re-created a root the harness had just removed.
+		// `pinFixtureHome` also keeps the home clear of `isPiOwnedTempPath`, which
+		// claims every `<tmp>/pi-*` root and every direct `<tmp>/` child.
+		let fixtureHome: ReturnType<typeof pinFixtureHome> | undefined;
+		try {
+			fixtureHome = pinFixtureHome("4576-tilde-home");
+			const home = fixtureHome.home;
+			const projectRoot = path.join(env.tmpDir, "workspace");
+			const realFile = path.join(home, "proj", "src", "tilde.ts");
+			fs.mkdirSync(path.dirname(realFile), { recursive: true });
+			fs.mkdirSync(projectRoot, { recursive: true });
+			fs.writeFileSync(path.join(home, "proj", "package.json"), "{}\n");
+			fs.writeFileSync(realFile, "export const value = 1;\n");
+			const runPipelineMock = vi.mocked(runPipeline);
+			runPipelineMock.mockReset();
+			runPipelineMock.mockResolvedValue({
+				output: "",
+				hasBlockers: false,
+				isError: false,
+				fileModified: false,
+			} as never);
+			// The pin is live before the handler runs: a stale HOME would make
+			// every assertion below pass against the wrong directory.
+			expect(os.homedir()).toBe(home);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = projectRoot;
+			const phantom = path.join(projectRoot, "~", "proj", "src", "tilde.ts");
+
+			await writeThroughRealSeams(
+				runtime,
+				"call-4576-tilde",
+				"~/proj/src/tilde.ts",
+			);
+
+			expect(dispatchedPaths()[0]).toBe(realFile);
+			// The phantom path is where the pre-fix resolver landed. No runner
+			// may ever be dispatched for it: it is what produced the ghost
+			// biome `internalError/io` and the synthetic coverage notice.
+			expect(dispatchedPaths()).not.toContain(phantom);
+			expect(
+				dispatchedPaths().some((p) => p.includes(`${path.sep}~${path.sep}`)),
+			).toBe(false);
+		} finally {
+			fixtureHome?.restore();
+			env.cleanup();
+		}
+	});
+
+	// #4577 N1: `~/x` is the spelling whose behaviour CHANGED, and the case
+	// above drives it end to end. `~user/x` did NOT change (pi expands only `~`
+	// and `~/`, and the pre-fix ternary also resolved a named-user tilde
+	// against the base), so this is an agreement witness, not a regression
+	// test: it reds if the two seams ever diverge again, which is the whole
+	// defect #4576 fixed.
+	it("leaves a ~user path resolved against the base, as the tool_call seam does", async () => {
+		const env = setupTestEnvironment("pi-lens-4577-resolver-");
+		const { home, restore } = pinFixtureHome("4577-resolver-user");
+		const projectRoot = path.join(env.tmpDir, "workspace");
+		const userFile = path.join(projectRoot, "~user", "proj", "a.ts");
+		fs.mkdirSync(path.dirname(userFile), { recursive: true });
+		fs.writeFileSync(userFile, "export const a = 1;\n");
+		const runPipelineMock = vi.mocked(runPipeline);
+		runPipelineMock.mockReset();
+		runPipelineMock.mockResolvedValue({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		} as never);
+		try {
+			expect(os.homedir()).toBe(home);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = projectRoot;
+			await writeThroughRealSeams(runtime, "call-4577-user", "~user/proj/a.ts");
+			expect(dispatchedPaths()[0]).toBe(userFile);
+		} finally {
+			restore();
+			env.cleanup();
+		}
+	});
+
+	// PIN, not a regression test: a bare `~` resolves to the home DIRECTORY, so
+	// no write result can target it and the handler has no effect to observe.
+	// The pin keeps the resolver's third spelling from drifting silently.
+	it("pins ~ resolving to the home directory itself", () => {
+		const env = setupTestEnvironment("pi-lens-4577-resolver-");
+		const { home, restore } = pinFixtureHome("4577-resolver-bare");
+		const cwd = path.join(env.tmpDir, "workspace");
+		fs.mkdirSync(cwd, { recursive: true });
+		try {
+			expect(os.homedir()).toBe(home);
+			expect(resolveHostToolPath("~", cwd)).toBe(home);
+		} finally {
+			restore();
+			env.cleanup();
+		}
+	});
+
+	// #4577 (Greptile P1): a bash-derived synthetic write's path came FROM disk,
+	// so its bytes are the identity. Re-resolving it through the host-tool
+	// resolver folded U+202F to a space and dispatched `src/a b.ts` — a file that
+	// does not exist — for a write that landed at `src/a\u202Fb.ts`. The
+	// recovery caller states the provenance (`_pathAlreadyResolved`); nothing
+	// re-detects it downstream.
+	it("dispatches a recovered write's byte-exact path, never the folded spelling", async () => {
+		const env = setupTestEnvironment("pi-lens-4577-recovered-");
+		const projectRoot = path.join(env.tmpDir, "workspace");
+		const writtenFile = path.join(projectRoot, "src", "a\u202Fb.ts");
+		const foldedFile = path.join(projectRoot, "src", "a b.ts");
+		fs.mkdirSync(path.dirname(writtenFile), { recursive: true });
+		fs.writeFileSync(writtenFile, "export const a = 1;\n");
+		const runPipelineMock = vi.mocked(runPipeline);
+		runPipelineMock.mockReset();
+		runPipelineMock.mockResolvedValue({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		} as never);
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = projectRoot;
+			await handleToolResult(
+				resultDeps(runtime, {
+					toolName: "bash",
+					toolCallId: "call-4577-recovered",
+					input: { command: "tee 'src/a\u202Fb.ts'" },
+					content: [{ type: "text", text: "export const a = 1;" }],
+				}),
+			);
+			expect(dispatchedPaths()).toContain(writtenFile);
+			expect(dispatchedPaths()).not.toContain(foldedFile);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+/**
+ * #4504 r1: the root the prescan takes its baseline under is also the root the
+ * rest of the bash path must use. Two bot findings on the #4504 fix pinned this:
+ * a recognized write into another checkout was dropped, and a recovered write
+ * was offered to the servers of a subtree that does not hold it.
+ */
+describe("the prescan root reaches the send and the recognized set (#4504 r1)", () => {
+	/** The deps `index.ts` hands the `tool_result` hook, with the session's cwd. */
+	function splitDeps(runtime: RuntimeCoordinator, event: unknown, cwd: string) {
+		return {
+			event,
+			cwd,
+			getFlag: () => false,
+			dbg: () => {},
+			runtime,
+			cacheManager: new CacheManager(false),
+			biomeClient: {},
+			ruffClient: {},
+			metricsClient: {},
+			resetLSPService: () => {},
+			readGuard: runtime.readGuard,
+			agentBehaviorRecord: () => [],
+			formatBehaviorWarnings: () => "",
+		} as never;
+	}
+	/**
+	 * The two roots a concurrent-secondary session splits: the coordinator's
+	 * `projectRoot` (the primary's checkout) and the session's own `cwd`. Plain
+	 * directories are enough - the seam under test is which root each half
+	 * derives, and the pending baseline is a real stat diff, not git's status.
+	 */
+	function splitDirs(
+		env: ReturnType<typeof setupTestEnvironment>,
+		tag: string,
+	): { mainRoot: string; worktreeRoot: string } {
+		const mainRoot = path.join(env.tmpDir, `${tag}-main`);
+		const worktreeRoot = path.join(env.tmpDir, `${tag}-session`);
+		fs.mkdirSync(mainRoot, { recursive: true });
+		fs.mkdirSync(worktreeRoot, { recursive: true });
+		return { mainRoot, worktreeRoot };
+	}
+	/** The real pre-write stat snapshot a `stat-diff` baseline holds. */
+	async function baselineSnapshot(root: string) {
+		const outcome = await captureFileStats(root, { withHashes: true });
+		expect(outcome.unknownReason).toBeUndefined();
+		return outcome.snapshot!;
+	}
+	/** The `filePath` every dispatch was handed, in call order. */
+	function dispatchedPaths(): string[] {
+		return vi
+			.mocked(runPipeline)
+			.mock.calls.map(([ctx]) => (ctx as { filePath?: string }).filePath ?? "");
+	}
+	beforeEach(() => {
+		const runPipelineMock = vi.mocked(runPipeline);
+		runPipelineMock.mockReset();
+		runPipelineMock.mockResolvedValue({
+			output: "",
+			hasBlockers: false,
+			isError: false,
+			fileModified: false,
+		} as never);
+	});
+	afterEach(() => {
+		// The shared per-session reset, not a hand-picked subset: `handleToolResult`
+		// touches stores beyond the opaque baseline these cases write, and
+		// `resetSessionScopedState` clears them all (the opaque store included).
+		resetSessionScopedState();
+	});
+
+	// Greptile P1 on #4594: the scan of the secondary's own checkout cleared a
+	// recognized write that landed in the primary's, so `out.ts` got no
+	// dispatch and no mutation record. A scan may only judge the tree it ran in.
+	it("keeps a recognized write that lands in the other checkout", async () => {
+		const env = setupTestEnvironment("pi-lens-4504-r1-cross-");
+		const { mainRoot, worktreeRoot } = splitDirs(env, "cross");
+		try {
+			const mainOut = path.join(mainRoot, "out.ts");
+			fs.writeFileSync(mainOut, "export const out = 1;\n");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = mainRoot;
+			const toolCallId = "4504-r1-cross";
+			getOpaqueBaselineStore().record(
+				opaqueBaselineSlot(worktreeRoot, runtime.sessionGeneration),
+				toolCallId,
+				{
+					startedAt: Date.now(),
+					strategy: "stat-diff",
+					stats: await baselineSnapshot(worktreeRoot),
+				},
+			);
+			const input = { command: `printf x > ${mainOut}` };
+			// The test runs the command's effect itself, as pi's bash tool would.
+			fs.writeFileSync(mainOut, "export const out = 2;\n");
+
+			await handleToolResult(
+				splitDeps(
+					runtime,
+					{
+						toolName: "bash",
+						toolCallId,
+						input,
+						isError: false,
+						content: [{ type: "text", text: "ok" }],
+					},
+					worktreeRoot,
+				),
+			);
+
+			expect(dispatchedPaths()).toContain(mainOut);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Greptile P1 on #4594: the recovered files reach the servers that hold
+	// them by root, so asking the coordinator's root found no holder in the
+	// secondary's checkout and sent nothing before the dispatches read a check.
+	it("sends a recovered worktree write to the servers that root it", async () => {
+		const env = setupTestEnvironment("pi-lens-4504-r1-send-");
+		const { mainRoot, worktreeRoot } = splitDirs(env, "send");
+		const resync = vi.fn(async () => ({ sent: 1, drained: true }));
+		try {
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = mainRoot;
+			const held = path.join(worktreeRoot, "held.ts");
+			const toolCallId = "4504-r1-send";
+			getOpaqueBaselineStore().record(
+				opaqueBaselineSlot(worktreeRoot, runtime.sessionGeneration),
+				toolCallId,
+				{
+					startedAt: Date.now(),
+					strategy: "stat-diff",
+					stats: await baselineSnapshot(worktreeRoot),
+				},
+			);
+			// The opaque command's own write, in the secondary's checkout.
+			fs.writeFileSync(held, "export const held = 2;\n");
+			installLspService(
+				makeLspServiceDouble({
+					getOpenDocumentPaths: (root: string) =>
+						normalizeMapKey(root) === normalizeMapKey(worktreeRoot)
+							? [normalizeMapKey(held)]
+							: [],
+					getTrackedContent: () => ({ hash: "held-before-the-write" }),
+					resyncHeldPrimaries: resync,
+				}),
+			);
+			// `peekLSPService` answers only for a service something has built.
+			getLSPService();
+
+			await handleToolResult(
+				splitDeps(
+					runtime,
+					{
+						toolName: "bash",
+						toolCallId,
+						input: { command: "node scripts/gen-held.mjs" },
+						isError: false,
+						content: [{ type: "text", text: "ok" }],
+					},
+					worktreeRoot,
+				),
+			);
+
+			expect(resync).toHaveBeenCalledWith(
+				[normalizeMapKey(held)],
+				expect.any(Number),
+			);
+		} finally {
 			env.cleanup();
 		}
 	});

@@ -504,3 +504,12 @@ export declare function watchOpenPrs(args: {
 	sleepImpl?: (ms: number) => Promise<void>;
 	now?: () => number;
 }): Promise<number>;
+
+// #3920 item 3: the rule lives in scripts/lib/ci-runtime-cap.mjs (#4691).
+import type { JobCapEntry } from "./lib/ci-runtime-cap.mjs";
+export declare function readJobTimeCaps(root: string): Promise<JobCapEntry[]>;
+export declare function formatRuntimeCapLines(args: {
+	checkRuns: readonly unknown[];
+	root: string;
+	requiredChecks?: readonly string[];
+}): Promise<string[]>;

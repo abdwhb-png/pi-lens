@@ -38,7 +38,10 @@ import type { GovulncheckResult } from "../clients/govulncheck-client.js";
 import type { TrivyResult } from "../clients/trivy-client.js";
 import extension from "../index.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
-import { makeSessionStartEvent } from "./support/host-event-factory.js";
+import {
+	makeContextWithSystemEvent,
+	makeSessionStartEvent,
+} from "./support/host-event-factory.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 
 const SESSION_ID = "pi-1892-witness-session";
@@ -168,14 +171,20 @@ describe("#1892 witness: pi turn_end → context, scanner freshness", () => {
 		);
 		await pi.emit("turn_end", {}, makeCtx({ cwd: tmpDir }));
 		const injected = (await pi.emit(
-			"context",
-			{ messages: [{ role: "user", content: "keep working" }] },
+			"context_with_system",
+			makeContextWithSystemEvent([{ role: "user", content: "keep working" }]),
 			makeCtx({ cwd: tmpDir }),
-		)) as { messages?: Array<{ content: string }> } | undefined;
+		)) as { messages?: Array<{ role?: string; content: string }> } | undefined;
 
+		// #4631 round 5 (F2): the transcript leads with the host's system head, so the
+		// golden records the messages pi-lens APPENDED. The assertion pins that the
+		// head is still at index 0: a regression that dropped it would shift this
+		// golden instead of slipping through.
+		expect((injected?.messages ?? [])[0]?.role).toBe("system");
 		const actual = [
 			"=== context message the agent receives ===",
 			(injected?.messages ?? [])
+				.slice(1)
 				.map((m) => m.content)
 				.join("\n\n")
 				.replaceAll(tmpDir, "<PROJECT>")
@@ -185,7 +194,21 @@ describe("#1892 witness: pi turn_end → context, scanner freshness", () => {
 			...freshnessRows().map((row) => row.replaceAll(tmpDir, "<PROJECT>")),
 			"",
 			"=== degradation ledger ===",
-			...getDegradationSummary().map((row) => row.kind),
+			...getDegradationSummary()
+				// #4530: npm and npx put the checkout's own `node_modules/.bin` on
+				// the runner's PATH, and under untrusted trust the spawn seam drops
+				// that entry with one record. That row describes how vitest was
+				// launched, not this flow, so the golden leaves it out.
+				.filter(
+					(row) =>
+						!(
+							row.kind === "trust-refusal" &&
+							row.latestReasons.every((entry) =>
+								entry.subject.startsWith("project-path-entry:"),
+							)
+						),
+				)
+				.map((row) => row.kind),
 			"",
 		].join("\n");
 

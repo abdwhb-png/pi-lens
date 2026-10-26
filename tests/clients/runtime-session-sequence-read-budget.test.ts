@@ -55,7 +55,7 @@ import {
 	setupTestEnvironment,
 	useTrackedTempDirs,
 } from "./test-utils.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 const logLatencySpy = vi.hoisted(() => vi.fn());
 const readLatestProjectSequenceAsyncSpy = vi.hoisted(() => vi.fn());
@@ -75,17 +75,9 @@ vi.mock("../../clients/project-changes.js", async (importOriginal) => {
 	};
 });
 
-vi.mock("../../clients/lsp/config.js", () => ({
-	loadLSPConfig: vi.fn().mockResolvedValue({}),
-	initLSPConfig: vi.fn().mockResolvedValue(undefined),
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
-vi.mock("../../clients/lsp/capabilities.js", () => ({
-	getLSPService: vi.fn(() => makeLspServiceDouble()),
-}));
-
 import { handleSessionStart } from "../../clients/runtime-session.js";
+import { resetLSPConfigStateForTests } from "../../clients/lsp/config.js";
+import { pinFixtureHome } from "./test-utils.js";
 
 // Session start and the warmup queue project-snapshot body writes that can
 // recreate a fixture root after its `env.cleanup()`; the drain lets them land.
@@ -187,7 +179,11 @@ describe("#1162 — bounded session_start sequence read", () => {
 	let prevFirst: boolean | undefined;
 	let prevWarmup: boolean | undefined;
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		// The real config loader walks up from the session cwd to HOME (#4709);
+		// a pinned fixture HOME keeps that read off the maintainer's home.
+		pinFixtureHome("runtime-session-sequence-read-budget");
+		await installLspServiceDouble();
 		prevArgv = process.argv;
 		prevStartupMode = process.env.PI_LENS_STARTUP_MODE;
 		prevBudget = process.env.PI_LENS_SEQUENCE_READ_BUDGET_MS;
@@ -208,6 +204,7 @@ describe("#1162 — bounded session_start sequence read", () => {
 	});
 
 	afterEach(() => {
+		resetLSPConfigStateForTests();
 		process.argv = prevArgv;
 		if (prevStartupMode === undefined) delete process.env.PI_LENS_STARTUP_MODE;
 		else process.env.PI_LENS_STARTUP_MODE = prevStartupMode;

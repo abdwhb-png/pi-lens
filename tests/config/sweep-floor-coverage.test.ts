@@ -10,6 +10,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const REPO_ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -32,7 +33,7 @@ const SELF = "tests/config/sweep-floor-coverage.test.ts";
  */
 export function looksSweepShaped(source: string): boolean {
 	const enumerates =
-		/(?:fs\.readdirSync|(?<![A-Za-z0-9_$])readdirSync|fs\.promises\.readdir|(?<![A-Za-z0-9_$.])readdir(?!Sync)|globSync|listSourceFiles|clientSourceFiles)/.test(
+		/(?:fs\.readdirSync|(?<![A-Za-z0-9_$])readdirSync|fs\.promises\.readdir|(?<![A-Za-z0-9_$.])readdir(?!Sync)|globSync|listSourceFiles|clientSourceFiles|walkFiles)/.test(
 			source,
 		) ||
 		/(?:assertNonEmptyScan|auditRegistry|scanDualInstanceImports|LSP_SERVERS|LSP_FIXTURES|ALL_FORMATTERS|DYNAMIC_OR_EXEMPT|isTimingSensitive|scanHostEventShapeViolations)/.test(
@@ -161,8 +162,15 @@ const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
 	"tests/clients/installer/install-lock.test.ts":
 		"lock behavior cases; it lists one lock directory and asserts an empty " +
 		"degradation ledger, not a production population sweep",
+	"tests/clients/installer/opengrep-pack-refresh-4765.test.ts":
+		"refresh behavior cases; it lists the rule-pack cache directory once to assert no " +
+		"candidate file outlives a refresh, not a production population sweep",
 	"tests/clients/instance-reaper-prune-concurrency.test.ts":
 		"concurrency cases, not a production population sweep",
+	"tests/clients/instance-reaper-backstop.test.ts":
+		"reaper behavior cases; one case lists its own fixture home's backstop " +
+		"lock directory and asserts a settled sweep left no canonical or " +
+		"quarantine name (#4581), not a production source-population sweep",
 	"tests/clients/instance-registry-lock.test.ts":
 		"lock behavior cases; it lists one lock directory and asserts an empty " +
 		"degradation ledger, not a production population sweep",
@@ -174,6 +182,10 @@ const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
 		"path behavior cases, not a production population sweep",
 	"tests/clients/pi-host-contract.test.ts":
 		"host contract cases, not a production population sweep",
+	"tests/clients/project-data-dir-slug.test.ts":
+		"data-dir naming and adoption cases (#4689 r5): it lists one fixture " +
+		"data dir and asserts a migration drain is empty, not a production " +
+		"population sweep",
 	"tests/clients/project-diagnostics/scanner.test.ts":
 		"scanner behavior cases, not a production population sweep",
 	"tests/clients/project-snapshot.test.ts":
@@ -200,6 +212,10 @@ const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
 		"host type cases, not a production population sweep",
 	"tests/packaging.test.ts":
 		"packaging behavior cases, not a production population sweep",
+	"tests/mcp/harness-socket-teardown.test.ts":
+		"lists one harness-owned TMPDIR root after dispose() and asserts no " +
+		"socket remains (#4353); a behavior case over a fixture root, not a " +
+		"production population sweep",
 	"tests/scripts/guard-bash-probe.test.ts":
 		"corpus-runner behavior cases over fixture rows and stub hooks (#4071), " +
 		"not a production source-population sweep",
@@ -236,38 +252,42 @@ const DECLARED_EXCEPTIONS: Readonly<Record<string, string>> = {
 };
 
 describe("registered-or-fail sweep floors", () => {
-	it("every sweep-shaped test uses sweep-kit or declares a reason", () => {
-		const shaped = sweepShapeFiles();
-		const files = shaped.map(({ file }) => relativePosix(REPO_ROOT, file));
-		const registered = shaped
-			.filter(({ source }) => isRegisteredFloorSource(source))
-			.map(({ file }) => relativePosix(REPO_ROOT, file));
-		const scannedCount = listSourceFiles(TESTS_ROOT, {
-			extensions: [".ts"],
-		}).filter((file) => file.endsWith(".test.ts")).length;
-		const audit = auditRegistry({
-			sweepName: "sweep-floor meta-sweep",
-			flagged: files,
-			registered,
-			exemptions: DECLARED_EXCEPTIONS,
-			// Calibration: 831 test files walked on 2026-08-27 (fix round 3, #2088
-			// R1: the `.length).toBe(0)` alternation added above pulled 3 more
-			// already-registered sweep files into the census); half is 416,
-			// rounded up to the documented 420 floor.
-			scannedCount,
-			minScanned: 420,
-			// Calibration: this census flags 58 sweep-shaped files on 2026-08-27
-			// (fix round 3) -- 13 registered via assertNonEmptyScan/minScanned, 45
-			// declared exceptions. Half of 58 rounded up is 29. Earlier figures (28
-			// for a census of 55) were accurate as of round 2 but went stale the
-			// moment the R1 regex fix changed what counts as sweep-shaped.
-			// Recalibrate by reading this test's OWN measured numbers, not by
-			// copying a figure from a comment or a PR body.
-			minFlagged: 29,
-			minReasonLength: 20,
-		});
-		expect(audit.problems, audit.problems.join("\n")).toEqual([]);
-	});
+	it(
+		"every sweep-shaped test uses sweep-kit or declares a reason",
+		() => {
+			const shaped = sweepShapeFiles();
+			const files = shaped.map(({ file }) => relativePosix(REPO_ROOT, file));
+			const registered = shaped
+				.filter(({ source }) => isRegisteredFloorSource(source))
+				.map(({ file }) => relativePosix(REPO_ROOT, file));
+			const scannedCount = listSourceFiles(TESTS_ROOT, {
+				extensions: [".ts"],
+			}).filter((file) => file.endsWith(".test.ts")).length;
+			const audit = auditRegistry({
+				sweepName: "sweep-floor meta-sweep",
+				flagged: files,
+				registered,
+				exemptions: DECLARED_EXCEPTIONS,
+				// Calibration: 831 test files walked on 2026-08-27 (fix round 3, #2088
+				// R1: the `.length).toBe(0)` alternation added above pulled 3 more
+				// already-registered sweep files into the census); half is 416,
+				// rounded up to the documented 420 floor.
+				scannedCount,
+				minScanned: 420,
+				// Calibration: this census flags 58 sweep-shaped files on 2026-08-27
+				// (fix round 3) -- 13 registered via assertNonEmptyScan/minScanned, 45
+				// declared exceptions. Half of 58 rounded up is 29. Earlier figures (28
+				// for a census of 55) were accurate as of round 2 but went stale the
+				// moment the R1 regex fix changed what counts as sweep-shaped.
+				// Recalibrate by reading this test's OWN measured numbers, not by
+				// copying a figure from a comment or a PR body.
+				minFlagged: 29,
+				minReasonLength: 20,
+			});
+			expect(audit.problems, audit.problems.join("\n")).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });
 
 describe("looksSweepShaped emptiness detection (#2088 fix round 3, R1)", () => {
@@ -279,6 +299,14 @@ describe("looksSweepShaped emptiness detection (#2088 fix round 3, R1)", () => {
 	// `empties` regex above must red this exact case.
 	it("recognizes the expect(x.length).toBe(0) spelling", () => {
 		const source = `${enumerateLine}\nexpect(violations.length).toBe(0);`;
+		expect(looksSweepShaped(source)).toBe(true);
+	});
+
+	// #4104 F4: the repo-wide walker is an enumeration. A sweep that walks
+	// through walkFiles and asserts emptiness is sweep-shaped, so a support
+	// module with that walk is not invisible to the floor-coverage census.
+	it("recognizes a walkFiles enumeration (#4104 F4)", () => {
+		const source = `const files = walkFiles(ROOT, () => true, () => {});\nexpect(files).toEqual([]);`;
 		expect(looksSweepShaped(source)).toBe(true);
 	});
 
@@ -363,35 +391,40 @@ describe("floor-call registration over blanked source (#2710)", () => {
 		).toBe(true);
 	});
 
-	it("reports a prose-only fixture sweep file uncovered and passes a real call", () => {
-		const root = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-sweep-floor-2710-"),
-		);
-		try {
-			fs.writeFileSync(
-				path.join(root, "comment-only.test.ts"),
-				commentOnlyFixture,
+	it(
+		"reports a prose-only fixture sweep file uncovered and passes a real call",
+		() => {
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-sweep-floor-2710-"),
 			);
-			fs.writeFileSync(path.join(root, "real-call.test.ts"), realCallFixture);
-			const flagged = listSourceFiles(root, { extensions: [".ts"] }).filter(
-				(file) => looksSweepShaped(stripSource(fs.readFileSync(file, "utf8"))),
-			);
-			expect(flagged.map((file) => relativePosix(root, file))).toEqual([
-				"comment-only.test.ts",
-				"real-call.test.ts",
-			]);
-			const registered = flagged.filter((file) =>
-				isRegisteredFloorSource(fs.readFileSync(file, "utf8")),
-			);
-			const audit = auditRegistry({
-				sweepName: "#2710 fixture sweep",
-				flagged: flagged.map((file) => relativePosix(root, file)),
-				registered: registered.map((file) => relativePosix(root, file)),
-				exemptions: {},
-			});
-			expect(audit.unaccounted).toEqual(["comment-only.test.ts"]);
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
+			try {
+				fs.writeFileSync(
+					path.join(root, "comment-only.test.ts"),
+					commentOnlyFixture,
+				);
+				fs.writeFileSync(path.join(root, "real-call.test.ts"), realCallFixture);
+				const flagged = listSourceFiles(root, { extensions: [".ts"] }).filter(
+					(file) =>
+						looksSweepShaped(stripSource(fs.readFileSync(file, "utf8"))),
+				);
+				expect(flagged.map((file) => relativePosix(root, file))).toEqual([
+					"comment-only.test.ts",
+					"real-call.test.ts",
+				]);
+				const registered = flagged.filter((file) =>
+					isRegisteredFloorSource(fs.readFileSync(file, "utf8")),
+				);
+				const audit = auditRegistry({
+					sweepName: "#2710 fixture sweep",
+					flagged: flagged.map((file) => relativePosix(root, file)),
+					registered: registered.map((file) => relativePosix(root, file)),
+					exemptions: {},
+				});
+				expect(audit.unaccounted).toEqual(["comment-only.test.ts"]);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 });

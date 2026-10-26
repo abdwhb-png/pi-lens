@@ -62,7 +62,14 @@ const CONVERSATION_MODULE_STATE: Readonly<Record<string, readonly string[]>> = {
 	"clients/read-guard.ts": [],
 	"clients/runtime-agent-end.ts": [],
 	"clients/runtime-coordinator.ts": [],
-	"clients/runtime-session.ts": [],
+	"clients/runtime-session.ts": [
+		// #4780 review: the pending managed-tool refresh TIMER HANDLE. Not a store:
+		// it holds no session data, only the one setTimeout a `/reload` must
+		// cancel, and `resetSessionScopedState` (the same function that re-arms
+		// every other session latch) clears it. A store here would have to
+		// survive a reload, which is exactly the defect.
+		"managedToolRefreshTimer",
+	],
 	"clients/runtime-tool-call.ts": [],
 	"clients/runtime-tool-result.ts": [
 		"GIT_GLOBAL_OPTIONS_WITH_VALUE",
@@ -113,6 +120,8 @@ const CONVERSATION_MODULE_STATE: Readonly<Record<string, readonly string[]>> = {
  * the containers: `astGrepClient` and `enabledLazyTools` joined the pin.
  */
 const ACTIVATION_STATE: Readonly<Record<string, string>> = {
+	admittedPrimary:
+		"whether this activation ran a full admission; an unmatched leave of one that admitted none keeps the classifier's answer for the registration (#4106, #4704)",
 	astGrepClient:
 		"a per-activation AstGrepClient handle for the tools this factory registers; it holds no conversation facts",
 	contextInjectionEnabled:
@@ -166,6 +175,7 @@ const COORDINATOR_FIELDS: Readonly<Record<string, "reset" | string>> = {
 	_gitGuardCacheUnknownReason: "reset",
 	_gitGuardHasBlockers: "reset",
 	_gitGuardSummary: "reset",
+	_gitGuardUnansweredDispatches: "reset",
 	_hasStableSessionId: "reset",
 	_inlineBlockerWriteOrder: "reset",
 	_lifecycleReason:
@@ -174,6 +184,8 @@ const COORDINATOR_FIELDS: Readonly<Record<string, "reset" | string>> = {
 	_mutationReceipts: "reset",
 	_nextCascadeSettleToken:
 		"kept: a monotonic token source; restarting it would let an old settle's token match a new one",
+	_owedAnchors: "reset",
+	_owedRunners: "reset",
 	_pendingCascadeRuns: "reset",
 	_pendingDeferredMutations: "reset",
 	_pendingInlineBlockers: "reset",
@@ -326,7 +338,7 @@ describe("session-scope ratchet (#3609 S8)", () => {
 			scanned += live.length;
 			problems.push(...diffNames(file, live, [...pinned].sort()));
 		}
-		assertNonEmptyScan("conversation module state", scanned, 34);
+		assertNonEmptyScan("conversation module state", scanned, 35);
 		expect(problems).toEqual([]);
 	});
 

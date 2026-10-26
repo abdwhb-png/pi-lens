@@ -14,10 +14,6 @@ import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 function makeServer(id: string, ext: string) {
@@ -33,8 +29,11 @@ function makeServer(id: string, ext: string) {
 
 describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 	let tmp: string;
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-perserver-"));
@@ -69,6 +68,7 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 			getOperationSupport: () => ({}),
 			serverId,
 			notify: {
+				announceCreated: () => undefined,
 				open: vi.fn(async () => {
 					const n = (live.get(serverId) ?? 0) + 1;
 					live.set(serverId, n);
@@ -140,7 +140,10 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 					diagnosticProviderKind: "object",
 				}),
 				getOperationSupport: () => ({}),
-				notify: { open: notifyOpen },
+				notify: {
+					announceCreated: () => undefined,
+					open: notifyOpen,
+				},
 				requestWorkspaceDiagnostics,
 				waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 				getDiagnostics: vi.fn(() => []),
@@ -183,7 +186,10 @@ describe("runWorkspaceDiagnostics — per-server serialization (#387)", () => {
 				diagnosticProviderKind: "object",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: notifyOpen },
+			notify: {
+				announceCreated: () => undefined,
+				open: notifyOpen,
+			},
 			requestWorkspaceDiagnostics,
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			getDiagnostics: vi.fn(() => []),

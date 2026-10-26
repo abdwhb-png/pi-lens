@@ -21,16 +21,18 @@ reachable.
 
 Every PR body starts with `## Why`, `## Notes for the reviewer`, and
 `## Change outline`, followed by the existing `## Summary`, `## Tests`,
-`## Blast radius`, `## Class sweep`, and `## Observability` sections. The
-change outline is the changed symbol's caller/callee tree with `+`/`-` on
-moved lines; include only structural views that changed.
+`## Blast radius`, `## Class sweep`, `## Observability`, and `## Fold check`
+sections. The change outline is the changed symbol's caller/callee tree with
+`+`/`-` on moved lines; include only structural views that changed.
 
 ## The loop, per PR
 
 1. **Review.** Spawn `pi-lens-reviewer` (worktree isolation) with the PR
    number, a one-paragraph summary of the claim, and any PR-specific attack
    angles. Self-authored and small PRs get reviewed too — the depth follows
-   the review tier below, never the priority label.
+   the review tier below, never the priority label. Bots review the PR as well:
+   every bot thread (Greptile and others) gets a disposition reply, `fixed in
+   <sha>`, `accepted and disclosed`, or `rejected because <reason>`.
 2. **Fix rounds.** Send findings back to the PR's original author agent when
    its worktree survives (SendMessage — cheapest context); otherwise spawn
    `pi-lens-fixer` on the branch with the findings inlined.
@@ -75,7 +77,8 @@ moved lines; include only structural views that changed.
    sweeps is not green — run the sweep on the merge before merging. Apply
    AGENTS.md's one mutation layer (#4005): new-guard proof and demonstrated
    correctness gaps gate the merge. `ci-verdict` prints no mutation line, and
-   the nightly Stryker report is not a merge input.
+   the nightly Stryker report is not a merge input. Every bot review thread
+   carries its disposition reply and is resolved before the merge.
 5. **Merge.** `gh pr merge <N> --merge` (merge commit, repo convention).
    If "not up to date", `gh api -X PUT .../pulls/<N>/update-branch`, wait for
    CI, re-gate, merge. On GitHub 503s: retry with backoff, never switch to
@@ -160,6 +163,18 @@ blocks dispatch above the thresholds (no hand-written fallback;
 every refill; state them in the lane ledger. Standing rule from
 2026-09-03, lifted only when the maintainer says so.
 
+## Host capacity (orchestrator)
+
+The maintainer may cap how many subagents run at once, for example when RAM is
+shared with a local model. This is a machine-load cap, separate from
+`PI_LENS_TEST_MAX_WORKERS` and from Git authority. A lane counts by what it
+runs, not by its role or brief wording: any agent that runs a build, Vitest, a
+language server or a probe counts, including an investigator that reproduces
+through a probe and a Git-read-only reviewer. Agents that only read files and
+call `gh`, grep or Explore never count and run in parallel with the capped
+lanes; their brief says "no builds, no tests, no language servers, no probes"
+(maintainer, 2026-10-14).
+
 ## Brief contract (orchestrator)
 
 Before dispatching any issue that adds a shared helper or seam: grep for
@@ -171,12 +186,12 @@ bound helper because the brief deferred the fold without a reason.
 
 ## External reports (orchestrator)
 
-The contract lives in AGENTS.md, "Issue triage (standing rule)" — assess the
+This section is the contract; AGENTS.md "Issue triage & labels" holds the labels only. Assess the
 report against the code before accepting or dispatching, ask the one or two
 facts that would change the design, **do not dispatch work that depends on an
 unanswered load-bearing question**, mirror the answer on the issue and point
 the worker there rather than at a paraphrase, and cite the reporter's reasoning
-as authority. Read it there; this section only points at it.
+as authority. The steps above are the whole contract.
 
 The train-specific consequence: an external lane's first dispatch is often
 worth delaying by one exchange. On 2026-09-12 a fixer was dispatched on #3000
@@ -191,8 +206,27 @@ exactly one `priority:p1|p2|p3` (AGENTS.md #1676 rubric). The priority labels
 were found deleted from the repo on 2026-09-03 and recreated (#2553); an
 issue filed without one is a triage defect, not a shortcut.
 
-Every reviewer **follow-up issue** generalization verdict is filed and assigned
-to a seam group on the tracking queue in the same turn. At each regroup, scan
+**Merge bar (user, 2026-10-18).** A PR merges when no HIGH finding is open and
+every gating check is green on the exact head. Each MEDIUM or LOW finding
+either folds into the same PR or becomes an accepted residual: the PR body
+lists it under `## Accepted residuals`, named `p3` with its severity and live
+population (for example `p3 (MEDIUM, live 0): <the gap>`), so the gap keeps a
+priority without an issue.
+A residual never becomes a follow-up issue. File an issue only for p2 or
+higher work that cannot ride the PR: a HIGH outside the PR's scope, or a
+MEDIUM with a live population. Before a final round, the brief says "final
+round" and names what it fixes; a residual of MEDIUM or below after it does not
+reopen the round.
+
+**Known gaps (user, 2026-10-19).** An open p3 issue is an accepted known gap,
+not backlog. The orchestrator closes it as not planned with the `known-gap`
+label and lists it under its seam on the pinned tracker #4626. When a PR
+merges, its `## Accepted residuals` lines join the same tracker under their
+seam. A known gap reopens as p2 when it turns material: a live wrong result,
+data loss, a hang, or a leak with no bound.
+
+Every reviewer **follow-up issue** generalization verdict that meets that bar is
+filed and assigned to a seam group on the tracking queue in the same turn. At each regroup, scan
 merged PRs for subset-shaped changes that lack a generalization verdict.
 
 Before filing a review follow-up, apply the standing fold rule: fold same-seam
@@ -201,6 +235,16 @@ into the same PR. Contract-only folds are trailing commits with no
 re-verification; small code folds carry a red-first test and return to the same
 reviewer. File only different-seam, blocked, decision-dependent, untouched
 pre-existing, or risk-class-changing items, as one consolidated issue per PR.
+
+Folds also decide the issue list itself, one step earlier than a review
+finding: `AGENTS.md`, "Orchestration and delegated work" states that check.
+
+A brief carries the lane's facts and the task, and points at the role
+contract for everything else. Lane facts are the worktree, branch, base,
+TMPDIR, test-worker cap, Git grant, and deliverable path. It never restates
+contract rules such as hooks, trailers, stash, PR-body lint or summary
+shape, because the role wrapper loads them. `bin/claude-lane.sh` prints
+exactly the lane facts.
 
 ## Round-count rail (orchestrator)
 
@@ -268,7 +312,7 @@ operator's private notes, so a different orchestrator can run the same train.
   | a change that touches identifier uses of a glossary-retired synonym | run `tests/config/glossary-synonym-sweep.test.ts` on the head AND on the merge with `origin/master`, then re-pin in the PR from the sweep's own `UNPINNED`/`STALE` output — #3279, #3283, #3284, #3288 |
   | a new `vi.mock` in a test file | run `tests/config/vi-mock-export-sweep.test.ts`; whole-module mocks of a production module must spread `importOriginal` — PR #3268's CI red, fixed by trailing commit `621d61c5c` |
   | a changelog fragment | front matter `section: <Section>` plus `audience: user` or `audience: internal` and exactly one top-level entry; new user entries open with a bold lead of at most 100 characters (refs excluded), never `CHANGELOG.md`, validated by `node scripts/check-changelog-fragments.mjs` — PR #3268 r1 shipped `category:` and a paragraph |
-  | a PR body | the header gate: exactly one-sentence `## Why`, `## Notes for the reviewer`, `## Change outline`, plus Summary / Tests with `### Test assessment` / Blast radius / Class sweep / Observability; run `node scripts/check-pr-body.mjs --lint-local` before pushing — three PRs this week needed orchestrator body edits |
+  | a PR body | the header gate: exactly one-sentence `## Why`, `## Notes for the reviewer`, `## Change outline`, plus Summary / Tests with `### Test assessment` / Blast radius / Class sweep / Fold check / Observability; run `node scripts/check-pr-body.mjs --lint-local` before pushing — three PRs this week needed orchestrator body edits |
   | a whole-tree docs restructure of `AGENTS.md` | every governance test that reads `AGENTS.md`, with markers on their own lines — PR #3265 r1 |
   | a raw poll in a test | the flake-shape ratchet; the fix is the governed wait, never a header admission — #2781 r1 |
   | a new, renamed or deleted rule file under `rules/` | `npm run docs:rule-catalogs` and commit the generated catalog; `tests/scripts/rule-catalogs.test.ts` is a strict consumer of every rule file, not of rule ids — #3214 r1 |
@@ -334,7 +378,16 @@ operator's private notes, so a different orchestrator can run the same train.
   round 1.** Their correctness lives in parsing edge cases, exactly where the
   smaller model loses: #2693 took two Sonnet rounds (~720k tokens) on a text
   scanner before the rail sent round 3 to Opus, which rewrote it on the AST
-  and closed in two rounds.
+  and closed in two rounds. The rule covers checks that scan source text or
+  its AST. A plain assertion over config or workflow data (two pins match, a
+  key exists) goes to Sonnet, or to Haiku when mechanical (#4350).
+- **Haiku 5.5 is the orchestrator's cheap lane.** The orchestrator uses it
+  without asking for read-only locate and premise-pointer passes, CI-red and
+  nightly investigations (`pi-lens-investigator`), and mechanical lanes
+  through `pi-lens-fixer-light`. Mechanical lanes include trailing folds,
+  dependabot pin and allowlist moves, and reviewer-prescribed test rows. It
+  never authors detectors or governance sweeps (the Opus rule above), and
+  never takes lifecycle or identity seams or reviews of runtime diffs.
 - **Brief shape for a fixer.** Issue/PR number and head; the checked-out
   branch; the exact findings with file:line, the reviewer's probe to reproduce
   FIRST, and the remedy shape the maintainer chose; what to fold (net-count)
@@ -410,8 +463,8 @@ operator's private notes, so a different orchestrator can run the same train.
     (so `Ast-grep self-scan` or `Audit production dependencies` reads as what
     it is, not as a test failure), its `FAIL` and assertion lines and the
     `Tests` summary with the ANSI codes stripped, the gating and advisory
-    counts on separate lines (advisory reds never gate, and are read before
-    merging), and the remedy hint: `gh run rerun <run>` for a cancelled or
+    counts on separate lines (an advisory red gates only when master is green
+    on that lane, and every red is read before merging), and the remedy hint: `gh run rerun <run>` for a cancelled or
     superseded run, the `gh api -X POST .../approve` command for fork
     approval, `gh pr update-branch <pr>` when the failed merge's base is no
     longer master's head (a rerun replays the old merge commit, #3660). A job
@@ -458,7 +511,7 @@ operator's private notes, so a different orchestrator can run the same train.
   Apart from `--approve-fork`, `--rerun-cancelled` and `--sync-main`, which you
   pass by name, it never approves, reruns or updates a branch: it prints the
   command.
-- **Read the advisory rows before merging, even though they never gate
+- **Read the advisory rows before merging, even where they do not gate
   (2026-09-12).** The exit-code rule above is right and stays: never text-match
   the verdict table for `failure`, because advisory rows print `failure` on a
   green PR. But "does not gate" is not "carries no information", and filtering
@@ -501,8 +554,18 @@ operator's private notes, so a different orchestrator can run the same train.
   layer SHOULD have caught it earlier and at what cost. The accepted layer
   words are the `DETECTION_LAYERS` list exported by `scripts/check-pr-body.mjs`,
   which the `## Detection` body check reads; the prose does not restate them.
+  `nightly` may carry its workflow as `nightly:<workflow>`, and a bug-closing
+  PR is refused when `Caught by:`, `Should have been caught by:`, the reason
+  after `Gap: none:`, the `Shape: new:` name or the `Enforcer: none:` reason is
+  a placeholder (starts with `unknown`, or is exactly `n/a`, `tbd` or `?`)
+  (#4519: 139 of 363 closed bugs read unknown in the 2026-10-16 retro).
   If that layer does not exist, file it as an issue with the bug as
-  its named recurrence — the same standard shapes are held to. The ledger
+  its named recurrence — the same standard shapes are held to. The lesson
+  names the defect SHAPE and its tree-wide enforcer, not only a test for the
+  instance: the Gap names the `AGENTS.md` catalog shape (or a new shape) and
+  either a test that scans the whole population, an issue to build one, or
+  `judgment-only` with the reason. A one-bug test is the fix's regression
+  test, not the closed gap (lint half: #4439). The ledger
   carries a `caught by / should have been caught by` column. Record: #2587's
   manifest entry escaped the package for four releases; a second registration
   path masked it, so the shipped defect was foreign-tree adoption, not absence
@@ -617,6 +680,10 @@ Each row cost a lane at least once; the prose above carries the record.
 | Dispatching a fixer on an issue's text without checking it against the code | Grep the claimed gap on master before the brief. A stale premise turns the lane into a no-op or a witness-only PR |
 | Writing off a worker's reds as "sandbox" without a same-env base run | Accept a sandbox attribution only with the same test names red on origin/master under the same env vars. Hundreds of guard reds can hide one real red |
 | Folding a reviewer's remedy after running only the file the reviewer named | Run every test that references the changed symbol (`rg -l <symbol> tests`) before pushing a fold |
+| Refreshing a census or matrix cell from a probe artifact | shape 76: the row must come from the subject's own emitter, never from an order-sensitive drain (#4615) |
+| Reading a cancelled shard as a failure, or assuming a rerun clears it | shape 77: check the shard's own step conclusions and its measured runtime against the cap (#4672) |
+| Admitting a third-party cache directory at the shared tmp root by name | shape 78: pin the loader's cache off and keep a planted sibling red (#4673) |
+| Writing bytes ahead of the newest message (a returned `context` list, a tool-set change) without measuring the provider prefix | shape 79: write at the tail only, count a tool-set change as one full rewrite on a collapsing model, and compare the head and pi-ai's collapsed head across two real-session requests |
 | Pushing with `-q` or a grep filter, then landing on whatever the PR head is | Read the push result unfiltered, check `git merge-base --is-ancestor <intended> origin/<branch>`, and land with `EXPECT_HEAD=<intended or its merge>` |
 | Gating a background step on `until ! pgrep -f '<pattern>'` | That command line matches itself and never exits. Chain the steps in one command, or wait on a PID |
 | Editing an orchestrator script while a chain or monitor runs it | Stop the chain first, or write a new file and `mv` it into place |
@@ -722,8 +789,10 @@ Each row cost a lane at least once; the prose above carries the record.
 | Diagnosing a red from the first `##[error]` line | #4054's shard-5 red was called "npm registry unreachable"; that line came from a passing stubbed test, and the real failure was a 5 s timeout in check-pr-body.test.ts (#4088, 2026-10-07). Read the FAIL lines; treat annotation lines from stubbed tests as noise |
 | Triggering CI on a bot PR before checking whether a run already exists | land.sh closed and reopened #4084 30 s after an update-branch, before the new run registered, which cancelled the run, and the cancelled aggregate read red (2026-10-07). Reopen only when no run exists for the head after a real wait |
 | Writing a closing keyword where GitHub does not honour it, or by accident | #4121's title said `closes #3873`, which fails the close-keyword check (titles are never honoured); #4094's body said "then fixed #4080", an accidental closing keyword (2026-10-07). Put closing keywords in the body only, and reread the body for `fix(es\|ed) #N` prose |
+| Quoting a closing keyword in a commit message | #4375's commit f40ac6c28 quoted `not fixed: #4346` and `Whether this closes #1513` as lint examples; GitHub acts on commit-message keywords that reach the default branch, so the merge closed both (2026-10-14). `closingIssuesReferences` omits them. Commit messages get the same keyword rules as the body; quote examples as `#N` without the keyword |
+| Merging a contract-doc edit on an orchestrator read alone | #4379's seven-line host-cap section used "read-only" for the opposite of its meaning in `docs/pi-lens-subagent.md`, and left probe-running investigators unclassified; a scoped review caught both (2026-10-14). An edit to `docs/pi-lens-*.md` or AGENTS.md gets one scoped reviewer pass |
 | Seeding a group list from the active queue instead of the tracker | The orchestrator's session group held 3 issues while `area:session` had 8 more open p2s, so "is the session group done?" was answered from an incomplete list (2026-10-08). Build a group from the label and the tracker, then subtract what is out of scope |
-| Filing every LOW review finding as an issue | Each review spawned about one follow-up, so the CI group stayed at about 36 open after 16 closures (2026-10-07). Fold or drop LOW findings; file only MEDIUM and above or a reproduced sibling, and give each group a "done when" |
+| Filing every LOW review finding as an issue | Each review spawned about one follow-up, so the CI group stayed at about 36 open after 16 closures (2026-10-07). Fold or drop LOW findings; file only what the merge bar admits (p2 or higher that cannot ride the PR), and give each group a "done when" |
 | No cleanup when lanes end | 78 GB of finished lane trees and a 22 GB leaking test TMPDIR filled the root disk twice; two reviewers lost probe runs and one fixer's test file was truncated (2026-10-07). Remove a lane's trees and TMPDIR when its PR merges, and keep a disk alarm |
 | Deriving the next round from a stale brief or a stale premise | #3871's brief asked for a selection fix #3903 had already shipped, and #3813's assumed every producer was unfixed; both fixers correctly refused to rebuild merged work (2026-10-07). Re-check the premise on current master when a lane starts, not when the issue was filed |
 | Calling a PR-owned hygiene leak pre-existing because the same files fail on a later run | The PR's own CI run exposed the leak, but the reviewer classified it as a flake and fixed an unreachable injected path; the PR review and red-on-base comparison should have owned the finding. The hygiene check now treats a new leak on a green-master PR as CAUSED-BY-PR until red-on-base proves otherwise, and harness children receive a private `TMPDIR` (#4133, #4128). |
@@ -733,7 +802,7 @@ Each row cost a lane at least once; the prose above carries the record.
 | Matching a flake on text that CI never prints | The unmatched CI output was noticed during review; the matcher test should have used a captured CI transcript. The flake matcher now keys on the classifier's actual output. |
 | Letting keyword-title lint contradict the repository convention | The title gate review found the contradiction; the title-convention test should have pinned the accepted form. The lint rule now follows the repository's title convention. |
 | Relaying a shard failure to a fixer without mirroring it on the PR | The fixer noticed the missing scope record; the scope-mirror hook should have rejected the handoff. The handoff path now records the scope on the PR before dispatch. |
-| Treating a repeatedly red advisory lane as harmless | The maintainer's retrospective found the 21% flake after a misleading PR draw; the advisory policy and newest-master comparison should have held the PR. `land.sh` now holds a PR-red/master-green advisory unless `ADVISORY_OK=1`. |
+| Treating a repeatedly red advisory lane as harmless | The maintainer's retrospective found the 21% flake after a misleading PR draw. The advisory policy and newest-master comparison should have held the PR. `merge-on-green.sh` now holds any advisory check red on the PR and green on master. `ADVISORY_OK='<lane>: <reason>'` must name the judgment; it refuses a bare `1`. #4540 (2026-10-17) and #4848 (2026-10-25) landed past such a red. |
 | Forgetting to arm the landing chain after a trailing fix | A later PR-GREEN event exposed that the fix was waiting unarmed; the trailing-fix command should have verified arming. Rule: after a trailing fix, arm `land.sh` in the same step (not yet mechanised). |
 | Accepting an identity trade-off without a complete timing-cell table | Cloud verification found primary-item loss after the trade-off was accepted from prose; the fixer's state table and review should have enumerated every timing cell. The brief now requires the complete state table before accepting the trade-off. |
 | Letting a scoped test exceed Vitest's default timeout | A repeated cloud review caught the timeout; the local targeted run should have exercised the test under its default timeout. Rule: a scoped review runs new tests under the default Vitest timeout before passing them (not yet mechanised). |
@@ -747,3 +816,37 @@ Each row cost a lane at least once; the prose above carries the record.
 | Adapting repository fixtures to a Plegma guard failure | Verify caught the harness-specific workaround; the fixture lane should have reported the environment block without changing repository tests. Plegma-guard fixture failures are now reported as environmental. |
 | Reading a piped command's exit status instead of its outcome record | A pending chain was reported as successful because `tail` returned zero; the landing check should have read the chain's own result. `land.sh` now prints `LAND-RESULT #N: <state> (rc=N)`, which callers must read. |
 | Routing a same-seam new defect to a weaker fixer after a prior round | The next verify found the same-seam defect after a Luna-high assignment; round routing should have selected Opus from the seam and round count. Rule: a new same-seam defect after two rounds goes to Opus (cloud fixer when the subscription is short) with the state table and model step first. |
+| Asking the maintainer whether to build or file a missing detection layer | The orchestrator owns the detection retrospective: it files the layer issue, or folds it into the same-seam PR, the same day, and tells the maintainer (maintainer, 2026-10-13). |
+| Sending a detector or governance-test round to a cheap model | The #4341 npx-pin scanner went to a Haiku round before the Opus-from-round-1 rule was re-read; check the routing bullets before every detector brief. |
+| Routing on the word "governance" instead of the risk | #4350 (a CodeQL pin-equality test) went to Opus as "governance authoring"; the Opus rule is for source-scanning detectors only. |
+| Leaving the `dist/` precondition undeclared | At least 5 lanes (#4417, #4418, the #4422 verify, the #4410 r1 review, the #4423 review F5) each ruled out the same 3 census reds that need `npm run build:dist` (2026-10-14). Mechanical: fail fast when a selected test needs `dist/` and it is missing or stale (#4436); `CLAUDE.md` names `npm run build:dist` for those files meanwhile |
+| A wait helper with a fixed wall-clock budget | `interleaving-kit` `waitFor` ran out at 3000 ms under CI load (run 38618401454, `tests/clients/fix-run-restore.test.ts:378`); the file passed alone and under 3 shuffle seeds, so the red read as a flake. Mechanical, filed as #4437 |
+| Briefing a worker to "report the size first" before a large migration | A worker cannot wait for a reply, so the #4432 fixer did the migration anyway (2026-10-14). A brief authorizes the conditional branch with its bound, or tells the worker to stop and hand back; `AGENTS.md` "Orchestration and delegated work" |
+| Naming a file by basename in a brief | "index.ts" meant `clients/lsp/index.ts`; a Haiku measurement pass searched the root `index.ts` and reported the #2052 comment missing (2026-10-14). Name every file by its repo path |
+| Sending a lane that must find its own failure space to Haiku | #4342 rounds 1 and 2 left three review findings (a wall-clock bound, a wrong offline premise, a 13-vs-20 population); a fresh Opus round with a state table passed verify first time (#4410 round 3). Haiku folds with a prescribed remedy (#4340, #4341, #4345, #4356, #4368, #4372, #4374, #4417) landed first try. Haiku takes only a prescribed change; `AGENTS.md` "Orchestration and delegated work" |
+| Listing a blast radius without the changed result's callers | #4411 round 3 changed `touchFile`'s result and the body omitted the cascade neighbour caller (`clients/dispatch/integration.ts:2139`), which then printed an uncaused "inconclusive" line every turn (review N2). `AGENTS.md` already requires `module_report` with `blastRadius: true` before and after; run it for the changed result and quote every caller, then read each one |
+| Leaving a ledger row reading as a remainder after a PR flips from `refs` to `closes` | The orchestrator's closes-check refused two lands (#4422, #4409) because the row still named a remainder after verify confirmed every criterion (2026-10-14). Mechanical, orchestrator tooling outside this repo: to be fixed in the orchestrator's land tooling, not by a repo check |
+| Linting the PR body only at the end of a round | #4423's advisory `PR body` check went red on 5 consecutive pushes in round 2 with the same passive-voice findings (2026-10-14); a push does not change the body, so the check re-read the unfixed one each time. Lint the body with `--lint-local` before the first push of a round (`docs/pi-lens-fixer.md` "Fix rounds") |
+| Concluding "no existing seam does this" from a search of your own call names | #4528 searched `notifyExternalFileChange\(` and missed six freshness modules in `clients/`; five detectors ended up wiring their own consumers (#4535). Search by primitive (`docs/pi-lens-fixer.md` "Before code"); the reviewer widens the query (`docs/pi-lens-reviewer.md`, #4536) |
+| Importing `dist/` from a script a workflow runs before any build | #4525's `scripts/assert-evaluated.mjs` reached `dist/` through `lib/clean-signal.mjs`, so `tool-smoke-prs` would fail on every refresh PR. #4531 pins the import graph with a test and plants |
+| Pinning workflow step shell as text instead of running it | #4531 r1: four mutations of the Swift, APFS and handshake shell survived, including deleting `set +e`. Run the extracted step shell against stubs in a test |
+| Filing gap after gap on one mechanism without an audit | Eleven freshness gaps went into #4532 before anyone asked why there were eleven; the cause was one missing fan-out (#4535). Three issues on one mechanism open a consolidation audit (`AGENTS.md` "Orchestration and delegated work") |
+| Landing with an unresolved bot review thread | #4548 and #4558 merged with open Greptile threads (2026-10-17); each one's disposition arrived or never did, and nothing held the land. Every bot thread gets a disposition reply and is resolved before the merge (step 1 and step 4 of "The loop, per PR") |
+| Pushing a worker tree on a stale "failed" settlement | The #4575 r5 settlement read as failed while its resumed turn was live and about to push (plegma #752). The orchestrator's push-verify now refuses a tree with a live agent process, and its wait loop takes a `turnId`. |
+| Settling a fix round with unpushed commits | #4582 r1 settled with the commits still local and nobody noticed (plegma #753). The settlement hook now prints `UNPUSHED` or `DIRTY` for the tree it just settled. |
+| Switching `closes` to `refs` through a raw `gh pr edit` body edit | The #4581 land was refused because commit `d068be947` still closed #4488. `pr-body.sh` now refuses a body that drops a commit's close keyword, and the orchestrator guard denies raw body edits. |
+| Reading an empty DeepSeek turn as a worker stall and resuming it | Four resumes on one backend exhausted the balance (plegma #751). Two empty turns on one backend mean check the backend or the quota before any resume. |
+| Proving a workflow floor with a test that matched the step's shell text | The step's exit code was never checked, and the body claimed a shared helper had not landed (#4584 review F1/F3). The reviewer caught both under the existing tautological-test and reuse-the-seam rules, and the round moves the case to `tests/scripts/floor-steps-executed.test.ts`. |
+| Taking a local `vitest --shard=3/5` soak as CI's shard 3 | The shard never contained the target file, so four runs were wasted (#4488). The soak now asserts the target is in the set it recovered from CI's own job log before it runs. |
+| Trusting fixers and reviewers to read the bot threads on their own | Greptile threads and code-scanning alerts reached a round only when the orchestrator relayed them (#4566, #4575). The role contracts now carry a conditional read-and-dispose rule; a missing bot review is never evidence, and the reviewer's own pass stands alone. |
+| Leaving the PR watcher down after a context compaction | #4594 sat conflicting with nobody told (2026-10-18). An orchestrator hook now marks a compacted or resumed session and denies tool calls until the watcher runs again. |
+| Resuming a review or fix round without `passthrough: ["gh"]` | A workspace override drops the inherited passthrough (plegma #762), so the #4593 verifier ran with `gh` unauthenticated and could not read CI or threads. The orchestrator's delegate guard refuses such a round. |
+| Pushing to a PR branch while a fix round is queued against its old head | Merging master into #4594 staled the queued round's lease; the worker pushed a diverged copy to its handle branch (plegma #723). The orchestrator's push-verify refuses while a round still publishes to that branch. |
+| Resuming a reviewer without naming the deliverable | The resumed verifies of #4575 and #4593 inherited report names that did not match the brief, so the hand-back missed the report. Every resumed round names its `deliverables` explicitly. |
+| Calling an issue "blocked on a release" without reproducing it on master | #4554 waited on a release; 58 runs on master did not reproduce it, and it closed crediting #4563. Reproduce on master before naming a blocker. |
+| Bolding a residual bullet (`- **p3 (LOW, live 0):**`) under `## Accepted residuals` | The tracker parser read only a bare `p3`, so #4832's three residuals were recorded as "none" (2026-10-25). `known-gap-add.sh` now reads the bold form, pinned by its test case (g) |
+| Planning a tracker layout before measuring the platform's limits | An 11-issue pinned split was proposed and dispatched; GitHub pins 3 issues per repository, and the assumed 65k body cap was already exceeded by #4626 at 91k (2026-10-25). Measure the limit first, then plan |
+| Pasting the `claude-lane.sh` header into a brief | The header began `Worktree (created, ...):`, the brief guard wants `Worktree:`, and two dispatches were refused (2026-10-25). The header now starts with `Worktree:`, pinned by `test-claude-lane-header.sh` |
+| Linting a PR body in the main checkout | The main checkout sits on another branch, so citations resolved against the wrong tree; three edits needed a hand-built head tree (2026-10-25). `pr-body.sh edit` without `--tree` now builds a temp tree at the PR head |
+| Guessing issue labels (`area:ci`, `area:formal`, `chore`) | Three filings were refused, and the refusal listed only priority labels (2026-10-25). `file-issue.sh` now lists the known type, area and priority labels |
+| Reaping a lane whose issue is closed while its ledger row is live | Two maintainer-ordered lanes on closed issues (#4714, #4691) were flagged for TaskStop (2026-10-25). `agent-reap.sh` now skips a closed issue with a live ledger row |

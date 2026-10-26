@@ -21,10 +21,6 @@ vi.mock("../../../clients/latency-logger.js", async (importActual) => ({
 	>()),
 	logLatency,
 }));
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 const FILE = "C:/repo/main.ts";
@@ -75,6 +71,7 @@ function makeClient(delayMs: number, serverId: string) {
 		getDiagnosticsVersionForPath: vi.fn((p: string) => stamps.get(p) ?? 0),
 		getDiagnostics: vi.fn(() => []),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {}),
 			change: vi.fn(async () => {}),
 			close: vi.fn(async () => {}),
@@ -101,11 +98,14 @@ describe("touchFile push-wait settle marker", () => {
 		seen.push(reason);
 	};
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		seen = [];
 		process.on("unhandledRejection", onUnhandled);
 		vi.useFakeTimers();
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		logLatency.mockReset();

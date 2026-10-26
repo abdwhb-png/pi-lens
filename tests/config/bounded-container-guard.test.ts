@@ -1,9 +1,10 @@
 /** Registered-or-fail guard for long-lived container growth (#2981). */
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { Lang, parse } from "@ast-grep/napi";
 import { describe, expect, it } from "vitest";
+import { parseNodes, parseRoot, walkAst } from "../support/ast-census.js";
 import {
 	auditRegistry,
 	listSourceFiles,
@@ -13,6 +14,7 @@ import {
 	scanSessionStateCandidates,
 	shippedContainerSourceRoots,
 } from "../support/session-state-scan.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const ROOT = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -27,10 +29,22 @@ const BOUNDED_HELPERS = new Set([
 ]);
 // Content-keyed, so an exemption must be re-confirmed after an edit.
 const FINITE_REASONS: Readonly<Record<string, string>> = {
+	// #4483: files whose pre-edit linter capture is still running. Each capture
+	// adds its own file before its linters run and deletes it in `finally`.
+	"clients/dispatch/integration.ts#preEditCaptureFacts:3fc075f7":
+		"one key per pre-edit capture still running; the capture deletes its own key in finally once its linters settle (each runner has its own spawn timeout)",
+	// #4403 round 5 (V1): the primaries whose cascade "no language server
+	// answered" line was delivered. Keyed by LSP server id, written only for a
+	// primary a delivered line named, and cleared at session_start.
+	"clients/cascade-format.ts#cascadeCarrySuffix:369e7dcc":
+		"keys are LSP server ids from the server catalog (finite, ~60), one per primary whose line was delivered this session; cleared by resetDispatchBaselines",
 	// #2372: one adapter per live LSPService identity; WeakMap keys are the
 	// bounded process-local service population and entries die with the service.
 	"clients/lsp/capabilities.ts#1e3511a9":
 		"adapter cache is keyed by live LSPService objects and reclaimed with them; it cannot retain path or user-key growth",
+	// #4496: one literal requirement per loaded ast-grep rule object.
+	"clients/dispatch/runners/ast-grep-literal-anchors.ts#satisfied:c607e2fd":
+		"WeakMap keyed by the YamlRule objects the rule loaders cache; entries are reclaimed with those objects, so it cannot grow with files, paths or sessions",
 	// #3968: the runner-id identity leaf — written once per runner definition
 	// that enters a `RunnerRegistry` through `register` (the dispatch
 	// registry's own population, finite and ~50 today), never per file, per
@@ -61,31 +75,13 @@ type Site = {
 	keyAxis: KeyAxis;
 };
 
-function walk(node: any, visit: (node: any) => void): void {
-	visit(node);
-	for (const child of node.children()) walk(child, visit);
-}
-
-/**
- * One parse and ONE pre-order walk per source text. Every predicate below
- * reads this document-ordered node array instead of parsing and walking the
- * tree itself.
- *
- * #3058: the predicates used to take the source STRING, so `scan()` re-parsed
- * and re-walked each whole file up to six times per container occurrence --
- * 302 occurrences over 121 files, ~1,800 whole-file passes. An
- * `@ast-grep/napi` root holds a native tree-sitter arena and every
- * `children()` call materialises a NAPI handle per node, none of which V8
- * accounts for and so none of which it ever feels pressure to collect.
- * Measured 9,207 MB peak RSS against 62 MB of V8 heap. Passing the node array
- * makes the per-call pass structurally impossible to re-introduce: a
- * predicate has no source string to parse and no root to walk.
- */
-export function parseNodes(source: string): any[] {
-	const nodes: any[] = [];
-	walk(parse(Lang.TypeScript, source).root(), (node) => nodes.push(node));
-	return nodes;
-}
+// The one parse and pre-order walk live in `tests/support/ast-census.ts`
+// (#4606 S0), shared with the eviction sweep. Every predicate below reads the
+// document-ordered node array `parseNodes` returns instead of parsing or
+// walking a tree itself: #3058 measured the alternative (a source STRING per
+// predicate, ~1,800 whole-file passes, 9,207 MB peak RSS against 62 MB of V8
+// heap). Keep the predicates on nodes; the seam's own test rejects a second
+// traversal in this file.
 
 function identifier(node: any): string | undefined {
 	return node?.kind() === "identifier" ? node.text() : undefined;
@@ -215,7 +211,7 @@ function axisName(node: any): KeyAxis {
 
 export function determineKeyAxis(expression: string | undefined): KeyAxis {
 	if (!expression) return "undetermined";
-	const root = parse(Lang.TypeScript, expression).root();
+	const root = parseRoot(expression);
 	const expressionNode = root.namedChildren()[0]?.namedChildren()[0];
 	if (
 		!["identifier", "member_expression", "subscript_expression"].includes(
@@ -224,10 +220,10 @@ export function determineKeyAxis(expression: string | undefined): KeyAxis {
 	)
 		return "undetermined";
 	let axis: KeyAxis = "undetermined";
-	walk(root, (node) => {
+	walkAst(root, (node) => {
 		if (
 			axis !== "undetermined" ||
-			!["identifier", "property_identifier"].includes(node.kind())
+			!["identifier", "property_identifier"].includes(String(node.kind()))
 		)
 			return;
 		axis = axisName(node);
@@ -282,7 +278,7 @@ export function hasNamedSizeComparison(nodes: any[], name: string): boolean {
 						"do_statement",
 					].includes(parent.kind())
 				) {
-					walk(parent, (child) => {
+					walkAst(parent, (child) => {
 						if (
 							child.kind() !== "call_expression" ||
 							child.field("function")?.kind() !== "member_expression" ||
@@ -467,7 +463,12 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 		"clients/runtime-tool-result.ts#inFlightPipelines:5e20396b",
 		"clients/sgconfig.ts#materializeMergedRuleDir:8f144dfd",
 		"clients/tool-policy.ts#GRADLE_BUILD_LOGIC_SCAN_MAX_ENTRIES:2ff14979",
-		"clients/diagnostic-dispositions.ts#06a3807d",
+		// #4701 F1: `deferredByCwd` (the session `defer` map, keyed by normalized
+		// cwd) replaced the flat `deferredThisSession` Set, so the identity moved
+		// with the declaration. Still bounded the same way: `resetDeferredDispositions`
+		// clears it whole at `session_start`, and an entry exists only for a project
+		// holding a `defer` the agent marked this session.
+		"clients/diagnostic-dispositions.ts#1c05c89b",
 		"clients/review-graph/builder.ts#recordPersistFailure:59b74176",
 		"clients/tree-sitter-client.ts#TYPESCRIPT_SQL_KNOWN_PACKAGES:95dcb590",
 		"clients/widget-state.ts#wireWidgetDispositionSubscriber:d8f1770a",
@@ -478,10 +479,9 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 		"clients/degradation-ledger.ts#OVERFLOW_KIND:8cf106dd",
 		"clients/degradation-ledger.ts#groups:218d12e1",
 		"clients/degradation-ledger.ts#onceKeys:b8a478d9",
-		"clients/dispatch/auxiliary-lsp.ts#enabledAuxiliaryLspServerIds:dd3e2650",
+		"clients/dispatch/auxiliary-lsp.ts#isEnabledByConfiguration:dd3e2650",
 		"clients/dispatch/collect-later-tier.ts#COLLECT_LATER_THRESHOLD_MS:6c0d1b78",
 		"clients/dispatch/dispatcher.ts#latencyReports:4e5c8069",
-		"clients/dispatch/integration.ts#getCascadeSessionStats:0753e302",
 		"clients/dispatch/integration.ts#isConfirmedTouch:0876b7da",
 		"clients/dispatch/runners/biome-check.ts#parseBiomeJson:753add48",
 		"clients/dispatch/runners/eslint.ts#makeEslintProbe:a15d1054",
@@ -507,14 +507,15 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 		"clients/latency-logger.ts#_setRecentPhasesForTest:b45c37e8",
 		"clients/latency-logger.ts#resetCurrentPhaseForSession:9d04beac",
 		"clients/lsp/client.ts#safeSendNotification:63295a96",
-		"clients/lsp/server.ts#PROJECT_BOUNDARY_MARKERS:cc0fbaf1",
+		"clients/lsp/server.ts#PYTHON_EXTENSIONS:cc0fbaf1",
 		"clients/lsp/server.ts#loggedRootCeilingClamps:3e9d9204",
 		"clients/lsp/server.ts#DIRECT_LSP_NEGATIVE_TTL_MS:6f24c89e",
 		"clients/lsp/server.ts#directLspCommandUnavailableUntil:831316db",
 		"clients/opaque-mutation-scan.ts#getOpaqueBaselineStore:feff1538",
 		"clients/opaque-mutation-scan.ts#isGitWorktree:97337298",
 		"clients/package-manager.ts#PROBE_TIMEOUT_MS:ab1ec294",
-		"clients/package-manager.ts#execArgs:b2cb6a98",
+		// #4530: `globalBinDirCache` keys on trust scope × manager, 2 × 4 keys.
+		"clients/package-manager.ts#updateArgs:e94f9156",
 		"clients/package-root.ts#1f3e8efd",
 		"clients/project-lens-config.ts#configCache:77a8d572",
 		"clients/project-report.ts#computeDeadWeight:7e342b62",
@@ -540,7 +541,9 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 		"clients/smells-rollup.ts#shouldCheckSmellsThisTurn:a818f473",
 		"clients/word-index.ts#updateWordIndexDocument:8b5e4c9e",
 		"clients/word-index.ts#isCanonicalWordIndexToken:99249de8",
-		"clients/word-index.ts#deserializeWordIndex:d6d64306",
+		// #4583: `buildStatuses`, the one-entry-per-resolved-cwd build guard; the
+		// content key moved with the publish seam that now sits above it.
+		"clients/word-index.ts#notifyWordIndexPublished:d6d64306",
 		// WeakMap entries are content-keyed by live WordIndex objects and are
 		// reclaimed with those objects; this is not an unbounded path-key cache.
 		"clients/word-index.ts#serializedWordIndexCaches:baa74c91",
@@ -564,15 +567,19 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 		registered,
 	);
 
-	it("scans a live population and accounts for every unbounded occurrence", () => {
-		expect(
-			[...audit.problems, ...registryDrift],
-			[...audit.problems, ...registryDrift].join("\n\n"),
-		).toEqual([]);
-		expect(
-			admissions.filter((site) => site.keyAxis === "undetermined").length,
-		).toBeGreaterThan(0);
-	});
+	it(
+		"scans a live population and accounts for every unbounded occurrence",
+		() => {
+			expect(
+				[...audit.problems, ...registryDrift],
+				[...audit.problems, ...registryDrift].join("\n\n"),
+			).toEqual([]);
+			expect(
+				admissions.filter((site) => site.keyAxis === "undetermined").length,
+			).toBeGreaterThan(0);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 	it("determines axes from key expressions and keeps unknown keys honest", () => {
 		expect(determineKeyAxis("filePath")).toBe("file path");
 		expect(determineKeyAxis("request.filePath")).toBe("file path");
@@ -581,149 +588,169 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 		expect(determineKeyAxis("opaqueKey")).toBe("undetermined");
 		expect(determineKeyAxis("`file`")).toBe("undetermined");
 	});
-	it("reports a stale finite exemption independently of the live site population", () => {
-		const staleReasons = {
-			"fixture.ts#deleted:ef567890":
-				"finite vocabulary removed from the source",
-		};
-		expect(
-			exemptionsForAudit(
-				[
-					{
-						key: "fixture.ts#live:abcd1234",
-						detail: "fixture.ts:1",
-						name: "cache",
-						verdict: 5,
-						keyExpression: "filePath",
-						keyAxis: "file path",
-					},
-				],
-				staleReasons,
-			),
-		).toBe(staleReasons);
-		const audit = auditRegistry({
-			sweepName: "fixture bounded container guard",
-			flagged: ["fixture.ts#live:abcd1234"],
-			registered: ["fixture.ts#live:abcd1234"],
-			exemptions: {
-				...staleReasons,
-			},
-		});
-		expect(audit.staleExemptions).toEqual(["fixture.ts#deleted:ef567890"]);
-		expect(audit.problems.join("\n")).toContain("no longer flags");
-	});
-	it("scans and audits a container below a nested tools source root", () => {
-		const root = fs.mkdtempSync(
-			path.join(process.cwd(), ".probe-bounded-root-"),
-		);
-		try {
-			const toolsRoot = path.join(root, "tools");
-			const nested = path.join(toolsRoot, "nested", "cache.ts");
-			fs.mkdirSync(path.dirname(nested), { recursive: true });
-			fs.writeFileSync(
-				nested,
-				[
-					"const cache = new Map<string, string>();",
-					"export function record(filePath: string): void {",
-					'\tcache.set(filePath, "seen");',
-					"}",
-				].join("\n") + "\n",
-			);
-			const result = scan([toolsRoot]);
-			expect(result.scanned).toBe(1);
-			expect(result.sites).toHaveLength(1);
-			const [site] = result.sites;
-			expect(site.detail).toMatch(/tools\/nested\/cache\.ts:1$/);
+	it(
+		"reports a stale finite exemption independently of the live site population",
+		() => {
+			const staleReasons = {
+				"fixture.ts#deleted:ef567890":
+					"finite vocabulary removed from the source",
+			};
+			expect(
+				exemptionsForAudit(
+					[
+						{
+							key: "fixture.ts#live:abcd1234",
+							detail: "fixture.ts:1",
+							name: "cache",
+							verdict: 5,
+							keyExpression: "filePath",
+							keyAxis: "file path",
+						},
+					],
+					staleReasons,
+				),
+			).toBe(staleReasons);
 			const audit = auditRegistry({
-				sweepName: "nested tools fixture bounded container guard",
-				flagged: result.sites,
-				registered: result.sites.map(({ key }) => key),
-				scannedCount: result.scanned,
-				minScanned: 1,
-				minFlagged: 1,
+				sweepName: "fixture bounded container guard",
+				flagged: ["fixture.ts#live:abcd1234"],
+				registered: ["fixture.ts#live:abcd1234"],
+				exemptions: {
+					...staleReasons,
+				},
 			});
-			expect(audit.problems, audit.problems.join("\n\n")).toEqual([]);
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
-	it("does not read runtime scratch below the walked root (#4097)", () => {
-		// Named recurrence (#4097): a root-level `index.ts` makes the scan walk
-		// the whole repo root, `.probe-home/` included, and a sibling worker
-		// removing its `worker-home-*` mid-walk killed the file with ENOENT. A
-		// class declared only below `.probe-home/` must not enter the class
-		// index either: the walk never reads scratch.
-		const root = fs.mkdtempSync(
-			path.join(process.cwd(), ".probe-bounded-root-"),
-		);
-		try {
-			const scratch = path.join(root, ".probe-home", "worker-home-a");
-			fs.mkdirSync(scratch, { recursive: true });
-			fs.writeFileSync(
-				path.join(scratch, "planted.ts"),
-				"export class PlantedHomeClass {}\n",
+			expect(audit.staleExemptions).toEqual(["fixture.ts#deleted:ef567890"]);
+			expect(audit.problems.join("\n")).toContain("no longer flags");
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+	it(
+		"scans and audits a container below a nested tools source root",
+		() => {
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-bounded-root-"),
 			);
-			const entry = path.join(root, "index.ts");
-			fs.writeFileSync(
-				entry,
-				"const planted = new PlantedHomeClass();\nexport const touch = () => planted;\n",
+			try {
+				const toolsRoot = path.join(root, "tools");
+				const nested = path.join(toolsRoot, "nested", "cache.ts");
+				fs.mkdirSync(path.dirname(nested), { recursive: true });
+				fs.writeFileSync(
+					nested,
+					[
+						"const cache = new Map<string, string>();",
+						"export function record(filePath: string): void {",
+						'\tcache.set(filePath, "seen");',
+						"}",
+					].join("\n") + "\n",
+				);
+				const result = scan([toolsRoot]);
+				expect(result.scanned).toBe(1);
+				expect(result.sites).toHaveLength(1);
+				const [site] = result.sites;
+				expect(site.detail).toMatch(/tools\/nested\/cache\.ts:1$/);
+				const audit = auditRegistry({
+					sweepName: "nested tools fixture bounded container guard",
+					flagged: result.sites,
+					registered: result.sites.map(({ key }) => key),
+					scannedCount: result.scanned,
+					minScanned: 1,
+					minFlagged: 1,
+				});
+				expect(audit.problems, audit.problems.join("\n\n")).toEqual([]);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+	it(
+		"does not read runtime scratch below the walked root (#4097)",
+		() => {
+			// Named recurrence (#4097): a root-level `index.ts` makes the scan walk
+			// the whole repo root, `.probe-home/` included, and a sibling worker
+			// removing its `worker-home-*` mid-walk killed the file with ENOENT. A
+			// class declared only below `.probe-home/` must not enter the class
+			// index either: the walk never reads scratch.
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-bounded-root-"),
 			);
-			expect(scan([entry]).scanned).toBe(0);
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
-	it("retains arbitrary dynamic identifiers in the real AST population", () => {
-		const root = fs.mkdtempSync(
-			path.join(process.cwd(), ".probe-bounded-dynamic-key-"),
-		);
-		try {
-			const toolsRoot = path.join(root, "tools");
-			const fixture = path.join(toolsRoot, "dynamic-key.ts");
-			fs.mkdirSync(toolsRoot, { recursive: true });
-			fs.writeFileSync(
-				fixture,
-				[
-					"const cache = new Map<string, string>();",
-					"export function record(key: string, value: string): void {",
-					"\tcache.set(key, value);",
-					"}",
-				].join("\n") + "\n",
+			try {
+				const scratch = path.join(root, ".probe-home", "worker-home-a");
+				fs.mkdirSync(scratch, { recursive: true });
+				fs.writeFileSync(
+					path.join(scratch, "planted.ts"),
+					"export class PlantedHomeClass {}\n",
+				);
+				const entry = path.join(root, "index.ts");
+				fs.writeFileSync(
+					entry,
+					"const planted = new PlantedHomeClass();\nexport const touch = () => planted;\n",
+				);
+				expect(scan([entry]).scanned).toBe(0);
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+	it(
+		"retains arbitrary dynamic identifiers in the real AST population",
+		() => {
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-bounded-dynamic-key-"),
 			);
-			const result = scan([toolsRoot]);
-			const [site] = result.sites;
-			expect(result.scanned).toBe(1);
-			expect(site?.detail).toMatch(/tools\/dynamic-key\.ts:1$/);
-			expect(site?.keyAxis).toBe("undetermined");
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
-	it("retains a raw module-scope dynamic write and classifies its key as unknown", () => {
-		const root = fs.mkdtempSync(
-			path.join(process.cwd(), ".probe-bounded-raw-dynamic-key-"),
-		);
-		try {
-			const toolsRoot = path.join(root, "tools");
-			const fixture = path.join(toolsRoot, "raw-dynamic-key.ts");
-			fs.mkdirSync(toolsRoot, { recursive: true });
-			fs.writeFileSync(
-				fixture,
-				[
-					"const cache = new Map<string, string>();",
-					"cache.set(key, value);",
-				].join("\n") + "\n",
+			try {
+				const toolsRoot = path.join(root, "tools");
+				const fixture = path.join(toolsRoot, "dynamic-key.ts");
+				fs.mkdirSync(toolsRoot, { recursive: true });
+				fs.writeFileSync(
+					fixture,
+					[
+						"const cache = new Map<string, string>();",
+						"export function record(key: string, value: string): void {",
+						"\tcache.set(key, value);",
+						"}",
+					].join("\n") + "\n",
+				);
+				const result = scan([toolsRoot]);
+				const [site] = result.sites;
+				expect(result.scanned).toBe(1);
+				expect(site?.detail).toMatch(/tools\/dynamic-key\.ts:1$/);
+				expect(site?.keyAxis).toBe("undetermined");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+	it(
+		"retains a raw module-scope dynamic write and classifies its key as unknown",
+		() => {
+			const root = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-bounded-raw-dynamic-key-"),
 			);
-			const result = scan([toolsRoot]);
-			const [site] = result.sites;
-			expect(result.scanned).toBe(1);
-			expect(site?.detail).toMatch(/tools\/raw-dynamic-key\.ts:1$/);
-			expect(site?.keyExpression).toBe("key");
-			expect(site?.keyAxis).toBe("undetermined");
-		} finally {
-			fs.rmSync(root, { recursive: true, force: true });
-		}
-	});
+			try {
+				const toolsRoot = path.join(root, "tools");
+				const fixture = path.join(toolsRoot, "raw-dynamic-key.ts");
+				fs.mkdirSync(toolsRoot, { recursive: true });
+				fs.writeFileSync(
+					fixture,
+					[
+						"const cache = new Map<string, string>();",
+						"cache.set(key, value);",
+					].join("\n") + "\n",
+				);
+				const result = scan([toolsRoot]);
+				const [site] = result.sites;
+				expect(result.scanned).toBe(1);
+				expect(site?.detail).toMatch(/tools\/raw-dynamic-key\.ts:1$/);
+				expect(site?.keyExpression).toBe("key");
+				expect(site?.keyAxis).toBe("undetermined");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 	it("requires a content-keyed exemption to survive an unchanged occurrence", () => {
 		const key = "fixture.ts#cache:abcd1234";
 		const site = {
@@ -741,53 +768,61 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 			finiteReason({ ...site, key: "fixture.ts#cache:changed" }, reasons),
 		).toBeUndefined();
 	});
-	it("keeps the five verdicts visible", () => {
-		const counts = new Map<Verdict, number>();
-		for (const site of result.sites)
-			counts.set(site.verdict, (counts.get(site.verdict) ?? 0) + 1);
-		expect(result.scanned).toBeGreaterThanOrEqual(100);
-		expect(counts.get(1) ?? 0).toBeGreaterThan(0);
-	});
-	it("accepts semantic bounds and rejects read-only TTL prose", () => {
-		expect(
-			hasBoundedConstructor(
-				parseNodes("const cache = new BoundedFifoMap<string, string>(8);"),
-				"cache",
-			),
-		).toBe(true);
-		expect(
-			hasNamedSizeComparison(
-				parseNodes(
-					"const cache = new Map<string, string>(); if (cache.size > MAX) log(cache.size);",
+	it(
+		"keeps the five verdicts visible",
+		() => {
+			const counts = new Map<Verdict, number>();
+			for (const site of result.sites)
+				counts.set(site.verdict, (counts.get(site.verdict) ?? 0) + 1);
+			expect(result.scanned).toBeGreaterThanOrEqual(100);
+			expect(counts.get(1) ?? 0).toBeGreaterThan(0);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+	it(
+		"accepts semantic bounds and rejects read-only TTL prose",
+		() => {
+			expect(
+				hasBoundedConstructor(
+					parseNodes("const cache = new BoundedFifoMap<string, string>(8);"),
+					"cache",
 				),
-				"cache",
-			),
-		).toBe(false);
-		expect(
-			hasNamedSizeComparison(
-				parseNodes(
-					'const cache = new Map<string, string>(); const MAX = 8; if (cache.size > MAX) cache.delete("x");',
+			).toBe(true);
+			expect(
+				hasNamedSizeComparison(
+					parseNodes(
+						"const cache = new Map<string, string>(); if (cache.size > MAX) log(cache.size);",
+					),
+					"cache",
 				),
-				"cache",
-			),
-		).toBe(true);
-		expect(
-			hasDeletingTimer(
-				parseNodes(
-					'const cache = new Map<string, string>(); setTimeout(() => cache.delete("x"), TTL);',
+			).toBe(false);
+			expect(
+				hasNamedSizeComparison(
+					parseNodes(
+						'const cache = new Map<string, string>(); const MAX = 8; if (cache.size > MAX) cache.delete("x");',
+					),
+					"cache",
 				),
-				"cache",
-			),
-		).toBe(true);
-		expect(
-			hasDeletingTimer(
-				parseNodes(
-					'const cache = new Map<string, string>(); const TTL = 8; if (Date.now() > TTL) cache.get("x");',
+			).toBe(true);
+			expect(
+				hasDeletingTimer(
+					parseNodes(
+						'const cache = new Map<string, string>(); setTimeout(() => cache.delete("x"), TTL);',
+					),
+					"cache",
 				),
-				"cache",
-			),
-		).toBe(false);
-	});
+			).toBe(true);
+			expect(
+				hasDeletingTimer(
+					parseNodes(
+						'const cache = new Map<string, string>(); const TTL = 8; if (Date.now() > TTL) cache.get("x");',
+					),
+					"cache",
+				),
+			).toBe(false);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 	it("keeps dynamic keys and values visible as undetermined", () => {
 		expect(
 			isGrowthShapedContainer(
@@ -829,16 +864,20 @@ describe("#2981 long-lived containers are bounded or admitted", () => {
 			),
 		).toBe(false);
 	});
-	it("does not let comments or strings manufacture a bound", () => {
-		const prose = [
-			"const cache = new Map<string, string>();",
-			"// cache.size > MAX and setTimeout(() => cache.delete(key))",
-			'const note = "cache.size > MAX; cache.delete(key)";',
-		].join("\n");
-		const proseNodes = parseNodes(prose);
-		expect(hasNamedSizeComparison(proseNodes, "cache")).toBe(false);
-		expect(hasDeletingTimer(proseNodes, "cache")).toBe(false);
-	});
+	it(
+		"does not let comments or strings manufacture a bound",
+		() => {
+			const prose = [
+				"const cache = new Map<string, string>();",
+				"// cache.size > MAX and setTimeout(() => cache.delete(key))",
+				'const note = "cache.size > MAX; cache.delete(key)";',
+			].join("\n");
+			const proseNodes = parseNodes(prose);
+			expect(hasNamedSizeComparison(proseNodes, "cache")).toBe(false);
+			expect(hasDeletingTimer(proseNodes, "cache")).toBe(false);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 	it("keeps the registry and population floors mutation-sensitive", () => {
 		const floor = auditRegistry({
 			sweepName: "fixture bounded container guard",

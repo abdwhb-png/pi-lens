@@ -20,6 +20,10 @@ export declare function verdictMatches(
 ): boolean;
 export declare function describeVerdict(verdict: TlcVerdict): string;
 export declare function listModelConfigs(root: string): string[];
+export declare function ensureJar(
+	jarArg: string | undefined,
+	root: string,
+): Promise<string>;
 export declare function resolveJarPath(
 	jarArg: string | undefined,
 	root: string,
@@ -44,10 +48,82 @@ export declare function parseShardArg(raw: string | undefined): {
 	index: number;
 	total: number;
 };
-export declare function selectShard<Item>(
-	configs: readonly Item[],
+/** The measured per-config cost table's file, repo-relative (#4672). */
+export declare const MODEL_COSTS_FILE: string;
+export type ModelCosts = {
+	root: string;
+	files: Record<string, number>;
+	max: number;
+	/** The recorded TLC distinct-state counts (#4714); absent before it. */
+	states?: Record<string, number>;
+};
+export declare function loadModelCosts(root: string): {
+	files: Record<string, number>;
+	max: number;
+	states: Record<string, number>;
+};
+/** TLC's distinct-state count from its statistics line, or null (#4714). */
+export declare function parseDistinctStates(output: string): number | null;
+/** How far a config's distinct-state count may grow past its recorded count. */
+export declare const STATE_COUNT_FACTOR: number;
+export type StateCountJump = {
+	id: string;
+	recorded: number;
+	observed: number;
+};
+/** The runs that grew past their recorded count by more than `factor`. */
+export declare function stateCountJumps(
+	outcomes: ReadonlyArray<{ id: string; distinctStates: number | null }>,
+	states: Record<string, number>,
+	factor?: number,
+): StateCountJump[];
+export declare function formatStateJump(
+	jump: StateCountJump,
+	factor?: number,
+): string;
+/** The configs that ran with a count but have no recorded count yet. */
+export declare function unrecordedStateCounts(
+	outcomes: ReadonlyArray<{ id: string; distinctStates: number | null }>,
+	states: Record<string, number>,
+): string[];
+/**
+ * The cost table's key for `config`: its path under `root`, always posix.
+ * `pathImpl` defaults to the host `path`; pass `path.win32` to dose one
+ * (AGENTS.md shape 35).
+ */
+export declare function modelCostId(
+	root: string,
+	config: string,
+	pathImpl?: { relative: (from: string, to: string) => string; sep: string },
+): string;
+/** `costs` null keeps the round-robin split; a table packs by measured cost. */
+export declare function selectShard(
+	configs: readonly string[],
 	shard: { index: number; total: number },
-): Item[];
+	costs?: ModelCosts | null,
+): string[];
+/**
+ * How far this run's own ORDERING may disagree with the table's before the
+ * balance line calls the table stale. Scale-free on purpose: one shard's summed
+ * ratio carries the runner's speed, the ranking does not.
+ */
+export declare const MODEL_COST_RANK_TOLERANCE: number;
+/**
+ * The balance line. `observed` maps `modelCostId` keys to the seconds this run
+ * measured, so the second half compares the projection with the run: the
+ * summed ratio as an advisory number, the rank agreement as the drift verdict.
+ */
+export declare function formatShardBalance(args: {
+	configs: readonly string[];
+	total: number;
+	costs: ModelCosts;
+	observed?: Map<string, number> | Record<string, number> | null;
+	rankTolerance?: number;
+}): string;
+export declare function resolveShardCosts(
+	argv: readonly string[],
+	root: string,
+): ModelCosts | null;
 export declare function parseCliArgs(argv: readonly string[]): {
 	jar?: string;
 	concurrency?: string;

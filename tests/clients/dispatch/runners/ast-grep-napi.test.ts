@@ -5,6 +5,7 @@ import {
 	makeRunnerCtx,
 	type RunnerCtxOverrides,
 } from "../../../support/runner-ctx.js";
+import { installLspServiceDouble } from "../../../support/lsp-service-seam.js";
 import { setupTestEnvironment } from "../../test-utils.js";
 
 const { mockAuxiliaryLspPublished, fsSyncOverrides } = vi.hoisted(() => ({
@@ -18,10 +19,6 @@ const { mockAuxiliaryLspPublished, fsSyncOverrides } = vi.hoisted(() => ({
 		statSync: undefined as ((...args: unknown[]) => unknown) | undefined,
 		readFileSync: undefined as ((...args: unknown[]) => unknown) | undefined,
 	},
-}));
-
-vi.mock("../../../../clients/lsp/capabilities.js", () => ({
-	hasAuxiliaryLspPublishedForRoot: mockAuxiliaryLspPublished,
 }));
 
 vi.mock("node:fs", async () => {
@@ -99,6 +96,18 @@ function mockWorkingSgLoad(): void {
 	}));
 }
 
+/**
+ * `vi.resetModules()` re-evaluates `clients/lsp/index.ts`, whose import-time
+ * configure replaces the lifecycle, so the double goes in AFTER every reset and
+ * before the subject import (tests/support/lsp-service-seam.ts, step 2).
+ */
+async function resetModulesWithAuxiliaryPublished(): Promise<void> {
+	vi.resetModules();
+	await installLspServiceDouble({
+		hasServerPublishedForFileRoot: mockAuxiliaryLspPublished,
+	});
+}
+
 // Every case installs its own @ast-grep/napi double; resetModules does not clear
 // the mock registry, so drop it after each case (#2883).
 afterEach(() => {
@@ -107,8 +116,8 @@ afterEach(() => {
 });
 
 describe("ast-grep-napi runner — LSP supersede gate (#239 Phase 2)", () => {
-	beforeEach(() => {
-		vi.resetModules();
+	beforeEach(async () => {
+		await resetModulesWithAuxiliaryPublished();
 		mockAuxiliaryLspPublished.mockResolvedValue(false);
 	});
 
@@ -172,8 +181,8 @@ describe("ast-grep-napi runner — LSP supersede gate (#239 Phase 2)", () => {
 });
 
 describe("ast-grep-napi runner — late-auxiliary dedupe (#2324 F3/R2)", () => {
-	beforeEach(() => {
-		vi.resetModules();
+	beforeEach(async () => {
+		await resetModulesWithAuxiliaryPublished();
 		mockAuxiliaryLspPublished.mockResolvedValue(false);
 	});
 
@@ -263,8 +272,8 @@ describe("ast-grep-napi runner — late-auxiliary dedupe (#2324 F3/R2)", () => {
 });
 
 describe("ast-grep-napi runner — skip paths", () => {
-	beforeEach(() => {
-		vi.resetModules();
+	beforeEach(async () => {
+		await resetModulesWithAuxiliaryPublished();
 	});
 
 	it("skips unsupported file extensions", async () => {
@@ -369,7 +378,7 @@ describe("ast-grep-napi runner — skip paths", () => {
 
 describe("ast-grep-napi rule-policy scan admission", () => {
 	it("does not evaluate a rule on an ignored path", async () => {
-		vi.resetModules();
+		await resetModulesWithAuxiliaryPublished();
 		const findAll = vi.fn().mockReturnValue([]);
 		vi.doMock("../../../../clients/dispatch/ast-grep-catalog.js", () => ({
 			buildEffectiveAstGrepCatalog: () => {
@@ -411,6 +420,11 @@ describe("ast-grep-napi runner — real shipped rule", () => {
 		// Earlier skip-path cases install per-test NAPI mocks. Replace any
 		// lingering doMock registration with the package's real implementation.
 		vi.doMock("@ast-grep/napi", async (importOriginal) => importOriginal());
+		// The seam install evaluates the facade's graph, so it comes AFTER the
+		// unmocks above: a graph evaluated under a lingering mock caches it.
+		await installLspServiceDouble({
+			hasServerPublishedForFileRoot: mockAuxiliaryLspPublished,
+		});
 		const env = setupTestEnvironment("pi-lens-ast-grep-real-rule-");
 		try {
 			const filePath = path.join(env.tmpDir, "file.ts");
@@ -438,7 +452,7 @@ describe("ast-grep-napi runner — real shipped rule", () => {
 
 describe("ast-grep-napi runner — metadata", () => {
 	it("has expected runner id and appliesTo", async () => {
-		vi.resetModules();
+		await resetModulesWithAuxiliaryPublished();
 		const mod =
 			await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
 		const runner = mod.default;
@@ -453,9 +467,155 @@ describe("ast-grep-napi runner — metadata", () => {
 // caught was that no test referenced the record at all, so the branch could
 // be deleted with the suite staying green.
 describe("ast-grep-napi runner — aux-runner-findings-lost degradation (#2324 R2-C)", () => {
-	beforeEach(() => {
-		vi.resetModules();
+	beforeEach(async () => {
+		await resetModulesWithAuxiliaryPublished();
 		mockAuxiliaryLspPublished.mockResolvedValue(false);
+	});
+
+	// Recurrence (#4484 round 4, verify note on Gate B): the skip carried no
+	// reason, so `reachedNoVerdict` read it as no verdict, and a napi blocker
+	// recorded before the ast-grep server first published stayed recorded
+	// after the agent fixed it.
+	it("states why Gate B skips, so the skip is a verdict (#4484 round 4)", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-gate-b-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			mockAuxiliaryLspPublished.mockResolvedValue(true);
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const { reachedNoVerdict } =
+				await import("../../../../clients/dispatch/types.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(result.skipReason).toBe("covered-by-primary");
+			expect(reachedNoVerdict(result)).toBe(false);
+			// Round 7 (P33): the verdict names the lane it relies on.
+			expect(result.coveredBy).toEqual({
+				runnerId: "lsp",
+				serverId: "ast-grep",
+			});
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Recurrence (#4484 round 5, verify note on Gate B): with an earlier
+	// touch's coverage still pending, the server is silent for these bytes,
+	// yet the skip stated `covered-by-primary`. That verdict retired napi's
+	// recorded blockers while nothing had read the current bytes.
+	it("states no reason when Gate B skips on pending coverage, so the skip is no verdict (#4484 round 5)", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-gate-b-pending-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			const pendingAux =
+				await import("../../../../clients/lsp/pending-aux-coverage.js");
+			pendingAux.resetPendingAuxiliaryCoverage();
+			pendingAux.markPendingAuxiliaryCoverage(filePath, ["ast-grep"]);
+			mockAuxiliaryLspPublished.mockResolvedValue(true);
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const { reachedNoVerdict } =
+				await import("../../../../clients/dispatch/types.js");
+			const result = await mod.default.run(
+				createCtx(filePath, { hasTool: async () => false }) as any,
+			);
+			expect(result.status).toBe("skipped");
+			expect(result.skipReason).toBeUndefined();
+			expect(result.coveredBy).toBeUndefined();
+			expect(reachedNoVerdict(result)).toBe(true);
+			pendingAux.resetPendingAuxiliaryCoverage();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Recurrence (#4484 round 6, verify probe P27): Gate B's verdict counted
+	// for napi's whole record, but on a ranged edit the server's gate withholds
+	// a blocking finding outside the edit, under another identity. A napi
+	// blocker outside the edit retired while still on disk.
+	it("says Gate B's verdict covers only the edit on a ranged dispatch, and the whole file otherwise (#4484 round 6)", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-gate-b-scope-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\nconst y = 2;\n");
+			mockAuxiliaryLspPublished.mockResolvedValue(true);
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const ranged = await mod.default.run(
+				createCtx(filePath, {
+					hasTool: async () => false,
+					blockingOnly: true,
+					modifiedRanges: [{ start: 2, end: 2 }],
+				}) as any,
+			);
+			expect(ranged.skipReason).toBe("covered-by-primary");
+			expect(ranged.editScopedVerdict).toBe(true);
+			const whole = await mod.default.run(
+				createCtx(filePath, {
+					hasTool: async () => false,
+					blockingOnly: true,
+				}) as any,
+			);
+			expect(whole.skipReason).toBe("covered-by-primary");
+			expect(whole.editScopedVerdict).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// Recurrence (#4509, probes P42 and P38): under Gate B napi never ran
+	// again, and the server's copy has another identity, so a napi blocker
+	// the carry could not place (a fixed line after a cut-off edit, an
+	// unaligned write) stayed pinned for the session. While napi holds a
+	// recorded blocker it runs, and its run names the lane it overlaps.
+	it("runs under Gate B while it holds a recorded blocker, naming the covering lane (#4509)", async () => {
+		const env = setupTestEnvironment("pi-lens-ast-grep-gate-b-recorded-");
+		try {
+			const filePath = path.join(env.tmpDir, "file.ts");
+			fs.writeFileSync(filePath, "const x = 1;\n");
+			mockAuxiliaryLspPublished.mockResolvedValue(true);
+			mockWorkingSgLoad();
+			const mod =
+				await import("../../../../clients/dispatch/runners/ast-grep-napi.js");
+			const recorded = await mod.default.run(
+				createCtx(filePath, {
+					hasTool: async () => false,
+					recordedRunnerIds: new Set(["ast-grep-napi"]),
+				}) as any,
+			);
+			expect(recorded.status).not.toBe("skipped");
+			expect(recorded.coveredBy).toEqual({
+				runnerId: "lsp",
+				serverId: "ast-grep",
+			});
+			// Another runner's record does not make napi run.
+			const other = await mod.default.run(
+				createCtx(filePath, {
+					hasTool: async () => false,
+					recordedRunnerIds: new Set(["lsp"]),
+				}) as any,
+			);
+			expect(other.skipReason).toBe("covered-by-primary");
+			// With the server not covering the file, a run names no lane.
+			mockAuxiliaryLspPublished.mockResolvedValue(false);
+			const alone = await mod.default.run(
+				createCtx(filePath, {
+					hasTool: async () => false,
+					recordedRunnerIds: new Set(["ast-grep-napi"]),
+				}) as any,
+			);
+			expect(alone.status).not.toBe("skipped");
+			expect(alone.coveredBy).toBeUndefined();
+		} finally {
+			env.cleanup();
+		}
 	});
 
 	it("records the loss when Gate B skips on a leftover pending pair", async () => {
@@ -581,8 +741,8 @@ describe("ast-grep-napi runner — aux-runner-findings-lost degradation (#2324 R
 // after a manually pre-marked pair), so no-opping the producer write left
 // every existing test green — this pins the write directly.
 describe("ast-grep-napi runner — napiFallbackCoveredSince producer pin (#2324 R3-B)", () => {
-	beforeEach(() => {
-		vi.resetModules();
+	beforeEach(async () => {
+		await resetModulesWithAuxiliaryPublished();
 		mockAuxiliaryLspPublished.mockResolvedValue(false);
 	});
 

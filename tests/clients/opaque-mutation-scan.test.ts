@@ -1,8 +1,7 @@
 /**
  * Opaque-mutation recovery (#2000 phase 2) — real-filesystem tests: actual
  * stat walks over temp trees and real diffs. This file pins the SEAM contract
- * only; handler wiring coverage (real node -e / python -c child writes through
- * handleToolCall/handleToolResult) is PR-B scope and NOT covered here.
+ * only; handler wiring coverage uses the same real child-process path.
  */
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
@@ -72,6 +71,12 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { runHandlerExpectingNoThrow } from "../support/handler-verdict.js";
+import { FAKE_LSP_SERVER_PATH } from "../support/fake-lsp-server.js";
+import { hashDiagnosticContent } from "../../clients/lsp/diagnostic-binding.js";
+import {
+	setProjectTrustState,
+	resetProjectTrust,
+} from "../../clients/project-trust.js";
 
 let tmpDir = "";
 
@@ -565,6 +570,113 @@ describe("recoverOpaqueChangesViaGit (real git repo)", () => {
 			}
 		},
 	);
+
+	it(
+		"keeps opaque recovery dispatch and LSP resync with read guard disabled (#4534)",
+		{ timeout: 15_000 },
+		async () => {
+			const previousDataDir = process.env.PILENS_DATA_DIR;
+			process.env.PILENS_DATA_DIR = path.join(repoDir, "data");
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = repoDir;
+			runtime.setTelemetryIdentity({ sessionId: "opaque-no-read-guard" });
+			const target = path.join(repoDir, "src", "no-read-guard.ts");
+			const command = "opaque-codemod --rewrite-source";
+			const noReadGuard = () => true;
+			const { runPipeline } = await import("../../clients/pipeline.js");
+			vi.mocked(runPipeline).mockClear();
+			const { initLSPConfig } = await import("../../clients/lsp/config.js");
+			const lsp = await import("../../clients/lsp/index.js");
+			setProjectTrustState("trusted");
+			fs.mkdirSync(path.join(repoDir, ".pi-lens"), { recursive: true });
+			fs.writeFileSync(path.join(repoDir, "package.json"), "{}\n", "utf8");
+			fs.writeFileSync(
+				path.join(repoDir, ".pi-lens", "lsp.json"),
+				JSON.stringify({
+					servers: {
+						fake: {
+							name: "fake",
+							extensions: [".ts"],
+							command: process.execPath,
+							args: [FAKE_LSP_SERVER_PATH],
+							rootMarkers: ["package.json"],
+						},
+					},
+					disabledServers: ["typescript", "deno", "ast-grep", "typos"],
+				}),
+				"utf8",
+			);
+			await initLSPConfig(repoDir);
+			const service = lsp.getLSPService();
+			try {
+				fs.writeFileSync(target, "before recovery\n", "utf8");
+				await service.touchFile(target, fs.readFileSync(target, "utf8"), {
+					diagnostics: "none",
+					clientScope: "primary",
+					source: "lsp_sync",
+				});
+				await runHandlerExpectingNoThrow(() =>
+					handleToolCall({
+						event: {
+							toolName: "bash",
+							input: { command },
+							toolCallId: "4534-no-read-guard",
+						},
+						ctx: { cwd: repoDir },
+						lensEnabled: true,
+						getFlag: noReadGuard,
+						dbg: () => {},
+						runtime,
+						cacheManager: new CacheManager(false),
+						ensureLSPConfigInitialized: async () => {},
+						updateLspStatus: () => {},
+						resetLSPService: () => {},
+					} as Parameters<typeof handleToolCall>[0]),
+				);
+				fs.writeFileSync(target, "recovered\n", "utf8");
+				await handleToolResult({
+					event: {
+						toolName: "bash",
+						input: { command },
+						toolCallId: "4534-no-read-guard",
+						content: [{ type: "text", text: "done" }],
+					},
+					getFlag: noReadGuard,
+					dbg: () => {},
+					runtime,
+					readGuard: runtime.readGuard,
+					cacheManager: new CacheManager(false),
+					biomeClient: {},
+					ruffClient: {},
+					testRunnerClient: {},
+					metricsClient: {},
+					resetLSPService: () => {},
+					agentBehaviorRecord: () => [],
+					formatBehaviorWarnings: () => "",
+				} as unknown as Parameters<typeof handleToolResult>[0]);
+
+				expect(
+					vi
+						.mocked(runPipeline)
+						.mock.calls.some(([ctx]) =>
+							String(ctx?.filePath).endsWith("no-read-guard.ts"),
+						),
+				).toBe(true);
+				await service.documentSymbol(target);
+				expect(service.getTrackedContent(target, repoDir)?.hash).toBe(
+					hashDiagnosticContent("recovered\n"),
+				);
+				expect(runtime.readGuard.exportAuthorship().written).not.toContain(
+					normalizeFilePath(target),
+				);
+			} finally {
+				await service.shutdown();
+				resetProjectTrust();
+				if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+				else process.env.PILENS_DATA_DIR = previousDataDir;
+			}
+		},
+	);
 });
 
 describe("partial-recognition recovery (#2000 PR-B)", () => {
@@ -689,6 +801,9 @@ describe("partial-recognition recovery (#2000 PR-B)", () => {
 			// Delta assertion: latency.log is append-only and shared, so assert
 			// on the LINES THIS RUN ADDED - a plain toContain would stay green
 			// forever after the first ever emission (review round-2 P2).
+			// Drain before the baseline (#4381): a row this test already queued would
+			// land after it and read as one this run added.
+			await flushLatencyLog();
 			const latencyPath = path.join(getGlobalPiLensDir(), "latency.log");
 			const beforeLines = new Set(
 				fs.existsSync(latencyPath)
@@ -732,6 +847,9 @@ describe("partial-recognition recovery (#2000 PR-B)", () => {
 				// Break the probe AFTER the baseline: git status now exits nonzero.
 				fs.writeFileSync(path.join(repoDir, ".git", "index"), "corrupt");
 
+				// Drain before the baseline (#4381): a row this test already queued would
+				// land after it and read as one this run added.
+				await flushLatencyLog();
 				const latencyPath = path.join(getGlobalPiLensDir(), "latency.log");
 				const beforeLines = new Set(
 					fs.existsSync(latencyPath)
@@ -1020,6 +1138,9 @@ describe("failed Git integration recovery dispatch", () => {
 
 				const runtime = integrationRuntime("failed-integration-telemetry");
 				const command = "git merge incoming";
+				// Drain before the baseline (#4381): a row this test already queued would
+				// land after it and read as one this run added.
+				await flushLatencyLog();
 				const latencyPath = path.join(getGlobalPiLensDir(), "latency.log");
 				const beforeLines = new Set(
 					fs.existsSync(latencyPath)
@@ -1074,6 +1195,9 @@ describe("failed Git integration recovery dispatch", () => {
 
 				const runtime = integrationRuntime("failed-integration-unknown-pair");
 				const command = "git merge incoming";
+				// Drain before the baseline (#4381): a row this test already queued would
+				// land after it and read as one this run added.
+				await flushLatencyLog();
 				const latencyPath = path.join(getGlobalPiLensDir(), "latency.log");
 				const beforeLines = new Set(
 					fs.existsSync(latencyPath)
@@ -1145,6 +1269,7 @@ describe("parallel bash calls (#4137)", () => {
 		hasBlockers: false,
 		isError: false,
 		fileModified: false,
+		checkedClean: false,
 	};
 
 	async function pipelineMock() {
@@ -1163,6 +1288,7 @@ describe("parallel bash calls (#4137)", () => {
 		hasBlockers: true,
 		isError: false,
 		fileModified: false,
+		checkedClean: false,
 		inlineBlockerSummary: STOP,
 		inlineBlockerSources: ["biome"],
 		inlineBlockerLines: [2],
@@ -1732,6 +1858,46 @@ describe("parallel bash calls (#4137)", () => {
 		expect(runtime.hasResolvedBlockerFiles()).toBe(true);
 	});
 
+	// #4484: the same changed bytes, but the opaque run's own observation
+	// still holds the blocker (its channel is withheld, #3226, so it reports
+	// the count, not the blocker). Before #4484 the record was cleared and
+	// turn end said "Resolved" for a blocker still on the file.
+	it("keeps an authored blocker when an opaque run of changed bytes still observes it (#4484)", async () => {
+		(await pipelineMock()).mockImplementation(async (ctx) => {
+			const inlineBlockerFileContent = analysedBytes(String(ctx.filePath));
+			return ctx.allowAutonomousWriters === false
+				? { ...NO_BLOCKERS, inlineBlockerFileContent, currentBlockerCount: 1 }
+				: { ...BLOCKED, inlineBlockerFileContent };
+		});
+		const runtime = newRuntime("changed-bytes-still-blocked");
+		const recognized = "echo 'debugger;' >> par-a.ts";
+		await runHandlerExpectingNoThrow(() =>
+			handleToolCall(callDeps(runtime, recognized, "recognized")),
+		);
+		await runHandlerExpectingNoThrow(() =>
+			handleToolCall(callDeps(runtime, opaqueCommand(), "opaque")),
+		);
+		append("par-a.ts", "debugger;\n");
+		await handleToolResult(resultDeps(runtime, recognized, "recognized"));
+		append("par-a.ts", "export const y = 2;\n");
+		await handleToolResult(resultDeps(runtime, opaqueCommand(), "opaque"));
+		expect(await dispatchLog()).toEqual([
+			["par-a.ts", true],
+			["par-a.ts", false],
+		]);
+		expect(blockerFiles(runtime)).toEqual(["par-a.ts"]);
+		expect(resolvedFiles(runtime)).toEqual([]);
+		expect(
+			getDegradationSummary().find((g) => g.kind === "blocker-clear-refused")
+				?.latestReasons,
+		).toEqual([
+			{
+				subject: keyOf("par-a.ts"),
+				reason: expect.stringContaining("still observed a blocker"),
+			},
+		]);
+	});
+
 	// VERIFY_4159 N2: the other half of the in-flight rank. An opaque claim
 	// that arrives while an authored run of the same bytes is in flight joins
 	// it. Running beside it would analyse bytes the agent authored a second
@@ -1789,5 +1955,241 @@ describe("parallel bash calls (#4137)", () => {
 		await Promise.all([recognizedResult, opaqueResult]);
 		expect(await dispatchLog()).toEqual([["par-a.ts", true]]);
 		expect(blockerFiles(runtime)).toEqual(["par-a.ts"]);
+	});
+});
+
+// #4732: every tool call that is not known to be read-only or structured is
+// diffed, not only bash. Recurrence prevented: the `toolName === "bash"` gate
+// skipped every other writer, so a file another extension's tool, an MCP tool
+// or the outer codemode call wrote was never dispatched.
+describe("opaque recovery for tools other than bash (#4732)", () => {
+	let repoDir = "";
+	let dataDir = "";
+
+	beforeEach(() => {
+		repoDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-opaque-any-"));
+		initCommittedRepo(repoDir, { "seed.ts": "export const seed = 1;\n" });
+		// Outside the repo: project data under it would read as changed files.
+		dataDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-opaque-any-data-"),
+		);
+		process.env.PILENS_DATA_DIR = dataDir;
+		resetDegradationLedger();
+		resetOpaqueMutationState();
+		clearLastAnalyzedStateCache();
+	});
+
+	afterEach(() => {
+		delete process.env.PILENS_DATA_DIR;
+		removeTempDirSync(repoDir);
+		removeTempDirSync(dataDir);
+	});
+
+	function newRuntime(sessionId: string): RuntimeCoordinator {
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = repoDir;
+		runtime.setTelemetryIdentity({ sessionId });
+		return runtime;
+	}
+
+	function callDeps(
+		runtime: RuntimeCoordinator,
+		event: Record<string, unknown>,
+	): Parameters<typeof handleToolCall>[0] {
+		return {
+			event,
+			ctx: { cwd: repoDir },
+			lensEnabled: true,
+			getFlag: () => false,
+			dbg: () => {},
+			runtime,
+			cacheManager: new CacheManager(false),
+			ensureLSPConfigInitialized: async () => {},
+			updateLspStatus: () => {},
+			resetLSPService: () => {},
+		} as Parameters<typeof handleToolCall>[0];
+	}
+
+	function resultDeps(
+		runtime: RuntimeCoordinator,
+		event: Record<string, unknown>,
+		agentBehaviorRecord: (toolName: string, filePath?: string) => [] = () => [],
+	): Parameters<typeof handleToolResult>[0] {
+		return {
+			event: { content: [{ type: "text", text: "ok" }], ...event },
+			getFlag: () => false,
+			dbg: () => {},
+			runtime,
+			cacheManager: new CacheManager(false),
+			biomeClient: {},
+			ruffClient: {},
+			testRunnerClient: {},
+			metricsClient: {},
+			resetLSPService: () => {},
+			agentBehaviorRecord,
+			formatBehaviorWarnings: () => "",
+			readGuard: runtime.readGuard,
+		} as unknown as Parameters<typeof handleToolResult>[0];
+	}
+
+	/** Each dispatch as [file, authored], in order. */
+	async function dispatchLog() {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		return vi
+			.mocked(runPipeline)
+			.mock.calls.map(([ctx]) => [
+				path.basename(String(ctx?.filePath)),
+				ctx?.allowAutonomousWriters === true,
+			]);
+	}
+
+	async function clearDispatches() {
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		vi.mocked(runPipeline).mockClear();
+	}
+
+	/** The change-log receipts for `file`, by source. */
+	function receiptsFor(file: string): string[] {
+		const logPath = getProjectChangeLogPath(repoDir);
+		if (!fs.existsSync(logPath)) return [];
+		return fs
+			.readFileSync(logPath, "utf8")
+			.split("\n")
+			.filter((line) => line.trim())
+			.map((line) => JSON.parse(line) as ProjectChangeEntry)
+			.filter((entry) => path.basename(entry.filePath) === file)
+			.map((entry) => entry.source ?? "");
+	}
+
+	it("dispatches a file an unknown extension tool wrote without naming it", async () => {
+		const runtime = newRuntime("4732-ext");
+		await clearDispatches();
+		const event = {
+			toolName: "some_ext_tool",
+			toolCallId: "ext-1",
+			input: { query: "generate" },
+		};
+		await runHandlerExpectingNoThrow(() =>
+			handleToolCall(callDeps(runtime, event)),
+		);
+		fs.writeFileSync(path.join(repoDir, "ext-out.ts"), "export const e = 1;\n");
+		await handleToolResult(resultDeps(runtime, event));
+		expect(await dispatchLog()).toEqual([["ext-out.ts", false]]);
+		expect(receiptsFor("ext-out.ts")).toEqual(["opaque-script"]);
+	});
+
+	// The tool names a RELATIVE path pi-lens recorded no attribution for, so the
+	// result used to return at `path_attribution_missing` before any recovery.
+	// The read guard is off, so the #2430 net arms no observation and the diff
+	// is the only answer (`observed-mutation-integration` pins the case where
+	// the net settles the named path).
+	it("dispatches a write by a tool whose relative path field has no attribution", async () => {
+		const runtime = newRuntime("4732-relative");
+		await clearDispatches();
+		const event = {
+			toolName: "ext_writer",
+			toolCallId: "rel-1",
+			input: { path: "rel-out.ts", content: "export const r = 1;\n" },
+		};
+		const noReadGuard = (flag: string) => flag === "no-read-guard";
+		await runHandlerExpectingNoThrow(() =>
+			handleToolCall({ ...callDeps(runtime, event), getFlag: noReadGuard }),
+		);
+		fs.writeFileSync(path.join(repoDir, "rel-out.ts"), "export const r = 1;\n");
+		const recordedPaths: Array<string | undefined> = [];
+		await handleToolResult({
+			...resultDeps(runtime, event, (_tool, filePath) => {
+				recordedPaths.push(filePath);
+				return [];
+			}),
+			getFlag: noReadGuard,
+		});
+		expect(await dispatchLog()).toEqual([["rel-out.ts", false]]);
+		// The path itself is still refused (#1642): the guess against the
+		// session root is never recorded as the file this call wrote.
+		expect(recordedPaths).toEqual([undefined]);
+	});
+
+	// The outer codemode call's window holds every nested call's writes. A
+	// nested write already analysed with authorship is not dispatched or
+	// receipted a second time; a nested unknown tool's write is its own
+	// capture, and the outer recovery does not repeat it either.
+	it("adds no dispatch or receipt at the outer codemode result", async () => {
+		const runtime = newRuntime("4732-codemode");
+		await clearDispatches();
+		const outer = {
+			toolName: "codemode",
+			toolCallId: "cm-1",
+			input: { code: "await write(...); await gen()" },
+		};
+		const nestedWrite = {
+			toolName: "write",
+			toolCallId: "cm-1/1",
+			parentToolCallId: "cm-1",
+			input: {
+				path: path.join(repoDir, "nested.ts"),
+				content: "export const n = 1;\n",
+			},
+		};
+		const nestedExt = {
+			toolName: "gen_tool",
+			toolCallId: "cm-1/2",
+			parentToolCallId: "cm-1",
+			input: { spec: "x" },
+		};
+		await runHandlerExpectingNoThrow(() =>
+			handleToolCall(callDeps(runtime, outer)),
+		);
+		await runHandlerExpectingNoThrow(() =>
+			handleToolCall(callDeps(runtime, nestedWrite)),
+		);
+		fs.writeFileSync(path.join(repoDir, "nested.ts"), "export const n = 1;\n");
+		await handleToolResult(resultDeps(runtime, nestedWrite));
+		await runHandlerExpectingNoThrow(() =>
+			handleToolCall(callDeps(runtime, nestedExt)),
+		);
+		fs.writeFileSync(path.join(repoDir, "gen-out.ts"), "export const g = 1;\n");
+		await handleToolResult(resultDeps(runtime, nestedExt));
+		const beforeOuter = await dispatchLog();
+		await handleToolResult(resultDeps(runtime, outer));
+		expect({
+			beforeOuter,
+			afterOuter: await dispatchLog(),
+			nestedReceipts: receiptsFor("nested.ts"),
+			genReceipts: receiptsFor("gen-out.ts"),
+		}).toEqual({
+			beforeOuter: [
+				["nested.ts", true],
+				["gen-out.ts", false],
+			],
+			afterOuter: [
+				["nested.ts", true],
+				["gen-out.ts", false],
+			],
+			nestedReceipts: ["agent-write"],
+			genReceipts: ["opaque-script"],
+		});
+	});
+
+	it("dispatches each of two parallel unknown tools' writes once", async () => {
+		const runtime = newRuntime("4732-parallel");
+		await clearDispatches();
+		const calls = ["par-x", "par-y"].map((id) => ({
+			toolName: "some_ext_tool",
+			toolCallId: id,
+			input: { query: id },
+		}));
+		for (const call of calls)
+			await runHandlerExpectingNoThrow(() =>
+				handleToolCall(callDeps(runtime, call)),
+			);
+		fs.writeFileSync(path.join(repoDir, "par-x.ts"), "export const x = 1;\n");
+		fs.writeFileSync(path.join(repoDir, "par-y.ts"), "export const y = 1;\n");
+		for (const call of calls) await handleToolResult(resultDeps(runtime, call));
+		expect((await dispatchLog()).sort()).toEqual([
+			["par-x.ts", false],
+			["par-y.ts", false],
+		]);
+		expect(lostBaselines()).toEqual([]);
 	});
 });

@@ -51,6 +51,14 @@ schema slice does not change server launch behavior.
 }
 ```
 
+`initializationOptions` take the shape the server itself reads. rust-analyzer
+reads them flat (`check`, `cargo`), as above. pyright and basedpyright read
+only their pulled settings, so nest the override under the section they ask
+for: `{ "python": { "analysis": { "typeCheckingMode": "strict" } } }`. pi-lens
+answers each
+`workspace/configuration` request from that section of the merged options and
+returns `{}` for a section the options do not carry.
+
 An override may also provide an experimental launcher `command` and `env`.
 The built-in server ID and strategy remain in force; only the launcher is
 replaced, and project-sourced launcher fields follow the same pi trust gate.
@@ -221,6 +229,17 @@ once no matter which spelling each file uses. Migrating does not change the
 answer, staying un-migrated is not a way around the denial, and a half-migrated
 pair of files merges rather than one clobbering the other.
 
+Denying a file's **language server** (its primary, such as `json` or
+`typescript`) leaves that file unchecked for the language itself. Every
+diagnostics route then reports a file with no findings as **unconfirmed**, not
+clean, with a "Primary LSP (…): not available" note that says it is disabled in
+config. On write-time checks the note appears once per server per session, and
+a later write of such a file shows a one-line "unconfirmed" status instead of
+"clean". When the denied server has a fallback (`deno` for `typescript`) that
+cannot start either, the note says so. Cross-file (cascade) checks name the
+server once per session. Auxiliary scanners such as `typos` still run and
+report their own findings.
+
 Two rules make the rest of the table unambiguous:
 
 - **The search stops at `$HOME`.** pi-lens never reads a config file in your
@@ -336,5 +355,6 @@ produced — so a session's config posture is visible without the detail.
 - `docs/globalconfig.md` — every key of `~/.pi-lens/config.json`, in detail.
 - `docs/settings.md` — the CLI flags and what they map to.
 - `docs/environment-variables.md` — the `PI_LENS_*` tier.
+- `docs/features.md` — the Python interpreter and syntax-level declarations pi-lens reads from a project (`VIRTUAL_ENV`, `requires-python`, `target-version`, `.python-version`).
 - `docs/public-api-stability.md` — what `x-stability`, the `PILENS_CFG_*` codes,
   and the deprecation windows commit pi-lens to.

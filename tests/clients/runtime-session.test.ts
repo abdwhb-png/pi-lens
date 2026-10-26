@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import * as path from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	getGlobalPiLensDir,
 	getProjectDataDir,
@@ -26,7 +26,10 @@ import {
 	loadPiLensProjectConfig,
 	type PiLensProjectConfig,
 } from "../../clients/project-lens-config.js";
-import { handleSessionStart } from "../../clients/runtime-session.js";
+import {
+	handleSessionStart,
+	STARTUP_TASK_DEFER_MS,
+} from "../../clients/runtime-session.js";
 import { _resetSlowFsForTests } from "../../clients/slow-fs.js";
 import { _resetSubagentModeForTests } from "../../clients/subagent-mode.js";
 import {
@@ -35,7 +38,8 @@ import {
 	useTrackedTempDirs,
 } from "./test-utils.js";
 import { waitFor as waitForCondition } from "./interleaving-kit.js";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { dataDir444 } from "../support/data-dir-4-4-4.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 // `handleSessionStart` queues project-snapshot body writes that can recreate a
 // fixture root after its `env.cleanup()`; the drain lets them land first.
@@ -59,18 +63,6 @@ function findDeadPid(): number {
 // afterEach cleanup would then race). supportsLSP:false short-circuits the warm
 // before it opens any file.
 const mockTouchFile = vi.fn(async () => undefined);
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	getLSPService: vi.fn(() =>
-		makeLspServiceDouble({
-			supportsLSP: () => false,
-			touchFile: mockTouchFile,
-		}),
-	),
-}));
-
 // #1767: every test in this file drives `handleSessionStart`, which does
 // real synchronous fs work (detectProjectLanguageProfile, scanProjectRules)
 // plus fire-and-forget background scans (`scheduleStartupScans`) that reach
@@ -134,7 +126,8 @@ function writeConfig(filePath: string, config: Record<string, unknown>): void {
 
 async function runSessionStart(
 	mode: "full" | "quick" | "minimal",
-	setup?: (tmpDir: string) => void,
+	/** May return the spelling of the project root the host starts with. */
+	setup?: (tmpDir: string) => string | void,
 	overrides: {
 		astGrepEnsure?: () => Promise<boolean>;
 		scanExports?: () => Promise<Map<string, string>>;
@@ -146,7 +139,7 @@ async function runSessionStart(
 	} = {},
 ) {
 	const env = setupTestEnvironment("pi-lens-runtime-session-");
-	setup?.(env.tmpDir);
+	const ctxCwd = setup?.(env.tmpDir) || env.tmpDir;
 	// #810 root cause: in "full" mode with a package.json present,
 	// scheduleStartupScans (clients/runtime-session.ts) fires "todo" and
 	// "word-index" as fire-and-forget background tasks (setImmediate) that do
@@ -199,7 +192,7 @@ async function runSessionStart(
 
 	try {
 		const sessionDeps = withResidentBootstrap({
-			ctxCwd: env.tmpDir,
+			ctxCwd,
 			getFlag: (name: string) => {
 				const override = overrides.getFlag?.(name);
 				if (override !== undefined) return override;
@@ -222,7 +215,7 @@ async function runSessionStart(
 				clearStartupScanInFlight: (name: string) => {
 					inFlightScans.delete(name);
 				},
-				complexityBaselines: new Map(),
+				complexityBaselines: new Set(),
 				resetForSession: () => {},
 				projectRoot: "",
 				projectRulesScan: { hasCustomRules: false, rules: [] },
@@ -323,7 +316,66 @@ async function runSessionStart(
 	}
 }
 
+// The ast-grep-exports defer (STARTUP_TASK_DEFER_MS) is the one long real wait
+// these cases would otherwise sit through. The literal pins the delay: a longer
+// or removed defer reds the boundary checks in `runSessionStartPastExportsDefer`.
+const EXPORTS_DEFER_MS = 5400;
+
+const exportsTaskStarted = (dbg: { mock: { calls: unknown[][] } }): boolean =>
+	dbg.mock.calls.some(([msg]) =>
+		String(msg).includes("session_start task ast-grep-exports: start"),
+	);
+
+/**
+ * `runSessionStart` with setTimeout faked, stepped to the ast-grep-exports
+ * defer boundary by hand, then back on real timers. Only the timer pair is
+ * faked: the scans' fs reads and setImmediate ticks still run for real, and
+ * the settle loops below yield on setImmediate, never on a timer.
+ */
+async function runSessionStartPastExportsDefer(
+	...args: Parameters<typeof runSessionStart>
+): Promise<Awaited<ReturnType<typeof runSessionStart>>> {
+	vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+	const run = await runSessionStart(...args);
+	try {
+		const yieldTick = () =>
+			new Promise<void>((resolve) => setImmediate(resolve));
+		await waitForCondition(
+			() =>
+				run.dbg.mock.calls.some(
+					([msg]) =>
+						msg ===
+						`session_start task ast-grep-exports: scheduled deferMs=${EXPORTS_DEFER_MS}`,
+				),
+			Boolean,
+			{ yieldControl: yieldTick },
+		);
+		await vi.advanceTimersByTimeAsync(EXPORTS_DEFER_MS - 1);
+		await yieldTick();
+		expect(exportsTaskStarted(run.dbg)).toBe(false);
+		await vi.advanceTimersByTimeAsync(1);
+		await waitForCondition(() => exportsTaskStarted(run.dbg), Boolean, {
+			yieldControl: yieldTick,
+		});
+	} catch (error) {
+		await run.env.cleanup();
+		throw error;
+	} finally {
+		vi.useRealTimers();
+	}
+	return run;
+}
+
+// The service stub documented above `mockTouchFile`, installed for every case.
+beforeEach(async () => {
+	await installLspServiceDouble({
+		supportsLSP: () => false,
+		touchFile: mockTouchFile,
+	});
+});
+
 afterEach(() => {
+	vi.useRealTimers();
 	delete process.env.PI_LENS_STARTUP_MODE;
 });
 
@@ -335,7 +387,7 @@ it(
 			["writeConfig", "src/config.ts"],
 		]);
 		const scanExports = vi.fn(async () => exports);
-		const { env, astGrepEnsure, dbg } = await runSessionStart(
+		const { env, astGrepEnsure, dbg } = await runSessionStartPastExportsDefer(
 			"full",
 			(tmpDir) =>
 				createTempFile(
@@ -359,6 +411,76 @@ it(
 					),
 				{ timeout: HEAVY_IO_TIMEOUT_MS },
 			);
+		} finally {
+			await env.cleanup();
+		}
+	},
+	TEST_BUDGET_MS,
+);
+
+// #4352: the defer table is keyed by runTask names. A key that matches no task
+// ("ast-grep exports" for "ast-grep-exports") defers nothing, so the export scan
+// started on the next tick and froze the TUI on cold boot. One setImmediate turn
+// shows the difference: every next-tick scan has fired by then, while the 5400
+// ms defer has not elapsed. The eventual run is covered by the ast-grep export
+// path test above.
+it(
+	"defers ast-grep-exports by its taskDeferMs entry, not on the next tick (#4352)",
+	async () => {
+		const { env, astGrepEnsure, dbg } = await runSessionStart(
+			"full",
+			(tmpDir) =>
+				createTempFile(
+					tmpDir,
+					"package.json",
+					JSON.stringify({ type: "module" }),
+				),
+		);
+		try {
+			await new Promise((resolve) => setImmediate(resolve));
+			expect(dbg).not.toHaveBeenCalledWith(
+				expect.stringContaining("session_start task ast-grep-exports: start"),
+			);
+			expect(astGrepEnsure).not.toHaveBeenCalled();
+		} finally {
+			await env.cleanup();
+		}
+	},
+	TEST_BUDGET_MS,
+);
+
+// #4352 round 2: a defer-table key whose task was removed ("project index")
+// defers nothing and never runs. Every key must be a task session_start schedules,
+// and each key keeps its staggered delay. The real seam is the scheduled debug
+// line, which full-mode session_start emits for every task it starts.
+it(
+	"schedules every defer-table key with its staggered delay (#4352)",
+	async () => {
+		const { env, dbg } = await runSessionStart("full", (tmpDir) =>
+			createTempFile(
+				tmpDir,
+				"package.json",
+				JSON.stringify({ type: "module" }),
+			),
+		);
+		try {
+			await new Promise((resolve) => setImmediate(resolve));
+			const scheduled = new Map<string, number>();
+			for (const [msg] of dbg.mock.calls) {
+				const match =
+					/^session_start task (\S+): scheduled deferMs=(\d+)$/.exec(
+						String(msg),
+					);
+				if (match) scheduled.set(match[1], Number(match[2]));
+			}
+			for (const key of Object.keys(STARTUP_TASK_DEFER_MS)) {
+				expect(scheduled.has(key), `defer key ${key} is never scheduled`).toBe(
+					true,
+				);
+			}
+			expect(scheduled.get("call-graph")).toBe(5000);
+			expect(scheduled.get("codebase-model")).toBe(5200);
+			expect(scheduled.get("ast-grep-exports")).toBe(5400);
 		} finally {
 			await env.cleanup();
 		}
@@ -691,6 +813,46 @@ describe("fixture-loaded startup precedence", () => {
 		}
 	});
 
+	// RECURRENCE GUARDED: #4689 round 4. The data dir moved from a link
+	// spelling's name to the real path's; the copy of what an earlier version
+	// stored under the spelling must say once whether it carried everything.
+	for (const [label, blockCache, expected] of [
+		["copies every file", false, "the old directory is kept"],
+		["cannot copy a file", true, "could not be copied"],
+	] as const) {
+		it(`records once that adopting a link spelling's data dir ${label}`, async (ctx) => {
+			if (process.platform === "win32")
+				return ctx.skip("the win32 name never moved");
+			let alias = "";
+			const result = await runSessionStart("quick", (tmpDir) => {
+				alias = `${tmpDir}-alias`;
+				fs.symlinkSync(tmpDir, alias, "dir");
+				const dir = getProjectDataDir(tmpDir);
+				const spelled = dataDir444(path.dirname(dir), alias);
+				fs.mkdirSync(path.join(spelled, "cache"), { recursive: true });
+				fs.writeFileSync(path.join(spelled, "cache", "marker.json"), "{}");
+				if (blockCache) {
+					fs.mkdirSync(dir, { recursive: true });
+					fs.writeFileSync(path.join(dir, "cache"), "");
+				}
+				// The host starts under the link's spelling of the root.
+				return alias;
+			});
+			try {
+				const rows = getDegradationSummary().filter(
+					(entry) => entry.kind === "data_dir_migrated",
+				);
+				expect(rows).toHaveLength(1);
+				expect(rows[0]?.count).toBe(1);
+				expect(rows[0]?.latestReasons[0]?.reason).toContain(expected);
+				expect(rows[0]?.latestReasons[0]?.reason).not.toContain("/");
+			} finally {
+				fs.rmSync(alias, { force: true });
+				await result.env.cleanup();
+			}
+		});
+	}
+
 	// Recurrence (#1129 F9 and F3, review of d873c8d74): marking a tmp checkout
 	// ephemeral was silent, and nothing reaped a dead process's data dir.
 	it("records a tmp checkout's ephemeral data dir once and sweeps a dead process's dir at session start", async () => {
@@ -974,7 +1136,7 @@ describe(
 					astGrepEnsure,
 					knipAnalyze,
 					jscpdEnsure,
-				} = await runSessionStart("full", (tmpDir) => {
+				} = await runSessionStartPastExportsDefer("full", (tmpDir) => {
 					createTempFile(
 						tmpDir,
 						"package.json",
@@ -1029,7 +1191,7 @@ describe(
 					knipAnalyze,
 					jscpdEnsure,
 					dbg,
-				} = await runSessionStart("full", (tmpDir) => {
+				} = await runSessionStartPastExportsDefer("full", (tmpDir) => {
 					createTempFile(
 						tmpDir,
 						"package.json",
@@ -1148,7 +1310,7 @@ describe(
 							isCurrentSession: () => true,
 							markStartupScanInFlight: () => {},
 							clearStartupScanInFlight: () => {},
-							complexityBaselines: new Map(),
+							complexityBaselines: new Set(),
 							resetForSession: () => {},
 							projectRoot: "",
 							projectRulesScan: { hasCustomRules: false, rules: [] },
@@ -1253,7 +1415,7 @@ describe(
 							isCurrentSession: () => true,
 							markStartupScanInFlight: () => {},
 							clearStartupScanInFlight: () => {},
-							complexityBaselines: new Map(),
+							complexityBaselines: new Set(),
 							resetForSession: () => {},
 							projectRoot: "",
 							projectRulesScan: { hasCustomRules: false, rules: [] },
@@ -1357,7 +1519,7 @@ describe(
 							isCurrentSession: () => true,
 							markStartupScanInFlight: () => {},
 							clearStartupScanInFlight: () => {},
-							complexityBaselines: new Map(),
+							complexityBaselines: new Set(),
 							resetForSession: () => {},
 							projectRoot: "",
 							projectRulesScan: { hasCustomRules: false, rules: [] },
@@ -1440,7 +1602,7 @@ describe(
 				knipEnsure,
 				knipAnalyze,
 				jscpdEnsure,
-			} = await runSessionStart("full", (tmpDir) => {
+			} = await runSessionStartPastExportsDefer("full", (tmpDir) => {
 				createTempFile(
 					tmpDir,
 					"package.json",
@@ -1450,6 +1612,8 @@ describe(
 			});
 
 			try {
+				// Exactly once: the startup madge scan ensures madge; a deferred madge
+				// probe on top of it was the duplicate this test exists to catch.
 				await vi.waitFor(() => expect(depEnsure).toHaveBeenCalledTimes(1), {
 					timeout: HEAVY_IO_TIMEOUT_MS,
 				});

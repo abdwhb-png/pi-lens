@@ -20,6 +20,7 @@ import {
 	sweepScratchDirs,
 } from "../../scripts/lib/scratch-dir.mjs";
 import { removeTempDirSync } from "../clients/test-utils.js";
+import { readNdjsonRows } from "./ndjson-rows.js";
 import { isProcessAlive, killProcessTree } from "./process-tree.js";
 
 // flake-shape: raw-timer-wait — the bounded timeout waits for real child progress
@@ -75,6 +76,8 @@ export type RealPi = {
 		extensionLog(): ReadonlyArray<JsonObject>;
 		sessionStartLog(): ReadonlyArray<string>;
 		degradations(): ReadonlyArray<JsonObject>;
+		/** Absolute paths of the per-session state sidecars (`<project data>/sessions/<id>.json`). */
+		sessionSidecars(): ReadonlyArray<string>;
 	};
 };
 type RpcMessage = HarnessEvent;
@@ -364,12 +367,7 @@ function startRealPi(
 			return request("get_commands");
 		},
 		quit: () => stopChild(false),
-		providerObservations: () =>
-			readFileSync(providerLog, "utf8")
-				.trim()
-				.split("\n")
-				.filter(Boolean)
-				.map((line) => JSON.parse(line) as JsonObject),
+		providerObservations: () => readNdjsonRows(providerLog).rows,
 		async close() {
 			await stopChild(true);
 			removeTempDirSync(scannerTempDir);
@@ -547,13 +545,21 @@ export async function withRealPi<T>(
 			childTempDir: () => path.join(harness.home, "tmp"),
 			childEnvironment: () => harness.childEnv,
 			lens: {
-				latencyRows: () => readRows(path.join(harness.home, "latency.log")),
-				extensionLog: () => readRows(path.join(harness.home, "extension.log")),
+				sessionSidecars: () =>
+					(readdirSync(harness.home, { recursive: true }) as string[])
+						.filter((entry) =>
+							/(^|[\\/])sessions[\\/][^\\/]+\.json$/.test(entry),
+						)
+						.map((entry) => path.join(harness.home, entry)),
+				latencyRows: () =>
+					readNdjsonRows(path.join(harness.home, "latency.log")).rows,
+				extensionLog: () =>
+					readNdjsonRows(path.join(harness.home, "extension.log")).rows,
 				sessionStartLog: () =>
 					readLines(path.join(harness.home, "sessionstart.log")),
 				degradations: () =>
-					readRows(path.join(harness.home, "latency.log"))
-						.filter((row) => row.phase === "degradation_ledger")
+					readNdjsonRows(path.join(harness.home, "latency.log"))
+						.rows.filter((row) => row.phase === "degradation_ledger")
 						.map((row) => ({
 							...row,
 							...(row.metadata as JsonObject | undefined),
@@ -565,22 +571,6 @@ export async function withRealPi<T>(
 	} finally {
 		await harness.close();
 	}
-}
-
-function readRows(file: string): JsonObject[] {
-	if (!existsSync(file)) return [];
-	return readFileSync(file, "utf8")
-		.trim()
-		.split("\n")
-		.filter(Boolean)
-		.flatMap((line) => {
-			try {
-				const row = JSON.parse(line) as unknown;
-				return row && typeof row === "object" ? [row as JsonObject] : [];
-			} catch {
-				return [];
-			}
-		});
 }
 
 function readLines(file: string): string[] {

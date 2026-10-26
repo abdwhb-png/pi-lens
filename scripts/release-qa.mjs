@@ -77,7 +77,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
+import { scratchHomeEnv } from "./lib/scratch-home-env.mjs";
+import { McpStdioClient } from "./lib/mcp-stdio-client.mjs";
 import { parseTable } from "./lib/md-matrix.mjs";
+import { parseNdjsonEntries } from "./lib/latency-log-phases.mjs";
+import { startRpcSession } from "./rpc-load-check.mjs";
 
 // ===========================================================================
 // Pure core — parsing, outcome rules, arithmetic, rendering.
@@ -1729,7 +1733,10 @@ const REPO_ROOT = path.resolve(
 const DEFAULT_POLL_CAP_MS = 120_000;
 const NPM_TIMEOUT_MS = 600_000;
 const RPC_TIMEOUT_MS = 60_000;
-const MCP_CALL_TIMEOUT_MS = 180_000;
+/** The session-start warm's success record (`index.ts`), the row's positive witness (#4316). `tests/index-4316-lsp-warm-record.test.ts` asserts the extension logs exactly this. */
+export const LSP_WARM_RESOLVED = "LSP warm resolved";
+/** How long the RPC capture waits for the warm to report after `get_commands`. */
+const WARM_LOG_WAIT_MS = 10_000;
 
 export function parseArgs(argv) {
 	const opts = {
@@ -1911,9 +1918,7 @@ export function scratchEnv(scratchRoot, extra = {}) {
 				.filter((key) => process.env[key] !== undefined)
 				.map((key) => [key, process.env[key]]),
 		),
-		HOME: home,
-		USERPROFILE: home,
-		PI_LENS_HOME: path.join(home, ".pi-lens"),
+		...scratchHomeEnv(home, path.join(home, ".pi-lens")),
 		PILENS_DATA_DIR: path.join(home, ".pilens-data"),
 		PI_LENS_INSTALL_LOG: path.join(home, ".pi-lens", "install.log"),
 		npm_config_cache: path.join(scratchRoot, "npm-cache"),
@@ -1927,6 +1932,64 @@ export function scratchEnv(scratchRoot, extra = {}) {
 }
 
 /**
+ * Classify the extension-log witness emitted by the RPC session-start warm.
+ * A success record is required; ANY `warm failed` record (LSP, formatter or
+ * dispatch warm) wins over it so a later recovery cannot hide a failed
+ * session-start attempt (#4316). A candidate built before the success record
+ * existed (4.4.3 and older) has no positive witness and so fails closed.
+ */
+export function classifyLspWarmLog(text) {
+	const messages = parseNdjsonEntries(String(text ?? ""))
+		.map((record) => record.message)
+		.filter((message) => typeof message === "string");
+	const failure = messages.find((message) => /warm failed/i.test(message));
+	if (failure) return { status: "fail", detail: failure };
+	return messages.includes(LSP_WARM_RESOLVED)
+		? { status: "pass", detail: LSP_WARM_RESOLVED }
+		: {
+				status: "fail",
+				detail: `no ${LSP_WARM_RESOLVED} record (and no warm failed record)`,
+			};
+}
+
+/**
+ * Observe the pinned extension log for this session's warm records. It polls
+ * until a `warm failed` record appears (a failure already decides the row) or
+ * the cap expires, then reads once more; a healthy candidate is therefore
+ * watched for the whole cap, so a sibling warm (formatter, dispatch) that
+ * fails seconds after the LSP warm is still seen (#4316 review F1). Only
+ * records stamped at or after `sinceIso` count, so a reused scratch root
+ * cannot lend a candidate a previous run's `LSP warm resolved` (F4). Returns
+ * the scoped records as NDJSON text.
+ */
+export async function awaitWarmLog(
+	readLog,
+	{ capMs = WARM_LOG_WAIT_MS, intervalMs = 250, sinceIso } = {},
+) {
+	const sinceMs = sinceIso ? Date.parse(sinceIso) : undefined;
+	const read = () =>
+		parseNdjsonEntries(readLog()).filter((record) => {
+			if (sinceMs === undefined) return true;
+			const ts = typeof record.ts === "string" ? Date.parse(record.ts) : NaN;
+			return Number.isFinite(ts) && ts >= sinceMs;
+		});
+	await pollToTerminal(
+		async () => ({
+			terminal: read().some(
+				(record) =>
+					typeof record.message === "string" &&
+					/warm failed/i.test(record.message),
+			),
+			detail: "no warm failed record",
+		}),
+		{ capMs, intervalMs },
+	);
+	return read()
+		.map((record) => JSON.stringify(record))
+		.join("\n");
+}
+
+/**
  * Every environment variable `scratchEnv` pins inside the scratch root, and
  * the writer each one steers. Exported so the hermeticity canary enumerates
  * the same list the runner does instead of re-typing it — a second copy is
@@ -1935,6 +1998,9 @@ export function scratchEnv(scratchRoot, extra = {}) {
 export const PINNED_ENV_KEYS = Object.freeze([
 	"HOME",
 	"USERPROFILE",
+	"XDG_CONFIG_HOME",
+	"XDG_CACHE_HOME",
+	"XDG_DATA_HOME",
 	"PI_LENS_HOME",
 	"PILENS_DATA_DIR",
 	"PI_LENS_INSTALL_LOG",
@@ -2023,30 +2089,37 @@ function setUpFixture(projectDir) {
  * uses in install-smoke's `pi-load` job — captured once and asserted on by two
  * rows rather than run twice.
  */
-function captureGetCommands({ piBin, cwd, env, timeoutMs = RPC_TIMEOUT_MS }) {
+export function captureGetCommands({
+	piBin,
+	cwd,
+	env,
+	timeoutMs = RPC_TIMEOUT_MS,
+	// The candidate's own session is held for its warm records. The boot probe
+	// and the git-install capture pass false: they judge no warm record.
+	awaitWarm = true,
+	warmWaitMs = WARM_LOG_WAIT_MS,
+}) {
 	return new Promise((resolve) => {
-		let child;
+		// The session boundary is fixed before the child exists, so a record the
+		// child logs the moment it starts is never older than the stamp (#4802 F9).
+		const sinceIso = new Date().toISOString();
+		let pi;
 		try {
-			child = spawn(piBin, ["--mode", "rpc", "--no-session"], {
+			pi = startRpcSession(piBin, {
+				args: ["--mode", "rpc", "--no-session"],
 				cwd,
-				stdio: ["pipe", "pipe", "pipe"],
 				env,
 			});
 		} catch (err) {
 			resolve({ ok: false, reason: `spawn failed: ${err?.message || err}` });
 			return;
 		}
-		const extensionErrors = [];
-		const stderr = [];
-		let buf = "";
 		let settled = false;
 		const finish = (value) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			try {
-				child.kill("SIGKILL");
-			} catch {}
+			pi.kill();
 			resolve(value);
 		};
 		const timer = setTimeout(
@@ -2054,166 +2127,62 @@ function captureGetCommands({ piBin, cwd, env, timeoutMs = RPC_TIMEOUT_MS }) {
 				finish({
 					ok: false,
 					reason: `no get_commands response within ${timeoutMs}ms`,
-					extensionErrors,
-					stderr: stderr.join(""),
+					extensionErrors: pi.extensionErrors,
+					stderr: pi.stderrTail.join(""),
 				}),
 			timeoutMs,
 		);
-		child.stderr.on("data", (chunk) => stderr.push(chunk.toString()));
-		child.stdout.on("data", (chunk) => {
-			buf += chunk.toString();
-			let i = buf.indexOf("\n");
-			while (i >= 0) {
-				const line = buf.slice(0, i).replace(/\r$/, "");
-				buf = buf.slice(i + 1);
-				i = buf.indexOf("\n");
-				if (!line.trim()) continue;
-				let message;
-				try {
-					message = JSON.parse(line);
-				} catch {
-					continue;
-				}
-				if (
-					(message.type === "event" && message.event === "extension_error") ||
-					message.type === "extension_error"
-				) {
-					extensionErrors.push(message);
-				}
-				if (message.type === "response" && message.command === "get_commands") {
+		pi.onMessage((message) => {
+			if (message.type === "response" && message.command === "get_commands") {
+				// The response arrived: the deadline above judged it. The warm wait
+				// is bounded by `warmWaitMs` itself.
+				clearTimeout(timer);
+				const done = (extensionLog, logError) =>
 					finish({
 						ok: true,
 						commands: message.data?.commands ?? [],
-						extensionErrors,
+						extensionErrors: pi.extensionErrors,
+						extensionLog,
+						...(logError ? { logError } : {}),
+						sinceIso,
 						raw: message,
 					});
+				if (!awaitWarm) {
+					done("");
+					return;
 				}
+				void (async () => {
+					let extensionLog = "";
+					let logError;
+					try {
+						extensionLog = await awaitWarmLog(
+							() => {
+								const file = path.join(env.PI_LENS_HOME, "extension.log");
+								return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+							},
+							{ capMs: warmWaitMs, sinceIso },
+						);
+					} catch (err) {
+						logError = err?.message || String(err);
+					}
+					done(extensionLog, logError);
+				})();
 			}
 		});
-		child.on("error", (err) =>
+		pi.child.on("error", (err) =>
 			finish({ ok: false, reason: `pi error: ${err?.message || err}` }),
 		);
-		child.on("exit", (code) =>
+		pi.onExit((code) =>
 			finish({
 				ok: false,
 				reason: `pi exited early (code ${code})`,
-				extensionErrors,
-				stderr: stderr.join(""),
+				extensionErrors: pi.extensionErrors,
+				stderr: pi.stderrTail.join(""),
 			}),
 		);
 		// Extensions register asynchronously; ask once they have had a moment.
-		setTimeout(() => {
-			try {
-				child.stdin.write(`${JSON.stringify({ type: "get_commands" })}\n`);
-			} catch {}
-		}, 3000);
+		setTimeout(() => pi.send({ type: "get_commands" }), 3000);
 	});
-}
-
-/** A newline-delimited JSON-RPC client for the pi-lens MCP stdio server. */
-class McpSession {
-	constructor(serverJs, cwd, env) {
-		this.child = spawn(process.execPath, [serverJs], {
-			cwd,
-			stdio: ["pipe", "pipe", "pipe"],
-			env,
-		});
-		this.pending = new Map();
-		this.nextId = 1;
-		this.stderr = [];
-		this.buf = "";
-		this.child.stderr.on("data", (chunk) => this.stderr.push(chunk.toString()));
-		this.child.stdout.on("data", (chunk) => {
-			this.buf += chunk.toString();
-			let i = this.buf.indexOf("\n");
-			while (i >= 0) {
-				const line = this.buf.slice(0, i).trim();
-				this.buf = this.buf.slice(i + 1);
-				i = this.buf.indexOf("\n");
-				if (!line) continue;
-				let message;
-				try {
-					message = JSON.parse(line);
-				} catch {
-					continue;
-				}
-				const waiter = this.pending.get(message.id);
-				if (waiter) {
-					this.pending.delete(message.id);
-					waiter.resolve(message);
-				}
-			}
-		});
-		this.exited = new Promise((resolve) => {
-			this.child.on("exit", (code) => {
-				for (const [, waiter] of this.pending) {
-					waiter.resolve({ error: { message: `server exited (${code})` } });
-				}
-				this.pending.clear();
-				resolve(code);
-			});
-		});
-	}
-
-	request(method, params, timeoutMs = MCP_CALL_TIMEOUT_MS) {
-		const id = this.nextId++;
-		return new Promise((resolve) => {
-			const timer = setTimeout(() => {
-				this.pending.delete(id);
-				resolve({ error: { message: `timeout after ${timeoutMs}ms` } });
-			}, timeoutMs);
-			this.pending.set(id, {
-				resolve: (message) => {
-					clearTimeout(timer);
-					resolve(message);
-				},
-			});
-			try {
-				this.child.stdin.write(
-					`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`,
-				);
-			} catch (err) {
-				clearTimeout(timer);
-				this.pending.delete(id);
-				resolve({ error: { message: `write failed: ${err?.message || err}` } });
-			}
-		});
-	}
-
-	notify(method, params) {
-		try {
-			this.child.stdin.write(
-				`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`,
-			);
-		} catch {}
-	}
-
-	/** The first text block of a tools/call result, or an error marker. */
-	async callToolText(name, args, timeoutMs) {
-		const response = await this.request(
-			"tools/call",
-			{ name, arguments: args },
-			timeoutMs,
-		);
-		if (response.error) {
-			return { ok: false, text: `JSON-RPC error: ${response.error.message}` };
-		}
-		const text = response.result?.content?.[0]?.text ?? "";
-		return { ok: response.result?.isError !== true, text: String(text) };
-	}
-
-	async close() {
-		try {
-			this.child.kill("SIGTERM");
-		} catch {}
-		await Promise.race([
-			this.exited,
-			new Promise((resolve) => setTimeout(resolve, 5000)),
-		]);
-		try {
-			this.child.kill("SIGKILL");
-		} catch {}
-	}
 }
 
 /**
@@ -2303,7 +2272,7 @@ function rowHomeEnv(ctx, name, extra = {}) {
  * unreachable server reads FAIL.
  */
 async function openScopedMcpSession(serverJs, cwd, env) {
-	const session = new McpSession(serverJs, cwd, env);
+	const session = new McpStdioClient(serverJs, cwd, env);
 	const init = await session.request(
 		"initialize",
 		{
@@ -2426,6 +2395,25 @@ const ROW_PROBES = {
 					2,
 				),
 			},
+		};
+	},
+
+	"lsp-warm-resolved": async (ctx) => {
+		const capture = ctx.rpc;
+		if (!capture?.ok) {
+			return { status: "fail", detail: capture?.reason ?? "no RPC capture" };
+		}
+		if (capture.logError) {
+			return {
+				status: "fail",
+				detail: `extension.log unreadable: ${capture.logError}`,
+			};
+		}
+		const verdict = classifyLspWarmLog(capture.extensionLog);
+		return {
+			...verdict,
+			shows: verdict.detail,
+			witness: { ext: "ndjson", content: capture.extensionLog },
 		};
 	},
 
@@ -2729,6 +2717,7 @@ const ROW_PROBES = {
 			piBin: ctx.piBin,
 			cwd: ctx.projectDir,
 			env,
+			awaitWarm: false,
 		});
 		if (!capture.ok) {
 			return { status: "fail", detail: capture.reason ?? "RPC capture failed" };
@@ -2912,6 +2901,7 @@ async function main() {
 		piBin: opts.pi,
 		cwd: projectDir,
 		env,
+		awaitWarm: false,
 	});
 	{
 		const classified = classifyRunFailure({
@@ -3010,7 +3000,11 @@ async function main() {
 		});
 
 		log("driving pi --mode rpc (get_commands) with the candidate installed");
-		rpc = await captureGetCommands({ piBin: opts.pi, cwd: projectDir, env });
+		rpc = await captureGetCommands({
+			piBin: opts.pi,
+			cwd: projectDir,
+			env,
+		});
 		if (!rpc.ok) {
 			// pi answered the boot probe moments ago, so this is the candidate
 			// breaking it, not an unbootable host.

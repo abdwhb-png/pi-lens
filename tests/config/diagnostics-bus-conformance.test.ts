@@ -9,6 +9,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const EVENT = "pilens:diagnostics";
 
@@ -28,7 +29,16 @@ const PUBLISHERS: BusSurfaceEntry[] = [
 
 const SUBSCRIBERS: BusSurfaceEntry[] = [];
 
+// The walk and each file read happen once; every case shares them.
+let scannedFiles: string[] | undefined;
+const readCache = new Map<string, string>();
+
 function sourceFiles(): string[] {
+	scannedFiles ??= scanSourceFiles();
+	return scannedFiles;
+}
+
+function scanSourceFiles(): string[] {
 	const roots = ["clients", "tools", "mcp", "scripts"];
 	const files = roots.flatMap((root) =>
 		listSourceFiles(path.join(repoRoot, root), {
@@ -45,7 +55,12 @@ function sourceFiles(): string[] {
 }
 
 function read(file: string): string {
-	return fs.readFileSync(path.join(repoRoot, file), "utf8");
+	let source = readCache.get(file);
+	if (source === undefined) {
+		source = fs.readFileSync(path.join(repoRoot, file), "utf8");
+		readCache.set(file, source);
+	}
+	return source;
 }
 
 function busPublisherFiles(
@@ -101,34 +116,45 @@ function busSubscriberFiles(
 }
 
 describe("pilens:diagnostics bus surface (#2079)", () => {
-	it("keeps the event constant and declared publisher list in conformance", () => {
-		const files = sourceFiles();
-		const sources = new Map(files.map((file) => [file, read(file)]));
-		const eventFiles = files.filter((file) => read(file).includes(EVENT));
-		expect(eventFiles).toContain("clients/diagnostics-publish.ts");
+	it(
+		"keeps the event constant and declared publisher list in conformance",
+		() => {
+			const files = sourceFiles();
+			const sources = new Map(files.map((file) => [file, read(file)]));
+			const eventFiles = files.filter((file) => read(file).includes(EVENT));
+			expect(eventFiles).toContain("clients/diagnostics-publish.ts");
 
-		const actual = busPublisherFiles(files, sources).sort((a, b) =>
-			a < b ? -1 : a > b ? 1 : 0,
-		);
-		expect(actual, "new publisher: update PUBLISHERS and AGENTS.md").toEqual(
-			PUBLISHERS.map((entry) => entry.file).sort((a, b) =>
+			const actual = busPublisherFiles(files, sources).sort((a, b) =>
 				a < b ? -1 : a > b ? 1 : 0,
-			),
-		);
-	});
+			);
+			expect(actual, "new publisher: update PUBLISHERS and AGENTS.md").toEqual(
+				PUBLISHERS.map((entry) => entry.file).sort((a, b) =>
+					a < b ? -1 : a > b ? 1 : 0,
+				),
+			);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
-	it("keeps the event subscriber list in conformance", () => {
-		const files = sourceFiles();
-		const sources = new Map(files.map((file) => [file, read(file)]));
-		const actual = busSubscriberFiles(files, sources).sort((a, b) =>
-			a < b ? -1 : a > b ? 1 : 0,
-		);
-		expect(actual, "new subscriber: update SUBSCRIBERS and AGENTS.md").toEqual(
-			SUBSCRIBERS.map((entry) => entry.file).sort((a, b) =>
+	it(
+		"keeps the event subscriber list in conformance",
+		() => {
+			const files = sourceFiles();
+			const sources = new Map(files.map((file) => [file, read(file)]));
+			const actual = busSubscriberFiles(files, sources).sort((a, b) =>
 				a < b ? -1 : a > b ? 1 : 0,
-			),
-		);
-	});
+			);
+			expect(
+				actual,
+				"new subscriber: update SUBSCRIBERS and AGENTS.md",
+			).toEqual(
+				SUBSCRIBERS.map((entry) => entry.file).sort((a, b) =>
+					a < b ? -1 : a > b ? 1 : 0,
+				),
+			);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("ignores comments and recognizes direct, aliased, and literal subscribers", () => {
 		const files = ["comment.ts", "alias.ts", "imported.ts", "literal.ts"];

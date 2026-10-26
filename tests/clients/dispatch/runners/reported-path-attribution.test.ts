@@ -520,7 +520,8 @@ const MEMBERS: Member[] = [
 			);
 		},
 		output: (reported) => ({
-			status: 1,
+			// #4522: detekt's measured findings exit is 2 (captured real.captured.json).
+			status: 2,
 			stdout: `${reported}:4:5: error: This expression contains a magic number (${MARKER}) [MagicNumber]\n`,
 		}),
 	},
@@ -1407,7 +1408,7 @@ describe("no-predicate runner reported-path attribution (#3295 r3)", () => {
 				{
 					file: reported,
 					errors: [
-						{ line: 4, col: 5, detail: MARKER, ruleId: "standard:test" },
+						{ line: 4, column: 5, message: MARKER, rule: "standard:test" },
 					],
 				},
 			]),

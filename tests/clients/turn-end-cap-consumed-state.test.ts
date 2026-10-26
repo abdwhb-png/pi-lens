@@ -19,22 +19,11 @@ import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeLspServiceDouble } from "../support/lsp-service-double.js";
+import { installLspServiceDouble } from "../support/lsp-service-seam.js";
 
 const readCachedDiagnosticsForServers = vi.hoisted(() => vi.fn());
-vi.mock("../../clients/lsp/capabilities.js", async (importOriginal) => ({
-	...(await importOriginal<
-		typeof import("../../clients/lsp/capabilities.js")
-	>()),
-	// The process boundary: a real auxiliary client is an external child
-	// process. The double carries the full service surface (#2582).
-	getLSPService: () =>
-		makeLspServiceDouble({
-			readCachedDiagnosticsForServers,
-			observeLateAuxiliaryAnswer: async () => undefined,
-		}),
-}));
-
+// The process boundary: a real auxiliary client is an external child
+// process. The double carries the full service surface (#2582).
 const logLatency = vi.hoisted(() => vi.fn());
 vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
 	const actual =
@@ -49,7 +38,10 @@ vi.mock("../../clients/latency-logger.js", async (importOriginal) => {
 	};
 });
 
-import { CacheManager } from "../../clients/cache-manager.js";
+import {
+	CacheManager,
+	DEFAULT_MAX_AGE_MS,
+} from "../../clients/cache-manager.js";
 import { resetBoundedTelemetry } from "../../clients/bounded-telemetry.js";
 import type { CascadeResult } from "../../clients/cascade-types.js";
 import { _resetSharedLineCountCacheForTests } from "../../clients/diagnostic-line-freshness.js";
@@ -74,7 +66,11 @@ import {
 	_resetStateCacheForTests,
 	markDisposition,
 } from "../../clients/diagnostic-dispositions.js";
-import { evaluateGitGuard } from "../../clients/git-guard.js";
+import {
+	evaluateGitGuard,
+	syncGitGuardRecord,
+} from "../../clients/git-guard.js";
+import { getProjectDataDir } from "../../clients/file-utils.js";
 import { consumeTurnEndFindings } from "../../clients/runtime-context.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { beginScope, retireScope } from "../../clients/session-scope.js";
@@ -158,7 +154,7 @@ function touch(rig: Rig, name: string, content = "export const a = 1;\n") {
 		{ start: 1, end: 1 },
 		false,
 		rig.cwd,
-		SESSION,
+		rig.runtime.telemetrySessionId,
 	);
 	return file;
 }
@@ -223,7 +219,11 @@ function ledgerCount(kind: string): number {
 		.reduce((sum, entry) => sum + entry.count, 0);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await installLspServiceDouble({
+		readCachedDiagnosticsForServers,
+		observeLateAuxiliaryAnswer: async () => undefined,
+	});
 	_resetStateCacheForTests();
 	resetDegradationLedger();
 	resetBoundedTelemetry();
@@ -638,6 +638,68 @@ describe("M3a: cascade runs vs the cap (#3813)", () => {
 });
 
 const INDETERMINATE_END = "graph unavailable ENDIND: ind-primary.ts";
+
+// #4495 round 3 (R2-2): a pending cascade neighbour whose file changed
+// outside pi since its errors were checked is named once, "changed since
+// checked, not re-checked", and forgotten. The forget is peek-then-commit.
+describe("M3d: the cascade changed-since-checked line vs the cap (#4495)", () => {
+	// Recurrence: forgetting at compose time would drop a line the cap cut,
+	// and the neighbour would then go silent, which reads as resolved.
+	it("a cut changed line keeps its entry and is named on the next turn, then forgotten", async () => {
+		const rig = makeRig("pi-lens-4495-m3d-");
+		const {
+			listCascadePendingNeighbors,
+			recordDeliveredCascadeNeighbor,
+			resetCascadePendingNeighbors,
+		} = await import("../../clients/cascade-format.js");
+		// Earlier tests here deliver cascade sections into the same
+		// process-wide record.
+		resetCascadePendingNeighbors();
+		try {
+			// Written outside pi (not `touch`, which records a pi edit), after
+			// the check below.
+			const neighbor = path.join(rig.cwd, "casc-changed.ts");
+			fs.writeFileSync(neighbor, "export const c = 1;\n");
+			recordDeliveredCascadeNeighbor(
+				neighbor,
+				[
+					{
+						id: "lsp:test:1",
+						message: "pending error",
+						filePath: neighbor,
+						line: 1,
+						column: 1,
+						severity: "error",
+						semantic: "blocking",
+						tool: "lsp",
+					} as Diagnostic,
+				],
+				1,
+				Date.now() - 60_000,
+			);
+			const fillerFile = fillerBlocker(rig, 1000);
+			const first = await endTurn(rig);
+			expect(first).not.toContain("changed since checked");
+			expect(listCascadePendingNeighbors().map((e) => e.filePath)).toEqual([
+				neighbor,
+			]);
+
+			clearFiller(rig, fillerFile);
+			nextTurn(rig, 2);
+			const second = await endTurn(rig);
+			expect(second).toContain(
+				"casc-changed.ts: 1 error(s) changed since checked",
+			);
+			expect(listCascadePendingNeighbors()).toEqual([]);
+
+			nextTurn(rig, 3);
+			expect(await endTurn(rig)).not.toContain("casc-changed.ts");
+		} finally {
+			resetCascadePendingNeighbors();
+			rig.cleanup();
+		}
+	});
+});
 
 describe("M3b: cascade coverage advisories vs the cap (#3813)", () => {
 	it.each(CELLS)(
@@ -1481,6 +1543,497 @@ describe("F6: a resolved retirement the signature dedupe would suppress (#3813)"
 			rig.runtime.beginTurn();
 			retire();
 			expect(await endTurn(rig)).toContain(line);
+		} finally {
+			rig.cleanup();
+		}
+	});
+});
+
+describe("F21: the dedupe rewrite owns the record it writes (#4733 r5)", () => {
+	// RECURRENCE GUARDED: #4733 r5 F21. The repeated-findings rewrite at turn end
+	// kept the stored owner while it wrote only this session's sections. When
+	// another session had written over the record, this session's own fix then
+	// read the record as foreign, latched `session_mismatch`, and every commit
+	// stayed refused.
+	// #4738: the other session's section of the same file is that session's and
+	// is carried, so this session's own fix leaves it; a whole-file clean check
+	// of the file then clears it and opens the gate.
+	it("a repeated turn end over another session's record stamps this session, so its own fix leaves only the other session's section", async () => {
+		const rig = makeRig("pi-lens-4733-f21-");
+		try {
+			rig.lensGuard = true;
+			const source = "eval(x);\n";
+			const blocker = () => {
+				const file = touch(rig, "a.ts", source);
+				rig.runtime.recordInlineBlockers(
+					file,
+					"🔴 STOP — 1 issue(s) must be fixed:\n  L1: eval() is banned",
+					rig.runtime.nextWriteIndex(),
+					["ast-grep"],
+					[1],
+				);
+				return file;
+			};
+			const file = blocker();
+			expect(await endTurn(rig)).toContain("eval() is banned");
+			const record = () =>
+				rig.cacheManager.readCache<{
+					sessionId?: string;
+					carriedBlockers?: Array<{ sessionId: string }>;
+				}>("turn-end-findings", rig.cwd, Number.POSITIVE_INFINITY)?.data;
+			// Another session writes over the record after this turn end.
+			rig.cacheManager.writeCache(
+				"turn-end-findings",
+				{ ...record(), sessionId: "another-session" },
+				rig.cwd,
+			);
+			rig.runtime.beginTurn();
+			blocker();
+			// The same findings again: the dedupe rewrites the record.
+			await endTurn(rig);
+			expect(record()?.sessionId).toBe(SESSION);
+			expect(
+				record()?.carriedBlockers?.map((partition) => partition.sessionId),
+			).toEqual(["another-session"]);
+			// The fix: this session retires its own entry, with no whole-file verdict.
+			rig.runtime.clearInlineBlockers(file, rig.runtime.nextWriteIndex());
+			syncGitGuardRecord(rig.runtime, rig.cacheManager, rig.cwd, file);
+			// Only the other session's section is left, and it is still theirs.
+			expect(record()?.sessionId).toBe("another-session");
+			expect(record()?.carriedBlockers).toBeUndefined();
+			const refusal = evaluateGitGuard(rig.runtime, rig.cacheManager, rig.cwd);
+			expect(refusal).toMatchObject({ block: true, unknown: true });
+			expect(refusal.reason).toContain("The record names blockers in a.ts ");
+			// A whole-file clean check of a.ts speaks for every session's section.
+			syncGitGuardRecord(
+				rig.runtime,
+				rig.cacheManager,
+				rig.cwd,
+				file,
+				"session",
+				true,
+			);
+			expect(evaluateGitGuard(rig.runtime, rig.cacheManager, rig.cwd)).toEqual({
+				block: false,
+			});
+		} finally {
+			rig.cleanup();
+		}
+	});
+});
+
+describe("#4738: a --lens-guard-off turn end keeps another session's blocker", () => {
+	// RECURRENCE GUARDED: #4738, the fourth replacing writer. With the flag off
+	// the turn end wrote its delivery record over the stored one, so a guarded
+	// session's blocker record became a record that claims nothing, and the
+	// next settled turn end of any session retired it.
+	it("keeps another session's blocker sections, owner and all, when a guard-off turn ends with findings", async () => {
+		const rig = makeRig("pi-lens-4738-guard-off-");
+		try {
+			const theirs = touch(rig, "theirs.ts", "eval(y);\n");
+			const theirText =
+				"Unresolved from this turn — theirs.ts:\n🔴 STOP — 1 issue(s) must be fixed:\n  L1: eval() is banned";
+			rig.cacheManager.writeCache(
+				"turn-end-findings",
+				{
+					content: theirText,
+					blockerContent: theirText,
+					blockingFiles: [theirs],
+					hasBlockers: true,
+					affectedFiles: [theirs],
+					sessionId: "another-session",
+					projectSeqStart: 0,
+					projectSeqEnd: 0,
+					fileSeqByPath: {},
+					fileContentHashes: {},
+					consumed: true,
+				},
+				rig.cwd,
+			);
+			const file = touch(rig, "a.ts", "eval(x);\n");
+			rig.runtime.recordInlineBlockers(
+				file,
+				"🔴 STOP — 1 issue(s) must be fixed:\n  L1: eval() is banned",
+				rig.runtime.nextWriteIndex(),
+				["ast-grep"],
+				[1],
+			);
+
+			expect(await endTurn(rig)).toContain("a.ts");
+
+			const after = rig.cacheManager.readCache<{
+				sessionId?: string;
+				blockerContent?: string;
+				carriedBlockers?: unknown;
+			}>("turn-end-findings", rig.cwd, Number.POSITIVE_INFINITY)?.data;
+			// This session claims nothing with the flag off; theirs stays theirs.
+			expect(after?.sessionId).toBe("another-session");
+			expect(after?.blockerContent).toBe(theirText);
+			expect(after?.carriedBlockers).toBeUndefined();
+		} finally {
+			rig.cleanup();
+		}
+	});
+});
+
+describe("#4738: the turn-end composer reads another session's record at any age", () => {
+	// RECURRENCE GUARDED: #4738 (the #4725 read). The composer read the record
+	// through the cache's freshness window, so a day-old record from another
+	// session was invisible to it, and its write replaced the record whole: the
+	// other session's blocker was gone without any re-check of its file.
+	for (const lensGuard of [true, false]) {
+		it(`keeps a day-old blocker of another session's (--lens-guard ${lensGuard ? "on" : "off"})`, async () => {
+			const rig = makeRig(`pi-lens-4738-day-old-${lensGuard}-`);
+			try {
+				rig.lensGuard = lensGuard;
+				const theirs = touch(rig, "theirs.ts", "eval(y);\n");
+				const theirText =
+					"Unresolved from this turn — theirs.ts:\n🔴 STOP — 1 issue(s) must be fixed:\n  L1: eval() is banned";
+				rig.cacheManager.writeCache(
+					"turn-end-findings",
+					{
+						content: theirText,
+						blockerContent: theirText,
+						blockingFiles: [theirs],
+						hasBlockers: true,
+						affectedFiles: [theirs],
+						sessionId: "another-session",
+						projectSeqStart: 0,
+						projectSeqEnd: 0,
+						fileSeqByPath: {},
+						fileContentHashes: {},
+						consumed: true,
+					},
+					rig.cwd,
+				);
+				fs.writeFileSync(
+					path.join(
+						getProjectDataDir(rig.cwd),
+						"cache",
+						"turn-end-findings.meta.json",
+					),
+					JSON.stringify({
+						timestamp: new Date(Date.now() - 86_400_000).toISOString(),
+					}),
+				);
+				const file = touch(rig, "a.ts", "eval(x);\n");
+				rig.runtime.recordInlineBlockers(
+					file,
+					"🔴 STOP — 1 issue(s) must be fixed:\n  L1: eval() is banned",
+					rig.runtime.nextWriteIndex(),
+					["ast-grep"],
+					[1],
+				);
+
+				expect(await endTurn(rig)).toContain("a.ts");
+
+				const after = rig.cacheManager.readCache<{
+					sessionId?: string;
+					blockerContent?: string;
+					carriedBlockers?: Array<{
+						sessionId: string;
+						blockerContent: string;
+					}>;
+				}>("turn-end-findings", rig.cwd, Number.POSITIVE_INFINITY)?.data;
+				const sections = [
+					[after?.sessionId, after?.blockerContent],
+					...(after?.carriedBlockers ?? []).map((partition) => [
+						partition.sessionId,
+						partition.blockerContent,
+					]),
+				];
+				// Theirs stays theirs, beside this session's own when it claims one.
+				expect(sections).toContainEqual(["another-session", theirText]);
+				expect(sections.map(([owner]) => owner)).toEqual(
+					lensGuard ? [SESSION, "another-session"] : ["another-session"],
+				);
+			} finally {
+				rig.cleanup();
+			}
+		});
+	}
+});
+
+/** A second session on the same checkout: its own coordinator and identity. */
+function secondSession(rig: Rig, lensGuard: boolean): Rig {
+	const runtime = new RuntimeCoordinator();
+	runtime.setTelemetryIdentity({ sessionId: "session-B" });
+	runtime.beginTurn();
+	return { ...rig, runtime, lensGuard };
+}
+
+/** The record as stored, read at any age. */
+function guardRecord(rig: Rig):
+	| {
+			sessionId?: string;
+			blockerContent?: string;
+			blockerWrittenAt?: number;
+			carriedBlockers?: Array<{
+				sessionId: string;
+				blockerContent: string;
+				blockerWrittenAt?: number;
+			}>;
+	  }
+	| undefined {
+	return rig.cacheManager.readCache<
+		NonNullable<ReturnType<typeof guardRecord>>
+	>("turn-end-findings", rig.cwd, Number.POSITIVE_INFINITY)?.data;
+}
+
+/** Every owner's blocker text in the stored record, top level first. */
+function ownerSections(
+	rig: Rig,
+): Array<[string | undefined, string | undefined]> {
+	const data = guardRecord(rig);
+	return data
+		? [
+				[data.sessionId, data.blockerContent],
+				...(data.carriedBlockers ?? []).map((partition): [string, string] => [
+					partition.sessionId,
+					partition.blockerContent,
+				]),
+			]
+		: [];
+}
+
+/** The metadata of the `phase` rows the real sink was handed, oldest first. */
+function phaseCalls(phase: string): unknown[] {
+	return logLatency.mock.calls
+		.map(([entry]) => entry as { phase?: string; metadata?: unknown })
+		.filter((entry) => entry.phase === phase)
+		.map((entry) => entry.metadata);
+}
+
+/**
+ * Session A's real composer turn with a CRITICAL CVE in the trivy store: the
+ * one blocker it records names no file. The store is then emptied, so no
+ * other session's lanes report the CVE again.
+ */
+async function laneBlockerOfSessionA(rig: Rig): Promise<string> {
+	rig.lensGuard = true;
+	rig.cacheManager.writeCache(
+		"trivy",
+		{
+			success: true,
+			scannedAt: new Date().toISOString(),
+			findings: [
+				{
+					vulnerabilityId: "CVE-2026-0001",
+					pkgName: "left-pad",
+					installedVersion: "1.0.0",
+					fixedVersion: "1.0.1",
+					severity: "CRITICAL",
+				},
+			],
+			secrets: [],
+			licenses: [],
+		},
+		rig.cwd,
+	);
+	touch(rig, "a.ts");
+	const before = Date.now();
+	expect(await endTurn(rig)).toContain("CVE-2026-0001");
+	rig.cacheManager.clearCache("trivy", rig.cwd);
+	const [[owner, text]] = ownerSections(rig);
+	expect(owner).toBe(SESSION);
+	// Its window runs from its own write (#4750).
+	expect(guardRecord(rig)?.blockerWrittenAt).toBeGreaterThanOrEqual(before);
+	expect(text).toContain("CRITICAL dependency CVEs (trivy");
+	return text as string;
+}
+
+/** A findings turn with no blocker of its own: a retirement forces the write. */
+function retirement(rig: Rig): void {
+	const file = touch(rig, "noise.ts");
+	rig.runtime.recordInlineBlockers(
+		file,
+		"🔴 STOP — 1 issue(s) must be fixed:\n  L1: b0",
+		rig.runtime.nextWriteIndex(),
+		["lsp"],
+		[1],
+	);
+	rig.runtime.clearInlineBlockers(file, rig.runtime.nextWriteIndex());
+}
+
+/**
+ * Move session A's own stamp back past the gate's freshness window, wherever
+ * its partition sits: at the top, or carried under another session's.
+ */
+function expireSessionA(rig: Rig): void {
+	const data = guardRecord(rig);
+	const expired = Date.now() - DEFAULT_MAX_AGE_MS - 60_000;
+	rig.cacheManager.writeCache(
+		"turn-end-findings",
+		data?.sessionId === SESSION
+			? { ...data, blockerWrittenAt: expired }
+			: {
+					...data,
+					carriedBlockers: data?.carriedBlockers?.map((partition) =>
+						partition.sessionId === SESSION
+							? { ...partition, blockerWrittenAt: expired }
+							: partition,
+					),
+				},
+		rig.cwd,
+	);
+}
+
+const UNATTRIBUTABLE =
+	"The record holds blockers pi-lens cannot attribute to a file, so no re-check of one file clears them; the session that wrote them replaces them at its next turn end, and once 30 minutes pass";
+
+describe("#4750: another session's text no file owns stays until its owner re-runs or it expires", () => {
+	// RECURRENCE GUARDED: #4750 (the #4749 review F1/F2). The composer carried
+	// another session's file sections only: a project lane's report (a CRITICAL
+	// CVE) that names no file was dropped by any other session's next turn end,
+	// though no lane had re-checked it, and the commit gate then let that
+	// session commit. The read logged the drop though no write had happened.
+	for (const guardB of [true, false]) {
+		it(`keeps session A's CVE report through session B's findings turn, and B's commit is refused (B --lens-guard ${guardB ? "on" : "off"})`, async () => {
+			const rig = makeRig(`pi-lens-4750-kept-${guardB}-`);
+			try {
+				const laneText = await laneBlockerOfSessionA(rig);
+				const b = secondSession(rig, guardB);
+				retirement(b);
+				logLatency.mockClear();
+
+				expect(await endTurn(b)).toContain("Resolved this turn");
+
+				expect(ownerSections(rig)).toEqual([[SESSION, laneText]]);
+				expect(phaseCalls("sections_dropped")).toEqual([]);
+				const refusal = evaluateGitGuard(b.runtime, b.cacheManager, b.cwd);
+				expect(refusal).toMatchObject({ block: true, unknown: true });
+				expect(refusal.reason).toContain("(session_mismatch)");
+				expect(refusal.reason).toContain(UNATTRIBUTABLE);
+			} finally {
+				rig.cleanup();
+			}
+		});
+	}
+
+	it("keeps session A's CVE report through session B's repeated findings turn (the dedupe rewrite)", async () => {
+		const rig = makeRig("pi-lens-4750-dedupe-");
+		try {
+			const laneText = await laneBlockerOfSessionA(rig);
+			const b = secondSession(rig, true);
+			const blocker = () => {
+				const file = touch(b, "b.ts", "eval(x);\n");
+				b.runtime.recordInlineBlockers(
+					file,
+					"🔴 STOP — 1 issue(s) must be fixed:\n  L1: eval() is banned",
+					b.runtime.nextWriteIndex(),
+					["ast-grep"],
+					[1],
+				);
+			};
+			blocker();
+			expect(await endTurn(b)).toContain("eval() is banned");
+			b.runtime.beginTurn();
+			blocker();
+			logLatency.mockClear();
+			const before = Date.now();
+
+			// The same findings again: the dedupe branch rewrites the record.
+			await endTurn(b);
+
+			const sections = ownerSections(rig);
+			expect(sections.map(([owner]) => owner)).toEqual(["session-B", SESSION]);
+			expect(sections[1]).toEqual([SESSION, laneText]);
+			expect(phaseCalls("sections_dropped")).toEqual([]);
+			// B's own partition is rewritten, so its window restarts.
+			expect(guardRecord(rig)?.blockerWrittenAt).toBeGreaterThanOrEqual(before);
+			expect(evaluateGitGuard(b.runtime, b.cacheManager, b.cwd)).toMatchObject({
+				block: true,
+			});
+		} finally {
+			rig.cleanup();
+		}
+	});
+
+	it("the dedupe rewrite drops session A's expired report, with one drop row", async () => {
+		const rig = makeRig("pi-lens-4750-dedupe-expired-");
+		try {
+			await laneBlockerOfSessionA(rig);
+			const b = secondSession(rig, true);
+			const blocker = () => {
+				const file = touch(b, "b.ts", "eval(x);\n");
+				b.runtime.recordInlineBlockers(
+					file,
+					"🔴 STOP — 1 issue(s) must be fixed:\n  L1: eval() is banned",
+					b.runtime.nextWriteIndex(),
+					["ast-grep"],
+					[1],
+				);
+			};
+			blocker();
+			await endTurn(b);
+			expireSessionA(rig);
+			b.runtime.beginTurn();
+			blocker();
+			logLatency.mockClear();
+
+			await endTurn(b);
+
+			expect(ownerSections(rig).map(([owner]) => owner)).toEqual(["session-B"]);
+			expect(phaseCalls("sections_dropped")).toEqual([
+				{ by: "turn_end", basis: "no_file" },
+			]);
+		} finally {
+			rig.cleanup();
+		}
+	});
+
+	it("drops session A's report once its own stamp is past the window, with one drop row, and B may commit", async () => {
+		const rig = makeRig("pi-lens-4750-expired-");
+		try {
+			await laneBlockerOfSessionA(rig);
+			expireSessionA(rig);
+			const b = secondSession(rig, true);
+			retirement(b);
+			logLatency.mockClear();
+
+			await endTurn(b);
+
+			// Nothing blocks after the write, so delivering it cleared the record.
+			expect(ownerSections(rig)).toEqual([]);
+			expect(phaseCalls("sections_dropped")).toEqual([
+				{ by: "turn_end", basis: "no_file" },
+			]);
+			expect(evaluateGitGuard(b.runtime, b.cacheManager, b.cwd)).toEqual({
+				block: false,
+			});
+		} finally {
+			rig.cleanup();
+		}
+	});
+
+	it("a settled turn end of session B keeps A's fresh report and retires an expired one, one row each way", async () => {
+		const rig = makeRig("pi-lens-4750-settled-");
+		try {
+			const laneText = await laneBlockerOfSessionA(rig);
+			const b = secondSession(rig, true);
+			logLatency.mockClear();
+
+			// No edit: the read-only turn end retires only what may go.
+			await endTurn(b);
+
+			expect(ownerSections(rig)).toEqual([[SESSION, laneText]]);
+			expect(phaseCalls("sections_dropped")).toEqual([]);
+			expect(phaseCalls("record_retired")).toEqual([]);
+
+			expireSessionA(rig);
+			b.runtime.beginTurn();
+			logLatency.mockClear();
+
+			await endTurn(b);
+
+			expect(guardRecord(rig)).toBeUndefined();
+			expect(phaseCalls("record_retired")).toEqual([
+				{ by: "turn_end", basis: "no_file" },
+			]);
+			expect(phaseCalls("sections_dropped")).toEqual([]);
+			expect(evaluateGitGuard(b.runtime, b.cacheManager, b.cwd)).toEqual({
+				block: false,
+			});
 		} finally {
 			rig.cleanup();
 		}

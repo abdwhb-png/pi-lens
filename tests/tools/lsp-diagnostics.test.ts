@@ -25,21 +25,12 @@ vi.mock("../../clients/warm-attach.js", () => ({
 // #631: `groupFilesByPrimaryServer`/`runPerServerGroups` are the REAL
 // per-server-group scheduling primitives (`tools/lsp-diagnostics.ts` now
 // imports them from this module instead of using a flat, server-oblivious
-// pool) — only `getLSPService` is faked here. Keeping the real
-// grouping/scheduling implementations wired through the mock is what lets
-// the "#631 per-server scheduling" describe block below actually exercise
-// the property under test (never >1 in-flight touch per server group),
-// rather than a mock that would trivially satisfy it either way.
-vi.mock("../../clients/lsp/capabilities.js", async () => {
-	const actual = await vi.importActual<
-		typeof import("../../clients/lsp/capabilities.js")
-	>("../../clients/lsp/capabilities.js");
-	return {
-		...actual,
-		getLSPService: () => mocked.service,
-	};
-});
-
+// pool) — only the service the singleton hands out is a double, installed
+// through the lifecycle seam. Keeping the real grouping/scheduling
+// implementations is what lets the "#631 per-server scheduling" describe
+// block below actually exercise the property under test (never >1 in-flight
+// touch per server group), rather than a mock that would trivially satisfy it
+// either way.
 vi.mock("../../clients/lsp/wait-policy/index.js", () => ({
 	classifyCascadeWaitTier: () => mocked.cascadeTier,
 }));
@@ -58,14 +49,21 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { RUNTIME_CONFIG } from "../../clients/runtime-config.js";
+import { installLspService } from "../support/lsp-service-seam.js";
 
-describe("lsp_diagnostics tool", () => {
-	beforeEach(() => {
-		mocked.cascadeTier = "waits";
-		mocked.warmAttached = false;
-		mocked.attachedDiagnostics.mockReset();
-		reconcileScanDiagnosticsMock.mockReset().mockReturnValue(true);
-		mocked.service = makeLspServiceDouble({
+/**
+ * The mocked LSP service every case reads through `mocked.service`. #4397: it
+ * used to be installed only by the first describe's `beforeEach`, so the
+ * carve-out describe below ran on whatever service an earlier case left
+ * behind, and on `null` when a shuffle put it first.
+ */
+function resetServiceDouble() {
+	mocked.cascadeTier = "waits";
+	mocked.warmAttached = false;
+	mocked.attachedDiagnostics.mockReset();
+	reconcileScanDiagnosticsMock.mockReset().mockReturnValue(true);
+	mocked.service = installLspService(
+		makeLspServiceDouble({
 			getDiagnostics: vi.fn().mockImplementation(async (filePath: string) => {
 				if (filePath.endsWith("bad.ts")) {
 					return [
@@ -95,8 +93,12 @@ describe("lsp_diagnostics tool", () => {
 			// live. Cases that want the touch itself to answer install their
 			// own `touchFile` on the double.
 			touchFile: vi.fn(async () => undefined),
-		});
-	});
+		}),
+	);
+}
+
+describe("lsp_diagnostics tool", () => {
+	beforeEach(resetServiceDouble);
 
 	it("uses attached diagnostics for a batch without local warm-up or touches", async () => {
 		const touchFile = vi.fn();
@@ -2480,6 +2482,8 @@ describe("lsp_diagnostics tool", () => {
  * standalone query path has to apply them itself.
  */
 describe("lsp_diagnostics per-rule ignores carve-out (#3041)", () => {
+	beforeEach(resetServiceDouble);
+
 	// The shipped catalog rule that carves out `scripts/**` (#965).
 	const RULE = "no-console-except-error";
 

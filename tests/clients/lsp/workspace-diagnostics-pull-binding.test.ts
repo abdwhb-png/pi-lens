@@ -36,10 +36,6 @@ import { removeTempDirSync } from "../test-utils.js";
 
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 function makeServer(id: string, ext: string, root: string) {
@@ -56,8 +52,11 @@ function makeServer(id: string, ext: string, root: string) {
 describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 	let tmp: string;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-wsd-pull-binding-"));
@@ -89,7 +88,10 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 				diagnosticProviderKind: "object",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			requestWorkspaceDiagnostics: vi.fn(async () => [
 				{
 					filePath: file,
@@ -139,7 +141,10 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 				diagnosticProviderKind: "object",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			requestWorkspaceDiagnostics,
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			getDiagnostics: vi.fn(() => []),
@@ -198,7 +203,10 @@ describe("runWorkspaceDiagnostics pull-sweep content binding (#1104)", () => {
 				diagnosticProviderKind: "none",
 			}),
 			getOperationSupport: () => ({}),
-			notify: { open: vi.fn(async () => {}) },
+			notify: {
+				announceCreated: () => undefined,
+				open: vi.fn(async () => {}),
+			},
 			waitForDiagnostics: vi.fn().mockResolvedValue(undefined),
 			// touchFile's real merge logic (index.ts, not mocked) composes each
 			// spawned client's `getDiagnosticBinding` into the non-enumerable

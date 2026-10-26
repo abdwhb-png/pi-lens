@@ -21,7 +21,11 @@ let pathUtils: typeof import("../../clients/path-utils.js");
 let previousHome: string | undefined;
 
 beforeEach(async () => {
-	home = setupTestEnvironment("pi-lens-tool-cwd-").tmpDir;
+	// #4560: this home is a scratch PI_LENS_HOME, and the markerless-root
+	// cells need it to stay out of the project-root walk.
+	home = setupTestEnvironment("pi-lens-tool-cwd-", {
+		rootMarker: false,
+	}).tmpDir;
 	previousHome = process.env.PI_LENS_HOME;
 	process.env.PI_LENS_HOME = home;
 	process.env.PI_LENS_TEST_MODE = "0";
@@ -200,45 +204,52 @@ describe("resolveToolCwd (#2777)", () => {
 	});
 
 	it("preserves every registry language root through the shared seam", async () => {
-		const project = path.join(process.cwd(), ".probe-language-roots");
-		fs.rmSync(project, { recursive: true, force: true });
-		// #2846 H1: a workspace-priority wrapper must retain its marker metadata;
-		// otherwise Go silently falls back from a nested go.mod to the dispatch cwd.
-		const goServer = LSP_SERVERS.find((entry) => entry.id === "go");
-		expect(goServer?.root.rootMarkers).toEqual(
-			expect.arrayContaining(["go.mod"]),
-		);
-		const languageServers = LANGUAGES.map((language) => {
-			const serverId = language.lspId ?? language.id;
-			const server = LSP_SERVERS.find((entry) => entry.id === serverId);
-			return { language, server };
-		}).filter(
-			(
-				entry,
-			): entry is {
-				language: (typeof LANGUAGES)[number];
-				server: LSPServerInfo;
-			} => Boolean(entry.server?.root.rootMarkers?.length),
-		);
-		const table: string[] = [];
+		// #4864: this project used to live at `process.cwd()`, the repository root,
+		// where a repo-walking scan on a sibling worker could list it and then
+		// ENOENT when this cell removed it mid-walk. The per-test temp home is the
+		// seam every other cell in this file uses, and the markerless-root cells
+		// keep it out of any project-root walk.
+		const project = path.join(home, "language-roots");
+		try {
+			// #2846 H1: a workspace-priority wrapper must retain its marker metadata;
+			// otherwise Go silently falls back from a nested go.mod to the dispatch cwd.
+			const goServer = LSP_SERVERS.find((entry) => entry.id === "go");
+			expect(goServer?.root.rootMarkers).toEqual(
+				expect.arrayContaining(["go.mod"]),
+			);
+			const languageServers = LANGUAGES.map((language) => {
+				const serverId = language.lspId ?? language.id;
+				const server = LSP_SERVERS.find((entry) => entry.id === serverId);
+				return { language, server };
+			}).filter(
+				(
+					entry,
+				): entry is {
+					language: (typeof LANGUAGES)[number];
+					server: LSPServerInfo;
+				} => Boolean(entry.server?.root.rootMarkers?.length),
+			);
+			const table: string[] = [];
 
-		for (const { language, server } of languageServers) {
-			const nested = path.join(project, "packages", language.id);
-			const file = path.join(nested, "src", `main${language.extensions[0]}`);
-			fs.mkdirSync(path.dirname(file), { recursive: true });
-			for (const marker of server.root.rootMarkers ?? []) {
-				const markerName = marker.replaceAll("*", "project");
-				const markerPath = path.join(nested, markerName);
-				fs.mkdirSync(path.dirname(markerPath), { recursive: true });
-				fs.writeFileSync(markerPath, "");
+			for (const { language, server } of languageServers) {
+				const nested = path.join(project, "packages", language.id);
+				const file = path.join(nested, "src", `main${language.extensions[0]}`);
+				fs.mkdirSync(path.dirname(file), { recursive: true });
+				for (const marker of server.root.rootMarkers ?? []) {
+					const markerName = marker.replaceAll("*", "project");
+					const markerPath = path.join(nested, markerName);
+					fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+					fs.writeFileSync(markerPath, "");
+				}
+				const before = await server.root(file);
+				const after = await resolveLspServerCwd(server, file, project);
+				table.push(`${language.id}: ${before} === ${after}`);
+				expect(after, table.at(-1)).toBe(before);
 			}
-			const before = await server.root(file);
-			const after = await resolveLspServerCwd(server, file, project);
-			table.push(`${language.id}: ${before} === ${after}`);
-			expect(after, table.at(-1)).toBe(before);
+			console.log(table.join("\n"));
+		} finally {
+			fs.rmSync(project, { recursive: true, force: true });
 		}
-		console.log(table.join("\n"));
-		fs.rmSync(project, { recursive: true, force: true });
 	});
 
 	it("routes built-in language marker tables through the same seam", () => {
@@ -279,11 +290,12 @@ describe("resolveToolCwd (#2777)", () => {
 		const server = LSP_SERVERS.find((entry) => entry.id === "python");
 		if (!server) throw new Error("python server missing from registry");
 		const service = new LSPService(undefined, project);
-		const resolveRoot = (
-			service as unknown as {
+		const { clientRegistry } = service as unknown as {
+			clientRegistry: {
 				resolveServerRoot(server: LSPServerInfo, file: string): Promise<string>;
-			}
-		).resolveServerRoot.bind(service);
+			};
+		};
+		const resolveRoot = clientRegistry.resolveServerRoot.bind(clientRegistry);
 		expect(await resolveRoot(server, file)).toBe(path.dirname(file));
 	});
 

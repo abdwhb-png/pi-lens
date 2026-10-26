@@ -1,3 +1,4 @@
+// real-home: read-only PATH probe for the maintainer's managed knip (`~/.pi-lens/tools/node_modules/.bin`); the pinned home has no managed tools tree, and the scenario skips where neither that nor a PATH knip exists.
 /**
  * The turn-simulation harness's seed scenarios — #1635 item 1.
  *
@@ -21,22 +22,30 @@
  * runs, but this host does not have the tool it drives (scenario 2 shells out
  * to a real knip).
  *
- * Live as of this revision: scenario 1 (#1627 merged) and scenario 2 (#1637
- * merged 2026-08-18). Pending: scenario 3 on PR #1633, still open, and
+ * Live as of this revision: scenario 1 (#1627 merged), scenario 2 (#1637
+ * merged 2026-08-18) and scenario 3 (#1633 merged 2026-08-19). Pending:
  * scenario 4 on nothing — that blind spot has no fix in flight.
  */
 
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import { KnipClient } from "../../clients/knip-client.js";
+import { REAL_HOME } from "../support/vitest-setup.js";
 import {
 	defineTurnScenario,
 	runTurnScenario,
 	type TurnScenario,
 } from "../support/turn-harness.js";
+import { setProjectTrustState } from "../../clients/project-trust.js";
+
+// #4530: the knip CLI under test is this checkout's own devDependency, found
+// through the test runner's `node_modules/.bin` PATH entry. That entry is the
+// session repository's own bytes, which a bare lookup refuses until pi trusts
+// the project. This file tests the tool, not trust, so it adopts trust the way
+// the maintenance hosts do; the trust rule has its own suite.
+setProjectTrustState("trusted");
 
 // ── Scenario 1 — gitleaks stale replay (#1622, fixed by PR #1627) ────────────
 
@@ -91,17 +100,13 @@ const gitleaksStaleReplay = defineTurnScenario({
  * `KnipClient.analyze`, the layer the stub removed.
  *
  * The availability probe mirrors `tests/clients/knip-cache-consumer-staleness.ts`'s:
- * the suite redirects `PI_LENS_HOME` to a per-worker temp dir, so the managed
- * install has to be found through the real home directory and put on PATH.
+ * the suite redirects `PI_LENS_HOME`, `HOME` and the XDG directories to
+ * per-worker temp dirs (#4789), so the managed install has to be found through
+ * `REAL_HOME` (a named opt-out, `tests/support/real-home-readers.ts`) and put on
+ * PATH.
  */
 const managedKnipBinDir = (() => {
-	const dir = path.join(
-		os.homedir(),
-		".pi-lens",
-		"tools",
-		"node_modules",
-		".bin",
-	);
+	const dir = path.join(REAL_HOME, ".pi-lens", "tools", "node_modules", ".bin");
 	return fs.existsSync(dir) ? dir : null;
 })();
 
@@ -216,15 +221,13 @@ const knipStaleCache = defineTurnScenario({
 	},
 });
 
-// ── Scenario 3 — dependency-drift replay (#1631, PR #1633 open) ──────────────
+// ── Scenario 3 — dependency-drift replay (#1631, fixed by PR #1633) ──────────
 
 const dependencyDriftReplay = defineTurnScenario({
 	id: "dependency-drift-replay",
 	incident:
 		"a blocker on the consumer file replayed for 50 minutes after the missing export was added to its dependency by a bash script",
 	issue: "#1631",
-	pendingOn:
-		"#1631 / PR #1633 — cached cross-file blockers are not revalidated against out-of-band dependency changes",
 	async run(h) {
 		h.write("src/worktree.ts", "export const other = 1;\n");
 		h.edit(

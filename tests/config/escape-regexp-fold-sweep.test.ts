@@ -72,6 +72,7 @@ import {
 	relativePosix,
 	stripSource,
 } from "../support/sweep-kit.js";
+import { TREE_WALK_TIMEOUT_MS } from "../support/test-timeout-scale.js";
 
 const root = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -85,18 +86,28 @@ const CANONICAL_FILE = "clients/string-utils.ts";
 // (quote style may vary; whitespace around the comma may vary).
 const ESCAPE_CALL = String.raw`\.replace\(\s*\/\[\.\*\+\?\^\$\{\}\(\)\|\[\\\]\\\\\]\/g\s*,\s*["'\`]\\\\\$&["'\`]\s*\)`;
 
-/** Shape A: a function declaration/expression whose body returns the escape. */
+/** Shape A: a function declaration/expression whose body returns the escape.
+ *
+ * The `(?:String\(\s*)?` arm covers the form that shipped through this sweep
+ * unnoticed in `scripts/ci-verdict.mjs` (#4680 V5c):
+ * `return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");`. The body was
+ * byte-identical to the canonical leaf -- only a `String(...)` wrapper sat
+ * between the parameter and `.replace`, which the bare-identifier arm below
+ * requires. That is shape 38's own evasion (a copy the guard's spelling cannot
+ * see), so the sweep now reads through the wrapper. */
 const FUNCTION_SHAPE = new RegExp(
-	String.raw`function\s+[A-Za-z_$][\w$]*\s*\([^)]*\)[^{]*\{\s*return\s+[A-Za-z_$][\w$]*` +
+	String.raw`function\s+[A-Za-z_$][\w$]*\s*\([^)]*\)[^{]*\{\s*return\s+(?:String\(\s*)?[A-Za-z_$][\w$]*\s*\)?` +
 		ESCAPE_CALL +
 		String.raw`\s*;?\s*\}`,
 );
 
 /** Shape B: an arrow function (parenthesized or bare single param) whose
  * expression body is the escape — including an inline callback such as
- * `.map((token) => token.replace(...))`. */
+ * `.map((token) => token.replace(...))`. The `(?:String\(\s*)?` arm is shape
+ * A's, for the same wrapper (#4680 r4 F10): round 3 widened shape A only, and
+ * `const escapeRegExp = (text) => String(text).replace(...)` stayed green. */
 const ARROW_SHAPE = new RegExp(
-	String.raw`(?:\(\s*[A-Za-z_$][\w$]*[^)]*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[\w$]+)?\s*=>\s*[A-Za-z_$][\w$]*` +
+	String.raw`(?:\(\s*[A-Za-z_$][\w$]*[^)]*\)|[A-Za-z_$][\w$]*)\s*(?::\s*[\w$]+)?\s*=>\s*(?:String\(\s*)?[A-Za-z_$][\w$]*\s*\)?` +
 		ESCAPE_CALL,
 );
 
@@ -143,40 +154,81 @@ describe("escapeRegExp single-source-of-truth (#2558)", () => {
 	// Whole-tree walk: 5.27 s under full-suite load on CI (PR #2742 rounds 2
 	// and 3 timed out at the 5 s default). Same budget as the other tree-walk
 	// sweeps (dependency-boundaries.test.ts).
-	it("has no local escaping-helper definition outside the canonical leaf", () => {
-		const files = listCandidateFiles();
-		// Belt-and-suspenders total floor on top of each directory's own floor
-		// above (~1620 at authoring time).
-		assertNonEmptyScan(
-			"clients/tools/mcp/scripts/tests source files",
-			files.length,
-			1400,
-		);
+	it(
+		"has no local escaping-helper definition outside the canonical leaf",
+		() => {
+			const files = listCandidateFiles();
+			// Belt-and-suspenders total floor on top of each directory's own floor
+			// above (~1620 at authoring time).
+			assertNonEmptyScan(
+				"clients/tools/mcp/scripts/tests source files",
+				files.length,
+				1400,
+			);
 
-		const offenders: string[] = [];
-		// readWalkedFile: this population includes the tests/ tree
-		// (`{ dir: "tests", floor: 900 }` above), which a concurrently running
-		// test can mutate; a path that vanished between the walk and the read is
-		// out of the population, not a finding (#3082).
-		for (const file of files) {
-			const rel = relativePosix(root, file);
-			if (rel === CANONICAL_FILE) continue;
-			const raw = readWalkedFile(file);
-			if (raw === undefined) continue;
-			const stripped = stripSource(raw, { strings: "keep" });
-			if (FUNCTION_SHAPE.test(stripped) || ARROW_SHAPE.test(stripped)) {
-				offenders.push(rel);
+			const offenders: string[] = [];
+			// readWalkedFile: this population includes the tests/ tree
+			// (`{ dir: "tests", floor: 900 }` above), which a concurrently running
+			// test can mutate; a path that vanished between the walk and the read is
+			// out of the population, not a finding (#3082).
+			for (const file of files) {
+				const rel = relativePosix(root, file);
+				if (rel === CANONICAL_FILE) continue;
+				const raw = readWalkedFile(file);
+				if (raw === undefined) continue;
+				const stripped = stripSource(raw, { strings: "keep" });
+				if (FUNCTION_SHAPE.test(stripped) || ARROW_SHAPE.test(stripped)) {
+					offenders.push(rel);
+				}
 			}
-		}
 
+			expect(
+				offenders,
+				`new escaping-helper definition(s) found outside ${CANONICAL_FILE} — ` +
+					`import { escapeRegExp } from "clients/string-utils.js" ` +
+					`(or its tests/support/sweep-kit.js re-export) instead of re-copying ` +
+					`the body: ${offenders.join(", ")}`,
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
+
+	// The guard's own positive control: the body that shipped as a second copy
+	// in #4680's `scripts/ci-verdict.mjs` must MATCH, or the sweep is a spelling
+	// the next copy walks around (shape 38, shape 69).
+	it("sees the `String(...)`-wrapped copy that shipped through it", () => {
+		// The body that shipped as a second copy in this PR's scripts/ci-verdict.mjs:
+		// byte-identical to the canonical leaf, with only a `String(...)` wrapper in
+		// front of `.replace`. The pieces are separate literals so the fixture line
+		// below is reproduced exactly rather than re-escaped by hand.
+		const escapeBody = "[.*+?^${}()|[\\]\\\\]";
+		const escapeReplacement = '"\\\\$&"';
+		const emit = (receiver: string) =>
+			`function escapeRegExp(text) {\n\treturn ${receiver}.replace(/${escapeBody}/g, ${escapeReplacement});\n}`;
+		expect(FUNCTION_SHAPE.test(emit("String(text)"))).toBe(true);
+		// ...and the bare form still does.
+		expect(FUNCTION_SHAPE.test(emit("value"))).toBe(true);
+		// A DIFFERENT character class is a variant, not a copy: it must stay out.
+		const globBody = "[.+^${}()|[\\]\\\\]";
+		const variant = `function globToRegExp(text) {\n\treturn text.replace(/${globBody}/g, ${escapeReplacement});\n}`;
+		expect(FUNCTION_SHAPE.test(variant)).toBe(false);
+		// #4680 r4 F10: the arrow spelling of the same wrapper, and the bare
+		// arrow forms it must keep seeing.
+		const arrow = (receiver: string) =>
+			`const escapeRegExp = (text) => ${receiver}.replace(/${escapeBody}/g, ${escapeReplacement});`;
+		expect(ARROW_SHAPE.test(arrow("String(text)"))).toBe(true);
+		expect(ARROW_SHAPE.test(arrow("text"))).toBe(true);
 		expect(
-			offenders,
-			`new escaping-helper definition(s) found outside ${CANONICAL_FILE} — ` +
-				`import { escapeRegExp } from "clients/string-utils.js" ` +
-				`(or its tests/support/sweep-kit.js re-export) instead of re-copying ` +
-				`the body: ${offenders.join(", ")}`,
-		).toEqual([]);
-	}, 30_000);
+			ARROW_SHAPE.test(
+				`const e = v => v.replace(/${escapeBody}/g, ${escapeReplacement});`,
+			),
+		).toBe(true);
+		expect(
+			ARROW_SHAPE.test(
+				`const g = (text) => text.replace(/${globBody}/g, ${escapeReplacement});`,
+			),
+		).toBe(false);
+	});
 
 	it("the canonical leaf still defines escapeRegExp with the expected body", () => {
 		const src = readFileSync(path.join(root, CANONICAL_FILE), "utf8");

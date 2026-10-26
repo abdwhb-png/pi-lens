@@ -26,20 +26,46 @@ export function changesTestTreeFile(file: string): boolean;
 /** CI-only suites (file → why it cannot run in pre-push), #3426 H3432-1. */
 export const CI_ONLY_PRE_PUSH_TESTS: Record<string, string>;
 
-/** Returns pushed diff ranges, or null for a deletion-only push. */
-export function resolveDiffRange(input?: string): string[] | null;
+/** `upstream/master` when it has commits `origin/master` lacks (#4724). */
+export function resolveBaseRef(): "origin/master" | "upstream/master";
+
+/**
+ * Returns `<base>...<pushed sha>` ranges, or null for a deletion-only push.
+ * `remoteTip` returns the pre-#4724 ranges, the fallback for an unresolvable
+ * base.
+ */
+export function resolveDiffRange(
+	input?: string,
+	base?: string,
+	options?: { remoteTip?: boolean },
+): string[] | null;
 
 export function changesProductionFile(file: string): boolean;
 
-export function changedFiles(range: string): string[] | null;
+export function changedFiles(
+	range: string,
+	options?: { diffFilter?: string; cwd?: string; env?: NodeJS.ProcessEnv },
+): string[] | null;
 
 /** Uncommitted tracked edits plus untracked, non-ignored files (#4047). */
 export function worktreeChangedFiles(): string[] | null;
 
 export function collectTestFiles(dir: string, out?: string[]): string[];
 
+/** `changed` and `mirror` are the change's own tests, never capped (#4489). */
+export type SelectionReason =
+	| "changed"
+	| "mirror"
+	| "import"
+	| "history"
+	| "governance";
+
 export interface TargetedTestSelection {
-	/** When `capped`, only the armed governance registries (#3492). */
+	/**
+	 * When `capped`: the change's own tests, the best `MAX_SELECTED_TESTS` import
+	 * matches (fewest importers first, ties by path), the armed governance
+	 * registries (#3492) and the history picks (#4489).
+	 */
 	selected: string[];
 	unmatched: string[];
 	capped: boolean;
@@ -49,7 +75,7 @@ export interface TargetedTestSelection {
 	/** Tests only the history pass added (#3215 lane 3). */
 	fromHistory: string[];
 	/** The reason each selected test entered the final selection (#4034). */
-	selectionReasons: Map<string, "import" | "history" | "governance">;
+	selectionReasons: Map<string, SelectionReason>;
 }
 
 export function selectTargetedTests(
@@ -64,7 +90,7 @@ export interface PrePushRecord {
 	timestamp: string;
 	selected: Array<{
 		file: string;
-		reason: "import" | "history" | "governance";
+		reason: SelectionReason;
 	}>;
 	passed: number;
 	failed: number;
@@ -80,6 +106,8 @@ export interface PrePushRecord {
 		| "tests-failed"
 		| "tests-lock-timeout"
 		| "tests-runner-failed";
+	/** Set only when the tests ran in a clean checkout of exactly this head. */
+	treeBound?: true;
 }
 
 export function readPrePushRecord(
@@ -99,6 +127,7 @@ export function writePrePushRecord(input: {
 	vitestExitCode: number | null;
 	wallTimeMs: number;
 	outcome?: PrePushRecord["outcome"];
+	treeBound?: boolean;
 }): PrePushRecord;
 
 export function parseVitestCounts(output: string): {

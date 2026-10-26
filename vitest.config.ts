@@ -11,6 +11,19 @@ import {
 process.env.PI_LENS_DISABLE_TOOL_INSTALL ??= "1";
 process.env.PI_LENS_TMP_HYGIENE_RUN_ID ??= `${Date.now()}-${process.pid}`;
 
+// #4673: pin jiti's fs cache off for the pre-fork process too. pi's loader
+// mkdirs `path.join(os.tmpdir(), "jiti")` in-process on the first by-path
+// extension load -- its `createJiti(import.meta.url, …)` call at
+// `@earendil-works/pi-coding-agent/dist/core/extensions/loader.js:477` -- and
+// the tmp-root census then judges it as a #4560 fixture sibling. Workers force
+// the same pair in `tests/support/vitest-setup.ts` before any test module
+// loads; this copy reaches globalSetup and every child forked ahead of the
+// first worker, forced here for the same reason (an ambient value would put
+// the sibling back). `tests/config/tmp-fixture-hygiene.test.ts` pins this
+// file's half and drives the load.
+process.env.JITI_FS_CACHE = "0";
+process.env.JITI_CACHE = "0";
+
 // #4019: GitHub's Windows runner exposes TEMP as an 8.3 short path
 // (`C:\Users\RUNNER~1\...`), but production canonicalizes through
 // `realpath.native`, which answers the long spelling (`...\runneradmin\...`).
@@ -312,16 +325,39 @@ const timingSensitiveInclude = [
 // silently goes stale.
 const lspSpawnHeavyInclude = [
 	"tests/clients/ast-grep-rule-precedence-followups.test.ts",
+	// #1712/#4485: the cascade's live twin over a real classic TypeScript
+	// server (opt-in, PI_LENS_INTEGRATION=1); three cascades each wait on
+	// the wrapper's tsserver answers.
+	"tests/clients/cascade-classic-ts-live.test.ts",
+	// #4403 round 4: the cascade line through pi's turn path. Real fake-LSP
+	// children (typescript, typos, Opengrep stand-ins) behind project command
+	// overrides, one of them held 8 s before it answers; same contention
+	// class as tests/tools/diagnostics-route-switch-matrix.test.ts.
+	"tests/clients/cascade-unanswered-primary-4403.test.ts",
 	"tests/clients/dispatch/runners/lsp-real-runner.test.ts",
 	// #3968: the builtin shuck row's smoke — a real `shuck server` child driven
 	// through the production LSP runner (real initialize handshake, real
 	// diagnostics publish, one didChange round trip). Real child + real wire,
 	// same #1022/#2332 contention class as its lane siblings.
 	"tests/clients/dispatch/runners/shuck-lsp-smoke.test.ts",
+	// #4758: the production LSPService over a real stdio fake-server child that
+	// pulls `workspace/configuration` after `initialized`; waits on a real
+	// handshake and the answer's trace line, the same #1022/#2332 shape as its
+	// lane siblings.
+	"tests/clients/lsp/config-section-answers-4758.test.ts",
 	// #3501: two real fake-server children (the second a respawn after the
 	// first is SIGKILLed), each through a real initialize handshake, then a
 	// first-diagnostics wait on the replacement — the #1022/#2332 shape.
 	"tests/clients/lsp/crash-respawn-debounce-wire.test.ts",
+	// #4322: the production LSPService over two real stdio fake-server children
+	// (a JSON primary and a typos auxiliary); waits on real handshakes and a
+	// diagnostics round, the same #1022/#2332 shape as its lane siblings.
+	// #1712 slice 2: the cross-file live twins over the same real classic
+	// TypeScript server (opt-in, PI_LENS_INTEGRATION=1); each case waits on the
+	// wrapper's handshake, its willRenameFiles answer and one diagnostics round
+	// trip, the same contention class as the cascade twin above.
+	"tests/clients/lsp/crossfile-classic-ts-live.test.ts",
+	"tests/clients/lsp/diagnostics-health-unavailable-primary-4322.test.ts",
 	// #3405: its last describe spawns two real fake-server children through
 	// `spawnFakeLspServer` and waits on a real initialize handshake before
 	// asserting which notifications reached the server — the same #1022/#2332
@@ -329,11 +365,45 @@ const lspSpawnHeavyInclude = [
 	"tests/clients/lsp/did-save-notification.test.ts",
 	"tests/clients/lsp/fake-lsp-server-parent-watchdog.test.ts",
 	"tests/clients/lsp/integration.test.ts",
+	// #4786: a real `createLSPClient` over stdio fake-server children that publish
+	// a finding then an unversioned empty; waits on real handshakes and debounce
+	// windows, the same #1022/#2332 contention class as its siblings.
+	"tests/clients/lsp/opengrep-late-empty-4786.test.ts",
+	// #4787: a real fake-server child gates its first diagnostic on the
+	// production didCreateFiles-before-didOpen ordering.
+	"tests/clients/lsp/opengrep-new-file-4787.test.ts",
+	// #4764: the production LSPService touch and a real `createLSPClient` over
+	// stdio fake-server children that report a failed rule download
+	// (`window/showMessage`) and then publish; waits on real handshakes and
+	// debounce windows, the same #1022/#2332 contention class as its siblings.
+	"tests/clients/lsp/opengrep-offline-config-failure.test.ts",
+	// #4765: the live twin over the real Opengrep binary with the network cut
+	// (skipped, with a named reason, when none is installed). It has no
+	// launchLSP/getServerById marker, so the census cannot derive it (its known
+	// marker gap); membership is by hand.
+	"tests/clients/lsp/opengrep-offline-findings-4765.integration.test.ts",
+	// #4758: a real pyright-langserver child (skipped, with a named reason, when
+	// none is installed) behind a real initialize handshake, then a first-
+	// diagnostics wait of up to 30 s per case — the #1022/#2332 shape of its
+	// lane siblings.
+	"tests/clients/lsp/pyright-settings-effect-4758.integration.test.ts",
 	// #4248: the unknown-trust project-local binary witness resolves a real
 	// PATH entry through launchLSP; keep that child-spawn boundary phased here.
 	"tests/clients/lsp/service-project-trust.test.ts",
+	// #4755: a real terraform-ls child (skipped when the binary is absent) behind
+	// a real initialize handshake, then a first-diagnostics wait of up to 15 s per
+	// case — the #1022/#2332 shape of its lane siblings.
+	"tests/clients/lsp/terraform-ls-tfvars-language-id.test.ts",
+	// #4532 gap 9: the server's own view of what it was sent only exists on a
+	// real stdio wire to a real fake-server child; the initialize handshake is
+	// the same #1022/#2332 shape as its lane siblings.
+	"tests/clients/lsp/touch-debounce-content-gate.test.ts",
 	// #4299: real wrapper compiler-resolution security witness.
 	"tests/clients/lsp/tsserver-project-trust-wire.test.ts",
+	// #4320: the watched-files wire frames only exist on a real stdio connection
+	// to a real fake-server child; the handshake is the same #1022/#2332 shape as
+	// its lane siblings.
+	"tests/clients/lsp/watched-files-created-4320.test.ts",
 	"tests/clients/lsp/workspace-diagnostics-language-neutral.test.ts",
 	// #2776: the real fake-server wire is the only way to reproduce the
 	// custom-primary handler verdict after pull diagnostics are ignored and a
@@ -342,6 +412,12 @@ const lspSpawnHeavyInclude = [
 	// project unless it is explicitly phased here. `test:integration` still
 	// selects the same file positionally, while `test:unit` excludes it below.
 	"tests/clients/lsp/workspace-diagnostics-sweep-attribution.integration.test.ts",
+	// #4534: the read-guard-off recovery witness drives the real LSP service
+	// on the shared fake-server child to observe the recovered bytes arrive.
+	"tests/clients/opaque-mutation-scan.test.ts",
+	// #4765: `OpengrepServer.spawn` cases launch a real PATH stub that only stays
+	// alive; no launchLSP/getServerById marker, so membership is by hand.
+	"tests/clients/opengrep-rule-pack-4765.test.ts",
 	// #3961: the `--lsp` cold-path witness spawns the real bin, which spawns
 	// real LSP children (deno `lsp`, opengrep `lsp`, typos-lsp, ast-grep `lsp`)
 	// for the file. The indirect spawn is invisible to this lane's marker census
@@ -349,10 +425,31 @@ const lspSpawnHeavyInclude = [
 	// import) because the bin is a separate process, so the membership is stated
 	// here by hand rather than pretended to be derived. The file runs once: the
 	// default project excludes this list.
+	// #4632 slice 7: the same cascade line through a REAL pi AgentSession, whose
+	// next provider request carries it. The same fake-LSP children behind the
+	// same project overrides, one held 8 s; the session adds pi's own turn loop
+	// on top of the wait.
+	"tests/index-4632-s7-turn-end-ordering.test.ts",
 	"tests/mcp/analyze-cli.test.ts",
 	// #4300: the MCP witness crosses Lean's real initialize handshake.
 	"tests/mcp/server.smoke.test.ts",
+	// #4521: the nightly born-after-start phase run through the production
+	// lsp_diagnostics handler and LSPService over real stdio fake-server
+	// children (two project custom servers); waits on real handshakes and
+	// polls to a deadline like #4320's and #4346's.
+	"tests/scripts/smoke-tools-born-after-start.test.ts",
+	// #4403: the LSP scripts' touch reading over the production
+	// LSPService, with fake-server children for the official Docker server and
+	// typos; waits on real handshakes like its lane siblings.
+	"tests/scripts/touch-result.test.ts",
 	"tests/support/fake-lsp-server.test.ts",
+	// #4403: the diagnostics route matrix. Real fake-LSP children (the JSON
+	// server, typos and an Opengrep stand-in, project command overrides) behind
+	// pi's hooks and tools, plus a real MCP server child per column; waits on
+	// real handshakes and pull rounds like #4320's. The MCP bin receives the
+	// fixture path, so the marker census cannot see that half; stated here by
+	// hand like analyze-cli above.
+	"tests/tools/diagnostics-route-switch-matrix.test.ts",
 	// #873/#448: the dispatch LSP runner against a real stdio JSON-RPC server
 	// — a real child spawn through the production LSPService plus a
 	// `.pi-lens/lsp.json` custom server, waiting on real first-document
@@ -367,11 +464,41 @@ const lspSpawnHeavyInclude = [
 	// kill — same process-death-timing budget and contention class as the
 	// watchdog test above.
 	"tests/tools/lsp-diagnostics-2776.test.ts",
+	// #4320: the production LSPService and the workspace-diagnostics cache over a
+	// real stdio fake-server child configured as a project custom server; waits on
+	// a real handshake and two diagnostics rounds like its lane siblings.
+	"tests/tools/lsp-diagnostics-created-module-4320.test.ts",
+	// #4346: the production lsp_diagnostics handler, LSPService and workspace
+	// edit applier over a real stdio fake-server child (a project custom
+	// server); waits on a real handshake and diagnostics rounds like #4320's.
+	"tests/tools/lsp-diagnostics-created-outside-4346.test.ts",
 	// #3310: launches the fake server THROUGH the production `PHPServer` entry
 	// (an executable node_modules/.bin/intelephense shim) and waits on a real
 	// initialize handshake plus a two-publish diagnostics sequence per case —
 	// the same #1022/#2332 contention class as its lane siblings.
 	"tests/tools/lsp-diagnostics-empty-first-publish-3310.test.ts",
+	// #4636: the production lsp_diagnostics handler and LSPService over a real
+	// stdio fake-server child (a project custom server for `.json`), reading the
+	// announced `languageId` off the wire after a real handshake and a
+	// diagnostics round like its lane siblings.
+	"tests/tools/lsp-diagnostics-jsonc-language-id-4636.test.ts",
+	// #4322: the production lsp_diagnostics handler, LSPService and the dispatch
+	// LSP runner beside a real stdio fake-server child (the typos auxiliary)
+	// whose primary cannot start; waits on a real handshake like #4346's.
+	"tests/tools/lsp-diagnostics-missing-primary-4322.test.ts",
+	// #4322: the same handler and LSPService with no auxiliary at all; the
+	// primary's spawn fails for real (a missing command) on every touch.
+	"tests/tools/lsp-diagnostics-no-client-4322.test.ts",
+	// #4323: the production lsp_diagnostics handler and LSPService over real
+	// stdio fake-server children (the JSON server and an Opengrep stand-in,
+	// project command overrides); waits on real handshakes and pull rounds like
+	// #4320's.
+	"tests/tools/lsp-diagnostics-opengrep-disabled-4323.test.ts",
+	// #4763: the production lsp_diagnostics handler and LSPService over real
+	// stdio fake-server children (the JSON server and an Opengrep stand-in that
+	// publishes its empty pre-rules set, then the finding, 250 ms apart); waits on
+	// real handshakes and publish rounds, the #1022/#2332 shape of #4323's.
+	"tests/tools/lsp-diagnostics-opengrep-pre-rules-4763.test.ts",
 	// #3750: launches the fake server THROUGH the production `RustServer`,
 	// `OCamlServer` and `GoServer` entries (PATH shims) and waits on a real
 	// initialize handshake plus a pull round trip per case -- the same
@@ -426,6 +553,12 @@ export const wallClockBudgetInclude = [
 	// #4148: a 199K-blank-line rule is a real event-loop occupancy witness for
 	// validateRule's synchronous language extraction, so it runs serialized.
 	"tests/clients/ast-grep-rule-regex-budget.test.ts",
+	// #4713 R11, R12: real `bash -c` is the oracle for 2 625 generated cd,
+	// empty-word and redirect-target spellings (flake-shape admission); about
+	// 5 s of serial spawns. No wall-clock budget assertion: the file pins its
+	// exact row count, one spawn per row, which bounds the cost without a
+	// clock that a loaded host would make flake.
+	"tests/clients/bash-word-composition.test.ts",
 	"tests/clients/biome-config-decorator-metadata.test.ts",
 	"tests/clients/build-identity.test.ts",
 	// #4046: the impact-cascade and reverse-dependency cases assert a t(4N)/t(N)
@@ -434,9 +567,26 @@ export const wallClockBudgetInclude = [
 	"tests/clients/cascade-graph-occupancy.test.ts",
 	"tests/clients/cascade-turn-merge.test.ts",
 	"tests/clients/config-diagnostic-codes.test.ts",
+	// #4535 slice 2: the HEAD look and the bash write path drive a real git
+	// repository through their real entry points (flake-shape admission).
+	"tests/clients/disk-change-detectors-4535.test.ts",
 	"tests/clients/dispatch/runners/ast-grep-playground-verify.test.ts",
 	"tests/clients/dispatch/runners/ast-grep-rule-ignores.test.ts",
+	// #4522: the git-ignored census reads git's own tracked-versus-ignored
+	// answer through a real `git ls-files` child (flake-shape admission).
+	"tests/clients/dispatch/smoke-fixture-coverage.test.ts",
+	// #4321: the real Biome binary's 80-column wrapping is the subject (flake-shape admission).
+	"tests/clients/format-service-tab-width-real-biome.test.ts",
+	// #4739: real `bash -c` is the oracle for about 4 400 spellings of git and its
+	// verbs, bare and inside subshells, groups, `eval` strings and launchers (flake-shape
+	// admission); one spawn per row, about 11 s serial. No wall-clock assertion: the file pins its
+	// exact row count, which bounds the cost.
+	"tests/clients/git-guard-decoded-word.test.ts",
 	"tests/clients/git-tracked-ignore.test.ts",
+	// #4493: real git repositories and fake-LSP children driven through the
+	// tool_call/tool_result seams (flake-shape admission); the fake-server
+	// handshake rides along in this fully serialized lane.
+	"tests/clients/head-move-resync-4493.test.ts",
 	// #2557 review round 3: a real 30s deadline margin is the subject of an abort-vs-deadline precedence assertion (flake-shape admission).
 	"tests/clients/hook-await-fold-bounds.test.ts",
 	"tests/clients/installer/pip-pep668.test.ts",
@@ -473,11 +623,24 @@ export const wallClockBudgetInclude = [
 	// window. Keep child-process CPU sampling and this wall-clock lower bound in
 	// the fully serialized, dead-last phase.
 	"tests/clients/lsp/service-notify-cpu-liveness.test.ts",
+	// #4742: a real git checkout and a real pyright-langserver child (skipped,
+	// with a named reason, when none is installed): the stale bytes live only in
+	// the server, so the handshake and two diagnostics waits of up to 30 s run
+	// in the serialized lane (flake-shape admission).
+	"tests/clients/lsp/unheld-module-pyright-4742.integration.test.ts",
+	// #4709 slice 3b: the resolver verdict `runRebuild` acts on comes from the
+	// real package-manager lookup spawning executable stand-in managers on PATH
+	// (flake-shape admission).
+	"tests/clients/mcp/review-rebuild.test.ts",
 	"tests/clients/metrics-history-stderr.test.ts",
 	// #4268 MED-8: a real `npx` child is the observation (the spawned process's
 	// own environment), so it runs in the quiet serialized phase (flake-shape
 	// admission).
 	"tests/clients/npx-child-env-isolation.test.ts",
+	// #4732: the per-call cost under test is the real `git status` children a
+	// captured tool call spawns, counted at the spawn boundary (flake-shape
+	// admission).
+	"tests/clients/opaque-any-tool-4732.test.ts",
 	// #2886 round 2: the /lens-perf occupancy row keeps its real-clock
 	// sampler assertion (a yield count is O(input) and cannot see per-chunk
 	// block growth), so the file runs here, fully serialized (flake-shape
@@ -498,6 +661,12 @@ export const wallClockBudgetInclude = [
 	// backtracking against a long non-matching path; the test measures the real
 	// synchronous matcher cost and belongs in the quiet serialized phase.
 	"tests/clients/read-guard-glob-nonbacktracking.test.ts",
+	// #4638: the fix passes are measured through the real ruff binary (flake-shape admission).
+	"tests/clients/ruff-target-version-real.test.ts",
+	// #4780 R3 review: the reload-timer case asserts a negative (a cancelled timer
+	// fetched nothing), so it waits a bounded real window; serialized here like its
+	// flake-shape peers (admission header + baseline row in the same change).
+	"tests/clients/runtime-session-opengrep-refresh-timer-4780.test.ts",
 	"tests/clients/runtime-session-scan-cache.test.ts",
 	// #4126: the first-session warmup has no awaitable completion signal; keep
 	// its real deferred-notification ordering in the serialized phase.
@@ -514,6 +683,9 @@ export const wallClockBudgetInclude = [
 	"tests/clients/safe-spawn-resource-usage.test.ts",
 	"tests/clients/safe-spawn-timeout-teardown.test.ts",
 	"tests/clients/safe-spawn-windows-command.test.ts",
+	// #4530: planted executables write marker files through the real spawn
+	// seam, PATH lookup and package-manager query (flake-shape admission).
+	"tests/clients/session-repository-trust-4530.test.ts",
 	// #3403: real scratch-tree rotation performs cold-disk filesystem work;
 	// measured p95 is 3.63s under six workers and eight CPU hogs, so the 10s
 	// assertion/budget leaves bounded CI scheduling headroom.
@@ -523,9 +695,21 @@ export const wallClockBudgetInclude = [
 	// #3871: runner-location regex budget (depth-30 paths, 100K blank runs
 	// and tokens); a real event-loop occupancy witness, so it runs serialized.
 	"tests/clients/test-runner-location-regex-budget.test.ts",
+	// #4709 slice 3b: the global-bin and fallback arms of resolveExec run the real
+	// package-manager lookup against executable stand-in managers (flake-shape
+	// admission).
+	"tests/clients/test-runner-resolve-exec.test.ts",
 	// #3511 review round 3: the quick-mode warmup witness joins session_start's
 	// background save with vi.waitFor (flake-shape admission).
 	"tests/clients/word-index-lifecycle.test.ts",
+	// #4583: the cold build is fire-and-forget (`triggerBackgroundWordIndexBuild`
+	// returns a status, not a joinable), so the witness joins the snapshot it
+	// publishes with a real-time vi.waitFor (flake-shape admission).
+	"tests/clients/word-index.test.ts",
+	// #4789: a real child process is the only observer of the HOME and XDG
+	// directories a spawned tool inherits from the worker (flake-shape
+	// admission).
+	"tests/clients/worker-home-pin-hermeticity.test.ts",
 	// #2603 (was #2591 review round 2, F1): the workspace-member matcher's
 	// budget asserts a real elapsed-time bound through detectPythonEnvironment;
 	// the defect it pins is wall-clock (2^N regex backtracking on an interleaved
@@ -546,6 +730,21 @@ export const wallClockBudgetInclude = [
 	"tests/config/strictness-ratchet.test.ts",
 	"tests/config/tracked-control-bytes.test.ts",
 	"tests/config/workflow-writers-governance.test.ts",
+	// #2050: the same real-worktree admission, driven through a real pi session
+	// and pi's own `bash` tool, so the child shells and git processes ride along
+	// in the serialized lane too.
+	"tests/index-2050-worktree-bash-dispatch-witness.test.ts",
+	// #4316: the session-start LSP warm is fire-and-forget inside the loaded
+	// extension copy, so the witness joins its log record with vi.waitFor
+	// (flake-shape admission).
+	"tests/index-4316-lsp-warm-record.test.ts",
+	// #4504: a real linked worktree (`git worktree add`) and the real
+	// tool_call/tool_result seams that key the opaque prescan (flake-shape
+	// admission); the git children ride along in the serialized lane.
+	"tests/index-4504-opaque-prescan-root-witness.test.ts",
+	// #4732: the same real-checkout recovery, for a tool that is not bash,
+	// through a real pi session; the git children ride in the serialized lane.
+	"tests/index-4732-opaque-any-tool-witness.test.ts",
 	"tests/mcp/session-end.smoke.test.ts",
 	// published-manifest guard runs the real `npm pack` (flake-shape admission).
 	"tests/packaging-pack-manifest.test.ts",
@@ -570,7 +769,13 @@ export const wallClockBudgetInclude = [
 	// #1185: the committed checker CLI (exit code, report, cwd contract) is the
 	// subject; an in-process call of the pure policy cannot prove that boundary.
 	"tests/scripts/check-allow-scripts.test.ts",
+	// #4691: the nightly CLI runs as a real child process, with PATH at a gh
+	// stand-in serving recorded master runs (flake-shape admission).
+	"tests/scripts/check-ci-job-p90.test.ts",
 	"tests/scripts/check-pr-body.test.ts",
+	// #4397: the changed-test shuffle job's exit code is the contract; only a
+	// real vitest start reorders cases under `--sequence.shuffle`.
+	"tests/scripts/ci-shuffle-changed-tests-spawn.test.ts",
 	// #4072 review F2: the CLI's real exit status is the contract; an
 	// in-process main() call cannot prove the executable entry point.
 	"tests/scripts/ci-test-diff.test.ts",
@@ -588,6 +793,9 @@ export const wallClockBudgetInclude = [
 	// #4030: the real `gh` process boundary is the subject of the retry test;
 	// serialize it with other child-process admissions.
 	"tests/scripts/download-test-history-artifacts.test.ts",
+	// #4518: the evaluated-floor steps are shell text; only a real bash running
+	// the extracted `run:` shows the exit-code mapping, `set +e` and pipefail.
+	"tests/scripts/floor-steps-executed.test.ts",
 	"tests/scripts/git-fixture-env.test.ts",
 	// #2699: the subject is the guard's own stdin/exit-code/stderr contract --
 	// what Claude Code actually invokes for a PreToolUse hook. No in-process
@@ -597,6 +805,9 @@ export const wallClockBudgetInclude = [
 	// #4071: the probe's real hook stdin/exit-code contract and ref diff are
 	// unobservable through an in-process classifier call.
 	"tests/scripts/guard-bash-probe.test.ts",
+	// #4291: the install-smoke handshake and report steps are shell text; only
+	// a real bash running the extracted `run:` shows pipefail and the crash line.
+	"tests/scripts/install-smoke-handshake-steps.test.ts",
 	// #2698: real `git init`/`add`/`commit`/`ls-files` calls against a
 	// throwaway fixture repo — gitignore/tracked-vs-untracked resolution is
 	// the exact mechanism under test, which no mock reproduces faithfully.
@@ -616,6 +827,9 @@ export const wallClockBudgetInclude = [
 	"tests/scripts/lint-js.test.ts",
 	"tests/scripts/lockfile-completeness.test.ts",
 	"tests/scripts/lsp-idle-eviction-promote.test.ts",
+	// #4717: the lexer-seam entry points run in a fresh node over a scripts
+	// copy with no node_modules (real child process, flake-shape admission).
+	"tests/scripts/markdown-lexer-entry-points.test.ts",
 	// #4048: the mutation helper's real child and SIGINT restoration witness
 	// require a quiet serialized phase; its bounded timer and never-settling
 	// fixture are the process boundary under test (flake-shape admission).
@@ -660,6 +874,12 @@ export const wallClockBudgetInclude = [
 	// #2613: the resolver CLI's real exit code (2 vs. 4) and GITHUB_OUTPUT
 	// write are the subject under test; no in-process double is faithful.
 	"tests/scripts/resolve-newest-in-range-host.test.ts",
+	// #4401: the RPC session smoke's exit code is the contract; only a real
+	// child process (a stand-in pi) can exit or write a signal to turn it red.
+	"tests/scripts/rpc-load-check-spawn.test.ts",
+	// #4789: the child-report cases spawn REAL `node -e` children under the
+	// scratch home pin and read back the HOME and XDG dirs each one inherited.
+	"tests/scripts/scratch-home-env.test.ts",
 	// #3401: the seed script's default git path (depth-2 fetch, refspec, blob
 	// specs) against real throwaway repos and a depth-1 clone (flake-shape
 	// admission).
@@ -698,6 +918,9 @@ export const wallClockBudgetInclude = [
 	"tests/support/fault-injection.test.ts",
 	"tests/support/git-config-guard.test.ts",
 	"tests/support/git-fixture-env.test.ts",
+	// #4709 slice 3b: the PATH-probe stub's fidelity is observable only through a
+	// real child (flake-shape admission).
+	"tests/support/path-probe-stub.test.ts",
 	// #3179: the guard's #3179 fix's one real, cross-process reproduction. A
 	// separately spawned process races node's own recursive-watch readdirSync
 	// against a directory removal — the same race PR #3178 hit in CI — which
@@ -717,6 +940,10 @@ export const wallClockBudgetInclude = [
 	// so the pool's SIGTERM of each fixture fork and a real hook timeout are
 	// what the file observes (flake-shape admission).
 	"tests/support/vitest-setup-registry-teardown.test.ts",
+	// #4583: same fire-and-forget cold build as its clients sibling above; the
+	// pi-tool witness joins it with a real-time vi.waitFor (flake-shape
+	// admission).
+	"tests/tools/symbol-search.test.ts",
 ];
 
 // #2912: the tmp-fixture governance sweep compares the real process-wide
@@ -767,6 +994,12 @@ export default defineConfig({
 					setupFiles: sharedSetupFiles,
 					maxWorkers: sharedMaxWorkers,
 					execArgv: sharedExecArgv,
+					// #4634: the only project without this field, so its hooks ran on
+					// vitest's 10 s default while every sibling project and the
+					// documented invariant (`tests/support/vitest-setup.ts`) say 60 s.
+					// `availability-policy-coverage.test.ts`' whole-clients scan costs
+					// ~9.9 s in `beforeAll` here and timed out at load 52.
+					hookTimeout: 60_000,
 					// Vitest 4 requires distinct groupOrder whenever projects have
 					// different `maxWorkers` — see the "grammar-heavy" project below
 					// for why that's actually desirable here, not just a workaround.

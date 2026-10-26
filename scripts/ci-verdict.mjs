@@ -202,7 +202,7 @@ import {
 	rmSync,
 	writeFileSync,
 } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	ASSERTION_LINE,
@@ -210,6 +210,11 @@ import {
 	stripAnsi,
 	stripLineTimestamps,
 } from "./lib/ci-failure-classifier.mjs";
+import {
+	githubHeaders,
+	parseOwnerRepoFromGitRemote,
+} from "./lib/github-rest.mjs";
+import { jobCapEntries, runtimeCapLines } from "./lib/ci-runtime-cap.mjs";
 import { parseVitestSummary } from "./lib/vitest-summary.mjs";
 import {
 	CHANGES_CHECK,
@@ -217,11 +222,13 @@ import {
 	HEAVY_GATE_CHECK,
 	isAdvisoryCheck,
 	isBlockingConclusion,
-	isNonPrCiEvent,
+	isGatingCheckName,
 	isUncertainConclusion,
 	isUnitTestsJobName,
 	REQUIRED_CHECKS,
 	resolveLatestByName,
+	resolveTriggerAdvisoryNames,
+	shardAggregateName,
 } from "./lib/ci-checks.mjs";
 
 export { REQUIRED_CHECKS };
@@ -660,27 +667,20 @@ export function computeVerdict(
 	// #4090: a name every one of whose runs came from a schedule/dispatch/
 	// workflow_run workflow is not part of this commit's PR/push CI. One run of
 	// the name from any other (or unknown) event keeps it gating, and a
-	// required name is never excused.
-	const eventsByName = new Map();
-	for (const checkRun of checkRuns) {
-		const events = eventsByName.get(checkRun.name) ?? [];
-		events.push(checkRun.workflow_event);
-		eventsByName.set(checkRun.name, events);
-	}
-	const triggerAdvisoryNames = new Set(
-		[...eventsByName]
-			.filter(([, events]) => events.every((event) => isNonPrCiEvent(event)))
-			.map(([name]) => name),
-	);
+	// required name is never excused. The rule and its one resolution live in
+	// `scripts/lib/ci-checks.mjs`, because `runtimeCapLines` prints the same
+	// answer as a `(gating)` marker and the two disagreed (V5a).
+	const triggerAdvisoryNames = resolveTriggerAdvisoryNames(checkRuns);
 
 	const buildRow = (name) => {
 		const run = byName.get(name);
 		// requiredNameSet.has(name): see the doc comment above -- a name GitHub
 		// itself confirms as required always gates, even if it were also (by
 		// mistake) on the static advisory allowlist.
-		const gating =
-			requiredNameSet.has(name) ||
-			(!isAdvisoryCheck(name) && !triggerAdvisoryNames.has(name));
+		const gating = isGatingCheckName(name, {
+			required: requiredNameSet,
+			triggerAdvisoryNames,
+		});
 		if (!run) {
 			return {
 				name,
@@ -755,13 +755,47 @@ export function computeVerdict(
 					: isBlockingConclusion(row.conclusion)),
 		),
 	);
+	// #4672 V3: a SHARD row's cancellation is judged by its aggregate, not here.
+	// The aggregate (`Unit tests`, `TLA+ models`) is the required context, and
+	// its own job runs `scripts/check-shard-verdict.mjs`, which reads every
+	// shard's step conclusions and keeps a teardown race as a pass with a
+	// warning. So when that aggregate row concluded `success`, the cancellation
+	// below has already been judged benign -- and this tool used to report
+	// PENDING / `cancelled` for it, leaving the merge policy's own gate step
+	// (which runs this script) waiting on the very run shape that seam makes
+	// green. An aggregate that did not conclude success judges nothing here, and
+	// the row keeps its old pending reading.
+	//
+	// #4680 r4 F2: and only an aggregate that STARTED AT OR AFTER the shard
+	// completed has read that shard. The lookup is by name, so without the
+	// ordering a green aggregate from an earlier run excused a shard cancelled in
+	// a later run whose own aggregate row did not exist yet. A real run posts
+	// them in this order (run 39481284562: each aggregate starts 2-3 s after its
+	// last shard ends). A missing or unparsable timestamp on either side proves
+	// no ordering, so it judges nothing (fail closed): `Date.parse` gives NaN,
+	// and every comparison with NaN is false.
+	const aggregateJudgedGreen = (row) => {
+		const aggregate = shardAggregateName(row.name);
+		if (aggregate === null) return false;
+		const parent = byName.get(aggregate);
+		const parentStarted = Date.parse(String(parent?.started_at ?? ""));
+		const shardCompleted = Date.parse(
+			String(byName.get(row.name)?.completed_at ?? ""),
+		);
+		return (
+			String(parent?.status ?? "").toLowerCase() === "completed" &&
+			String(parent?.conclusion ?? "").toLowerCase() === "success" &&
+			parentStarted >= shardCompleted
+		);
+	};
 	const cancelledLatestRows = rows.filter(
 		(row) =>
 			row.gating &&
 			row.present &&
 			row.status === "completed" &&
 			!supersededRows.has(row) &&
-			isUncertainConclusion(row.conclusion),
+			isUncertainConclusion(row.conclusion) &&
+			!aggregateJudgedGreen(row),
 	);
 	// #3700: a row the caller proved is post-merge noise (its job could not
 	// fetch `refs/pull/N/merge` after the PR merged) is not a failure. The proof
@@ -984,6 +1018,68 @@ export function formatRerunHint(row) {
 	if (rerun) return `rerun ${rerun.at(-1)} (gh ${rerun.join(" ")})`;
 
 	return `${row?.name ?? "unknown check"} cannot be rerun via gh (not a GitHub Actions job; details: ${detailsUrl || "unavailable"})`;
+}
+
+// ---------------------------------------------------------------------------
+// #3920 item 3: a required job's recent runtime against its `timeout-minutes`.
+// The rule (ratio, name matcher, cap entries, the report lines) lives in
+// `scripts/lib/ci-runtime-cap.mjs`, beside the nightly p90-over-window mode of
+// the same rule (#4691); this file only reads the caps off the checkout.
+// ---------------------------------------------------------------------------
+
+/**
+ * The caps of every workflow file under `<root>/.github/workflows`, parsed from
+ * the YAML the runner itself reads. The YAML parser and the escape helper are
+ * loaded dynamically: both are compiled `clients/` files, and this script is
+ * documented to run with nothing but `gh` on PATH, so a checkout with no
+ * install or build degrades to one `unavailable` line instead of a crash.
+ *
+ * @param {string} root repository root
+ * @returns {Promise<Array<{ file: string, jobId: string, name: string, capMinutes: number, pattern: RegExp }>>}
+ */
+export async function readJobTimeCaps(root) {
+	const { readdirSync } = await import("node:fs");
+	const dir = join(root, ".github", "workflows");
+	const files = readdirSync(dir)
+		.filter((file) => /\.ya?ml$/.test(file))
+		.sort();
+	const yaml = (await import("../clients/deps/js-yaml.js")).default;
+	const { escapeRegExp } = await import("../clients/string-utils.js");
+	const entries = [];
+	for (const file of files) {
+		const doc = yaml.load(readFileSync(join(dir, file), "utf8"));
+		entries.push(
+			...jobCapEntries(doc, `.github/workflows/${file}`, escapeRegExp),
+		);
+	}
+	return entries;
+}
+
+/**
+ * `runtimeCapLines` over the real checkout, failing open into ONE line: an
+ * unreadable workflow tree or a missing YAML parser must not turn an advisory
+ * report into a verdict (#3920 item 3 is a report, never a gate).
+ *
+ * @param {{ checkRuns: object[], root: string, requiredChecks?: string[] }} args
+ * @returns {Promise<string[]>}
+ */
+export async function formatRuntimeCapLines({
+	checkRuns,
+	root,
+	requiredChecks = REQUIRED_CHECKS,
+}) {
+	try {
+		const caps = await readJobTimeCaps(root);
+		if (caps.length === 0)
+			return [
+				`Runtime vs cap: unavailable (no job in ${root}/.github/workflows declares timeout-minutes)`,
+			];
+		return runtimeCapLines({ checkRuns, caps, requiredChecks });
+	} catch (error) {
+		return [
+			`Runtime vs cap: unavailable (${firstLine(error).replace(/\s+/g, " ").slice(0, 200)})`,
+		];
+	}
 }
 
 /** Fixed-column table: CHECK / STATUS / CONCLUSION / URL. Exported for tests
@@ -2059,20 +2155,7 @@ export function formatGatingSplit(rows, failingRows = [], details = []) {
 export const TRANSPORT_GH = "gh";
 export const TRANSPORT_REST = "rest";
 
-/**
- * Parses `owner/repo` out of a `git remote get-url origin` value -- both the
- * SSH (`git@github.com:owner/repo.git`) and HTTPS
- * (`https://github.com/owner/repo.git`) forms this repo's own clones use.
- * `gh repo view` resolves the current repository the same way (from the
- * checkout's remote), so this is the REST transport's equivalent when `gh`
- * itself cannot be asked to do it.
- */
-export function parseOwnerRepoFromGitRemote(remoteUrl) {
-	const match = /github\.com[:/]{1,2}([^/\s]+)\/([^/\s.]+?)(?:\.git)?\/?$/.exec(
-		String(remoteUrl ?? "").trim(),
-	);
-	return match ? `${match[1]}/${match[2]}` : null;
-}
+export { parseOwnerRepoFromGitRemote };
 
 /**
  * REST equivalent of `resolveRepository` (#3497): `gh repo view` has no REST
@@ -2120,11 +2203,7 @@ async function restGet(
 	try {
 		response = await fetchImpl(`${apiBase}/${path}`, {
 			signal: AbortSignal.timeout(timeoutMs),
-			headers: {
-				Accept: "application/vnd.github+json",
-				Authorization: `Bearer ${token}`,
-				"X-GitHub-Api-Version": "2022-11-28",
-			},
+			headers: githubHeaders(token),
 		});
 	} catch (error) {
 		if (error?.name === "TimeoutError" || error?.name === "AbortError") {
@@ -2973,6 +3052,9 @@ export async function run({
 	// #3700: when `--watch-open` first saw this head; the absence clock of a
 	// head with no check suite.
 	absentSinceMs = null,
+	// #3920 item 3: the checkout whose `.github/workflows/*.yml` carry the job
+	// caps. Injected so a test can point at a fixture tree.
+	runtimeCapRoot = process.cwd(),
 } = {}) {
 	const {
 		target,
@@ -3330,6 +3412,18 @@ export async function run({
 		for (const line of formatTriggerAdvisoryLines(verdict.rows)) stdout(line);
 		if (triggerScopeNote) stdout(triggerScopeNote);
 		for (const line of formatFailureLines(verdict)) stdout(line);
+		// #3920 item 3: a non-gating runtime-vs-cap report over the same
+		// check-runs. It never changes `code` below -- it exists so a shard
+		// running at its cap is visible BEFORE it reports `cancelled`.
+		for (const line of await formatRuntimeCapLines({
+			checkRuns: Array.isArray(lastPayload?.check_runs)
+				? lastPayload.check_runs
+				: [],
+			root: runtimeCapRoot,
+			requiredChecks,
+		})) {
+			stdout(line);
+		}
 		// Merge state is always printed, not just when it drives the verdict
 		// (round 3, F1) -- a reviewer reading the report should never have to
 		// infer it from `reason` text alone. `"n/a"` for a bare-SHA target

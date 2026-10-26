@@ -563,7 +563,6 @@ describe("#2522 AC1 — turn_end selection excludes integration/e2e targets", ()
 		try {
 			const runtime = new RuntimeCoordinator();
 			const cacheManager = new CacheManager(false);
-			fs.mkdirSync(path.join(env.tmpDir, ".git"));
 			fs.writeFileSync(
 				path.join(env.tmpDir, ".git", "HEAD"),
 				"ref: refs/heads/main\n",
@@ -807,7 +806,7 @@ describe("#2522 AC3 — delivery framing distinguishes runner errors from real f
 });
 
 describe("#2504 AC2 — cap constants", () => {
-	// `caps concurrency at 4` was deleted in the #2522 round-4 pass (AGENTS.md
+	// `caps concurrency at 4` was deleted in the #2522 round-4 pass (HISTORY.md
 	// "Test assessment and removal"). It restated `TEST_RUNNER_BATCH_CONCURRENCY
 	// === 4` and nothing else: changing the constant to 3 reds that case and
 	// NOTHING in the whole file, because 4 is a tuning value, not an invariant.

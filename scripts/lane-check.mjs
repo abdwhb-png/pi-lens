@@ -17,10 +17,10 @@ import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
 import {
 	changedFiles as committedChangedFiles,
 	findStaleDistFiles,
+	resolveBaseRef,
 	worktreeChangedFiles,
 } from "./pre-push-targeted-tests.mjs";
 
-const BASE = "origin/master";
 // Room for a 137-file governance batch: spawnSync's 1 MiB default kills the
 // child and turns a long transcript into a lost verdict.
 const MAX_OUTPUT_BYTES = 256 * 1024 * 1024;
@@ -149,6 +149,8 @@ export function main(argv = process.argv.slice(2)) {
 	}
 	const findings = [];
 	const unproven = (reason) => findings.push({ kind: "unproven", reason });
+	// The hook resolves its base the same way, so both compare one range (#4724).
+	const BASE = resolveBaseRef();
 	const record = { base: BASE, checks: {}, failedFiles: [], redOnBase: null };
 
 	const build = run(root, "npm", ["run", "build"]);
@@ -193,8 +195,9 @@ export function main(argv = process.argv.slice(2)) {
 		...targeted.output.matchAll(/^\s+- (tests\/[^\s]+\.test\.ts)$/gm),
 	].map((match) => match[1]);
 	const targetedFailing = reportedFailureFiles(targeted.output, selected);
-	// Over the selector's cap only the governance registries and history picks
-	// ran, and the selector still exits 0: that is not a clean targeted run.
+	// Over the selector's cap the import matches past the best 25 did not run
+	// (the change's own tests, the registries and the history picks did), and the
+	// selector still exits 0: that is not a clean targeted run.
 	const cap = targeted.output.match(
 		/selection too broad \((\d+) test files matched/,
 	);
@@ -295,6 +298,9 @@ export function main(argv = process.argv.slice(2)) {
 				])
 			: null,
 		astgrep: run(root, "npm", ["run", "astgrep:self-scan"]),
+		// #4344 r2: CI's Dependency boundaries job, so a boundary violation
+		// reds the lane before the push rather than after it.
+		depcruise: run(root, "npm", ["run", "depcruise:check"]),
 	};
 	for (const [name, result] of Object.entries(checks)) {
 		record.checks[name] = result ? result.status : null;

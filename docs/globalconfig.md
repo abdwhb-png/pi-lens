@@ -25,6 +25,7 @@ Each runtime toggle is settable from the CLI *and* from `config.json`. The two a
 | `--lens-guard` | `guard.enabled` | `false` |
 | `--lens-checkout-guard` | `guard.sharedCheckout` | `false` |
 | `--immediate-format` | `format.mode` (`"immediate"`) | `"deferred"` |
+| `--lens-retain-injections` | `contextInjection.retain` | `false` |
 | `--lens-turn-summary` | `turnSummary.enabled` | `false` |
 | `--lens-actionable-warnings` | `actionableWarnings.enabled` | `false` |
 | `--lens-actionable-warning-actions` | `actionableWarnings.includeLspCodeActions` | `false` |
@@ -51,15 +52,41 @@ Each runtime toggle is settable from the CLI *and* from `config.json`. The two a
 | `startup.mode` | `full` | `quick`, `full`, or `minimal`; `PI_LENS_STARTUP_MODE` wins |
 | `startup.scans.enabled` | `true` | `true` or `false` |
 
-By default pi-lens registers five situational tools (the `ast_grep_*` family,
-`lsp_navigation`, `lens_diagnostic_mark`) inactive and exposes a small loader,
+pi-lens registers five situational tools (the `ast_grep_*` family,
+`lsp_navigation`, `lens_diagnostic_mark`) and a small loader,
 `pi_lens_activate_tools`, that the model calls to activate the ones it needs.
-`--no-lazy-tools` turns that off: every pi-lens tool is active from the first
-turn and pi-lens never changes the tool list. Use it if you would rather spend
-the tokens of a longer tool list than have the list change mid-session. The
-loader tool is still registered and still describes itself as activating
-inactive tools; under this flag those tools are already active, so calling it
-does nothing.
+`tools.lazy` decides whether the situational tools start inactive:
+
+| `tools.lazy` | Situational tools |
+| --- | --- |
+| `true` (default) | Start inactive on every model. |
+| `"auto"` | Start inactive only when the session's model keeps mid-conversation system messages (`compat.supportsMidConvoSystemMessages` is `true`). On any other model, including one that does not state the fact, every tool is active from the first turn. Before a model is known, the tools start inactive. |
+| `false`, or `--no-lazy-tools` | Every tool is active for the whole session and pi-lens never changes the tool list. |
+
+Why `true` is the default: a model without that fact gets every system message
+folded into one prompt head, so each tool-list change rewrites the whole cached
+prompt. Activations are rare, though. Over the window measured for #4687 the
+loader ran about once per 3,329 requests, while carrying every situational
+schema on every request costs more than the rewrites once activations are
+rarer than about one per 1,000 requests. `"auto"` is there for a workload that
+activates often on a folding model.
+
+Under `"auto"`, pi-lens decides at session start and again only when you
+switch models, never between turns of one model. A switch to a folding model
+activates every enabled situational tool. A switch back deactivates only the
+ones the conversation never activated or called. Any other value is reported
+once as an ignored setting, and the default applies.
+
+Precedence: `tools.<name>.enabled` (in either config file, or `--no-tool`)
+filters first. A disabled tool is never registered, so it is absent under every
+`tools.lazy` value and the loader refuses to activate it. `tools.lazy` then
+applies only to the enabled situational tools. It is user-level only: a project
+`.pi-lens.json` that sets it, `"auto"` included, is reported and ignored. The
+CLI flag outranks the key.
+
+The loader tool stays registered under every value and keeps describing itself
+as activating inactive tools; when the tools it names are already active,
+calling it does nothing.
 
 Keys are positive (`"enabled": true` means the feature runs), so a `--no-*` flag corresponds to setting its key `false`. A `no-*` flag on the command line is a one-way switch: it can disable, never re-enable, so `--no-lsp` wins over `lsp.enabled: true` but nothing on the CLI overrides `lsp.enabled: false`. Set the key back to `true` to re-enable.
 
@@ -111,6 +138,8 @@ Hide the diagnostics widget by default, run formatting immediately after write/e
 `autofix.enabled` (default `true`) is the global-config counterpart to the project `.pi-lens.json` `autofix.enabled` below — set it to `false` to match `--no-autofix` for every project that doesn't set its own `autofix.enabled`. As with `format.enabled` and `actionableWarnings.autoFix.enabled`, a project's own `.pi-lens.json` value overrides this global default in either direction (see "Mutation controls" below).
 
 `contextInjection.enabled` (default `true`) controls whether pi-lens prepends automatic findings — session-start guidance, turn-end findings, and test findings — into the next model turn. Set it to `false` (or use `--no-lens-context` / `PI_LENS_NO_CONTEXT_INJECTION=1` / `/lens-context-toggle`) to keep tools, LSP, read-guard, and formatting running while avoiding the prompt-cache invalidation that injected messages cause in long, cache-sensitive sessions. Findings are still cached, so `lens_diagnostics` and `/lens-health` keep working.
+
+`contextInjection.retain` (default `false`, or `--lens-retain-injections`) keeps injection on and makes it cache-stable instead. An injection normally rides one provider request: pi rebuilds the next request from its own transcript, so that request no longer carries it, and an engine that caches by exact prefix (a local llama.cpp or Qwen server) re-processes everything after the point where it sat. With `retain` on, pi-lens re-sends each injection's bytes unchanged, at the same place, in every later request of the session, so each request is the previous one plus new content. Findings are still delivered once; each retained block ends with a snapshot label naming `lens_diagnostics` for the current state. A compaction, a `/tree` move, or a new, resumed, forked or reloaded session drops what was retained. A session holds at most 64 retained injections and 256 KiB; past either, a new injection reaches its one request only and one `context-injection-retain-declined` degradation row is recorded.
 
 `contextInjection.requirePreExistingFixes` (default `true`) controls whether the session-start orientation tells the agent to fix pre-existing blocking errors; set `false` to scope that demand to errors its own edits introduce.
 

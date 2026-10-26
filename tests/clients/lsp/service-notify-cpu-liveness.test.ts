@@ -29,11 +29,6 @@ vi.hoisted(() => {
 	process.env.PI_LENS_TEST_MODE = "0";
 });
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 const ROOT = process.cwd();
 const NOTIFY_BUDGET_MS = 200;
 /** `notifyWedgedMs` = budget x 5 = 1000 at this budget. */
@@ -185,8 +180,11 @@ describe("#2358 — CPU-liveness discriminator on a real wedged scanner", () => 
 		return service?.state.clients.has(AUX_CLIENT_KEY) ?? false;
 	};
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		process.env.PI_LENS_LSP_NOTIFY_BUDGET_MS = String(NOTIFY_BUDGET_MS);
 		process.env.PI_LENS_LSP_NOTIFY_STALL_CPU_SAMPLE_MS = String(CPU_SAMPLE_MS);
@@ -249,7 +247,10 @@ describe("#2358 — CPU-liveness discriminator on a real wedged scanner", () => 
 		expect(broken()).toBe(false);
 		expect(clientStillRegistered()).toBe(true);
 		// The adaptive timer re-arms while busy, but detail telemetry remains
-		// rising-edge bounded for this server/file identity.
+		// rising-edge bounded for this server/file identity. Drain first (#4381):
+		// a second busy row or a demotion row queued during the wait above would
+		// otherwise be missed, and both counts would pass on an undrained sink.
+		await latencyLogger?.flushLatencyLog();
 		expect(rowsFor("lsp_notify_stall_cpu_busy")).toHaveLength(1);
 		expect(rowsFor("lsp_notify_backpressure_broken")).toHaveLength(0);
 	}, 30_000);

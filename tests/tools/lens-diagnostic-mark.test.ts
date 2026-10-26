@@ -9,6 +9,11 @@ import {
 	isDeferredThisSession,
 } from "../../clients/diagnostic-dispositions.js";
 import {
+	getDegradationSummary,
+	resetDegradationLedger,
+} from "../../clients/degradation-ledger.js";
+import {
+	__testing,
 	clearWidgetState,
 	markWidgetFileBlockersStale,
 	recordDiagnostics,
@@ -17,6 +22,7 @@ import {
 import { createLensDiagnosticMarkTool } from "../../tools/lens-diagnostic-mark.js";
 import {
 	createCaseAliasFixture,
+	pinFixtureHome,
 	removeTempDirSync,
 } from "../clients/test-utils.js";
 
@@ -318,6 +324,53 @@ describe("lens_diagnostic_mark tool — line verification/reanchoring (#802)", (
 		expect((result.details as { line: number }).line).toBe(3);
 	});
 
+	// #4689 item 3: the tool is an entry point, so the path it hands the stores
+	// is the file's identity. The widget keys a record syntactically (#1020) and
+	// the pipeline recorded this finding under the identity; a mark typed with
+	// the link's spelling reached the store as that spelling, found no record,
+	// and left the footer row untagged (a recorded
+	// `widget-disposition-reconcile-fallback`).
+	// RECURRENCE GUARDED: a mark through the other spelling of a file the
+	// pipeline recorded never retired the widget row.
+	it("a mark typed through a link retires the widget row recorded under the file's identity", async (ctx) => {
+		const real = writeFile("real.ts", "const a = 1;\nconst target = bad();\n");
+		try {
+			fs.symlinkSync("real.ts", path.join(tmpDir, "link.ts"));
+		} catch (err) {
+			return ctx.skip(`cannot create symlinks here: ${String(err)}`);
+		}
+		resetDegradationLedger();
+		recordDiagnostics(fs.realpathSync(real), [
+			{
+				tool: "eslint",
+				rule: "no-bad",
+				message: "bad call",
+				line: 2,
+				severity: "error",
+				semantic: "blocking",
+			},
+		]);
+
+		const result = await run({
+			filePath: "link.ts",
+			line: 2,
+			message: "bad call",
+			rule: "no-bad",
+			tool: "eslint",
+			disposition: "false-positive",
+		});
+
+		expect(result.isError).toBeFalsy();
+		expect(__testing.getWidgetStateSnapshot().files).toHaveLength(1);
+		expect(__testing.getWidgetStateSnapshot().files[0]).toMatchObject({
+			blocking: 0,
+			errors: 0,
+		});
+		expect(getDegradationSummary().map((row) => row.kind)).not.toContain(
+			"widget-disposition-reconcile-fallback",
+		);
+	});
+
 	it("suppress with reanchor writes the comment above the CURRENT line, not the stale caller line", async () => {
 		const absPath = writeFile(
 			"a.ts",
@@ -507,5 +560,42 @@ describe("lens_diagnostic_mark's suppress record names its call (#4187 R4-1)", (
 		);
 		expect(result.isError).toBeFalsy();
 		expect(recordedEntries).toEqual([]);
+	});
+});
+
+/**
+ * #4577 M2: `path` is a host-supplied tool path, so it resolves through the
+ * shared host resolver. A bare `path.resolve(cwd, filePath)` turned `~/x` into
+ * `<cwd>/~/x`, the read at the top of the tool failed, and the disposition was
+ * refused for a file that exists.
+ */
+describe("lens_diagnostic_mark path resolution (#4577 M2)", () => {
+	it("resolves a ~ path to $HOME, not under the cwd", async () => {
+		// #4591: the fixture HOME is outside the fixture root this file deletes.
+		const { home, restore } = pinFixtureHome("diagnostic-mark-tilde");
+		const homeFile = path.join(home, "proj", "tilde.ts");
+		fs.mkdirSync(path.dirname(homeFile), { recursive: true });
+		fs.writeFileSync(homeFile, "const a = 1;\nconst target = bad();\n");
+		try {
+			expect(os.homedir()).toBe(home);
+			const result = await run({
+				filePath: "~/proj/tilde.ts",
+				line: 2,
+				message: "bad call",
+				rule: "no-bad",
+				tool: "eslint",
+				disposition: "suppress",
+			});
+			expect(result.isError).toBeFalsy();
+			// The comment landed in the HOME file the agent named: the pre-fix
+			// join edited `<cwd>/~/proj/tilde.ts`, which does not exist, so the
+			// tool refused the disposition entirely.
+			expect(fs.readFileSync(homeFile, "utf-8")).toContain(
+				"// pi-lens-ignore: no-bad",
+			);
+			expect(fs.existsSync(path.join(tmpDir, "~"))).toBe(false);
+		} finally {
+			restore();
+		}
 	});
 });

@@ -4,7 +4,14 @@ import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LSPClientInfo } from "../../../clients/lsp/client.js";
 import { LSPService } from "../../../clients/lsp/index.js";
-import type { LSPServerInfo } from "../../../clients/lsp/server.js";
+import {
+	type LSPServerInfo,
+	LSP_SERVERS,
+	PHPServer,
+	PythonJediServer,
+	PythonServer,
+	TypeScriptServer,
+} from "../../../clients/lsp/server.js";
 import {
 	initLSPConfig,
 	resetLSPConfigStateForTests,
@@ -21,19 +28,38 @@ import {
 	registerSessionRoot,
 	shouldInitializeSessionRoot,
 } from "../../../clients/lsp/session-roots.js";
-import { removeTempDirSync } from "../test-utils.js";
+import { removeTempDirSync, setupTestEnvironment } from "../test-utils.js";
 
 process.env.PI_LENS_TEST_MODE = "1";
+
+// #4788 F2: a pass-through recorder on the real `stat`, so the fallback walk's
+// filesystem probe count is observable. It records only while `recording` is set.
+const statProbes = vi.hoisted(() => ({
+	recording: false,
+	paths: [] as string[],
+}));
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
+	return {
+		...actual,
+		stat: ((...args: Parameters<typeof actual.stat>) => {
+			if (statProbes.recording) statProbes.paths.push(String(args[0]));
+			return actual.stat(...args);
+		}) as typeof actual.stat,
+	};
+});
 
 type RootPolicyHarness = {
 	state: {
 		clients: Map<string, LSPClientInfo>;
 		inFlight: Map<string, Promise<unknown>>;
 	};
-	resolveServerRoot(
-		server: LSPServerInfo,
-		filePath: string,
-	): Promise<string | undefined>;
+	clientRegistry: {
+		resolveServerRoot(
+			server: LSPServerInfo,
+			filePath: string,
+		): Promise<string | undefined>;
+	};
 };
 
 const dirs: string[] = [];
@@ -60,6 +86,9 @@ const CASE_SENSITIVE_FILESYSTEM = hasCaseSensitiveFilesystem();
 afterEach(() => {
 	for (const dir of dirs.splice(0)) removeTempDirSync(dir);
 	vi.restoreAllMocks();
+	vi.unstubAllEnvs();
+	statProbes.recording = false;
+	statProbes.paths.length = 0;
 	resetLSPConfigStateForTests();
 });
 
@@ -79,6 +108,149 @@ function markerServer(id: string): LSPServerInfo {
 	};
 }
 
+// #4728: a marker-less PHP project used one workspace per source directory.
+// Exercise every real server root so the same fallback cannot drift by language.
+describe("LSP project-root fallback (#4728)", () => {
+	it("shares a PHP root across directories without composer.json", async () => {
+		const env = setupTestEnvironment("pi-lens-4728-php-");
+		try {
+			const files = [
+				"entry.php",
+				"plugins/gobcore/includes/a.php",
+				"plugins/gobcore/main.php",
+				"themes/gobportal/parts/b.php",
+			].map((relative) => path.join(env.tmpDir, relative));
+			for (const file of files) {
+				fs.mkdirSync(path.dirname(file), { recursive: true });
+				fs.writeFileSync(file, "<?php echo 1;\n");
+			}
+			expect(
+				await Promise.all(files.map((file) => PHPServer.root(file))),
+			).toEqual(files.map(() => env.tmpDir));
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("uses the nearest generic project marker", async () => {
+		const env = setupTestEnvironment("pi-lens-4728-nearest-");
+		try {
+			const nested = path.join(env.tmpDir, "packages", "plugin");
+			const file = path.join(nested, "src", "a.php");
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(path.join(nested, "package.json"), "{}\n");
+			fs.writeFileSync(file, "<?php echo 1;\n");
+			await expect(PHPServer.root(file)).resolves.toBe(nested);
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #4788 F1. A dotfiles checkout at $HOME that gitignores `.pi/` excludes every
+	// directory up to the extensions boundary. The bounded walk then recorded no
+	// allowed ancestor and returned the filesystem root, which two production
+	// consumers (`findOutsideProjectRoot`, `resolveLspServerCwd`) trust as a root.
+	// The follow-up decision: a bounded walk with nothing allowed inside it takes
+	// the file's own directory (below the boundary, #123), so TypeScript keeps
+	// its diagnostics for extension authors instead of declining.
+	it("roots at the file's directory, never the filesystem root, when the extensions boundary is gitignored", async () => {
+		const env = setupTestEnvironment("pi-lens-4788-ext-excluded-");
+		try {
+			const home = env.tmpDir;
+			vi.stubEnv("HOME", home);
+			vi.stubEnv("USERPROFILE", home);
+			fs.writeFileSync(path.join(home, ".gitignore"), ".pi/\n");
+			const agentDir = path.join(home, ".pi", "agent");
+			const srcDir = path.join(agentDir, "extensions", "myext", "src");
+			fs.mkdirSync(srcDir, { recursive: true });
+			// The #123 setup: pi's own package.json sits above the boundary.
+			fs.writeFileSync(path.join(agentDir, "package.json"), "{}\n");
+			const file = path.join(srcDir, "index.ts");
+			fs.writeFileSync(file, "export const x = 1;\n");
+			const php = path.join(srcDir, "a.php");
+			fs.writeFileSync(php, "<?php echo 1;\n");
+			const roots = [
+				await TypeScriptServer.root(file),
+				await PHPServer.root(php),
+			];
+			for (const root of roots) {
+				expect(
+					root,
+					"filesystem root escaped the extensions boundary",
+				).not.toBe(path.parse(home).root);
+				expect(root).toBe(srcDir);
+			}
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #4788 F2. The walk used to ask `isExcludedLspRoot` at every ancestor, and
+	// each ask re-walked to the Git boundary: O(depth^2) `.git` probes on a hook
+	// path (2.1 ms -> 11.0 ms at depth 30). One walk resolves each directory's
+	// boundary once. Depth 12 gives >100 probes unmemoised and 26 at most memoised.
+	it("probes each ancestor's Git boundary once per walk", async () => {
+		const env = setupTestEnvironment("pi-lens-4788-probes-");
+		try {
+			const depth = 12;
+			const dirs = Array.from({ length: depth }, (_, i) => `d${i}`);
+			const file = path.join(env.tmpDir, ...dirs, "a.php");
+			fs.mkdirSync(path.dirname(file), { recursive: true });
+			fs.writeFileSync(file, "<?php echo 1;\n");
+			statProbes.recording = true;
+			const root = await PHPServer.root(file);
+			statProbes.recording = false;
+			expect(root).toBe(env.tmpDir);
+			const gitProbes = statProbes.paths.filter(
+				(probed) => path.basename(probed) === ".git",
+			).length;
+			expect(gitProbes).toBeLessThanOrEqual(2 * (depth + 1));
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("coalesces every built-in server at the Git project or explicitly declines", async () => {
+		const env = setupTestEnvironment("pi-lens-4728-registry-");
+		try {
+			const declined = new Set<string>();
+			for (const server of LSP_SERVERS) {
+				for (const directory of ["src", "lib/nested", "scripts"]) {
+					const extension = server.extensions[0]!;
+					const name = extension.startsWith(".")
+						? `probe${extension}`
+						: extension;
+					const file = path.join(env.tmpDir, directory, name);
+					fs.mkdirSync(path.dirname(file), { recursive: true });
+					fs.writeFileSync(file, "");
+					const root = await server.root(file);
+					if (root === undefined) declined.add(server.id);
+					else expect(root, `${server.id}: ${directory}`).toBe(env.tmpDir);
+				}
+			}
+			// These servers deliberately require their own project/config markers;
+			// unlike RootWithFallback and FileDirRoot users, they reject loose files.
+			expect(
+				[...declined].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+			).toEqual([
+				"clojure",
+				"csharp",
+				"deno",
+				"fsharp",
+				"haskell",
+				"lua",
+				"nix",
+				"ocaml",
+				"omnisharp",
+				"rust",
+				"swift",
+			]);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
 describe("LSP per-server nested-root coalescing (#1373)", () => {
 	it("attaches a nested marker directory to an existing ancestor client", async () => {
 		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-coalesce-"));
@@ -95,7 +267,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 		);
 
 		await expect(
-			service.resolveServerRoot(server, path.join(nested, "ci.yml")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(nested, "ci.yml"),
+			),
 		).resolves.toBe(project);
 		expect(service.state.clients.size).toBe(1);
 		cwdSpy.mockRestore();
@@ -117,7 +292,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 		);
 
 		await expect(
-			service.resolveServerRoot(server, path.join(nested, "README.md")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(nested, "README.md"),
+			),
 		).resolves.toBe(nested);
 		cwdSpy.mockRestore();
 	});
@@ -135,7 +313,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 		};
 
 		await expect(
-			service.resolveServerRoot(server, path.join(foreign, "app.ts")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(foreign, "app.ts"),
+			),
 		).resolves.toBeUndefined();
 	});
 
@@ -159,7 +340,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 
 		// projectA initialized FIRST and projectB LAST; projectA must still serve.
 		await expect(
-			service.resolveServerRoot(server, path.join(projectA, "a.ts")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(projectA, "a.ts"),
+			),
 		).resolves.toBe(projectA);
 	});
 
@@ -280,7 +464,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 		};
 
 		await expect(
-			service.resolveServerRoot(server, path.join(foreign, "app.ts")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(foreign, "app.ts"),
+			),
 		).resolves.toBe(foreign);
 	});
 
@@ -301,7 +488,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 			fakeClient(project),
 		);
 		await expect(
-			service.resolveServerRoot(server, path.join(nested, "app.ts")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(nested, "app.ts"),
+			),
 		).resolves.toBe(project);
 	});
 
@@ -327,7 +517,10 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 			fakeClient("C:\\Repo"),
 		);
 		await expect(
-			service.resolveServerRoot(server, "c:\\repo\\nested\\app.ts"),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				"c:\\repo\\nested\\app.ts",
+			),
 		).resolves.toBe("C:\\Repo");
 	});
 
@@ -348,10 +541,98 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 		);
 
 		await expect(
-			service.resolveServerRoot(server, path.join(nested, "README.md")),
+			service.clientRegistry.resolveServerRoot(
+				server,
+				path.join(nested, "README.md"),
+			),
 		).resolves.toBe(nested);
 		cwdSpy.mockRestore();
 	});
+
+	// #4547: a nested Python project marked only by requirements.txt, setup.py
+	// or setup.cfg was folded into a live ancestor client, so pyright never
+	// read that project's own config or venv. The cases come from the servers'
+	// own root markers: a marker added there without a boundary entry reds.
+	const pythonRootMarkerCases = [PythonServer, PythonJediServer].flatMap(
+		(server) =>
+			(server.root.rootMarkers ?? []).map((marker) => ({
+				server,
+				marker,
+			})),
+	);
+
+	it("derives the Python root-marker cases from the real servers", () => {
+		expect(pythonRootMarkerCases.map(({ marker }) => marker)).toEqual(
+			expect.arrayContaining(["requirements.txt", "setup.py", "setup.cfg"]),
+		);
+	});
+
+	it.each(pythonRootMarkerCases)(
+		"keeps a nested $server.id root marked only by $marker apart from a hosted ancestor",
+		async ({ server, marker }) => {
+			const project = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-python-boundary-"),
+			);
+			dirs.push(project);
+			vi.spyOn(process, "cwd").mockReturnValue(project);
+			const nested = path.join(project, "smoke");
+			fs.mkdirSync(nested, { recursive: true });
+			if (marker === ".git") fs.mkdirSync(path.join(nested, marker));
+			else fs.writeFileSync(path.join(nested, marker), "\n");
+
+			const service = new LSPService() as unknown as RootPolicyHarness;
+			service.state.clients.set(
+				`${server.id}:${normalizeMapKey(project)}`,
+				fakeClient(project),
+			);
+
+			await expect(
+				service.clientRegistry.resolveServerRoot(
+					server,
+					path.join(nested, "qq.py"),
+				),
+			).resolves.toBe(nested);
+		},
+	);
+
+	// #4548: Python packaging manifests must not split a TypeScript client at a
+	// nested directory; the shared boundary predicate used to overreach here.
+	it.each(["requirements.txt", "setup.py", "setup.cfg"])(
+		"does not treat a Python $0 as a TypeScript project boundary",
+		async (marker) => {
+			const project = fs.mkdtempSync(
+				path.join(os.tmpdir(), "pi-lens-typescript-python-boundary-"),
+			);
+			dirs.push(project);
+			vi.spyOn(process, "cwd").mockReturnValue(project);
+			const nested = path.join(project, "smoke");
+			fs.mkdirSync(nested, { recursive: true });
+			fs.writeFileSync(path.join(nested, marker), "\n");
+
+			const service = new LSPService() as unknown as RootPolicyHarness;
+			service.state.clients.set(
+				`typescript:${normalizeMapKey(project)}`,
+				fakeClient(project),
+			);
+			service.state.clients.set(
+				`python:${normalizeMapKey(project)}`,
+				fakeClient(project),
+			);
+
+			await expect(
+				service.clientRegistry.resolveServerRoot(
+					TypeScriptServer,
+					path.join(nested, "app.ts"),
+				),
+			).resolves.toBe(project);
+			await expect(
+				service.clientRegistry.resolveServerRoot(
+					PythonServer,
+					path.join(nested, "qq.py"),
+				),
+			).resolves.toBe(nested);
+		},
+	);
 
 	it("collapses the observed nested-marker fixture below ceiling pressure", async () => {
 		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-pressure-"));
@@ -379,7 +660,7 @@ describe("LSP per-server nested-root coalescing (#1373)", () => {
 			service.state.clients.set(projectKey, fakeClient(project));
 			roots.add(projectKey);
 			for (const relative of shapes) {
-				const root = await service.resolveServerRoot(
+				const root = await service.clientRegistry.resolveServerRoot(
 					server,
 					path.join(
 						project,

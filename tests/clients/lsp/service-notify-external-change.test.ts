@@ -11,11 +11,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const getServersForFileWithConfig = vi.fn();
 const createLSPClient = vi.fn();
 
-vi.mock("../../../clients/lsp/config.js", () => ({
-	getServersForFileWithConfig,
-	getServerInitOverride: vi.fn().mockReturnValue(undefined),
-}));
-
 vi.mock("../../../clients/lsp/client.js", () => ({ createLSPClient }));
 
 const FILE = "C:/repo/main.ts";
@@ -58,6 +53,7 @@ function makeClient() {
 		diagnosticsVersion: 0,
 		getDiagnostics: vi.fn(() => []),
 		notify: {
+			announceCreated: () => undefined,
 			open: vi.fn(async () => {}),
 			change: vi.fn(async () => {}),
 			watchedFileChange: vi.fn(),
@@ -67,8 +63,11 @@ function makeClient() {
 }
 
 describe("LSPService.notifyExternalFileChange (#1668)", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
 		vi.resetModules();
+		(await import("../../../clients/lsp/config.js"))._setServersForFileForTests(
+			getServersForFileWithConfig,
+		);
 		getServersForFileWithConfig.mockReset();
 		createLSPClient.mockReset();
 	});

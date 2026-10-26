@@ -7,7 +7,6 @@
 
 import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
 	getSgCommand,
@@ -15,7 +14,9 @@ import {
 } from "./dispatch/runners/utils/runner-helpers.js";
 import { getProjectIgnoreGlobs } from "./file-utils.js";
 import { findGlobalBinary } from "./package-manager.js";
+import { walkUpDirs } from "./path-utils.js";
 import { getProjectTrustState } from "./project-trust.js";
+import { scannerReportParentDir } from "./scanner-temp-root.js";
 import { safeSpawnAsync, type SpawnResult } from "./safe-spawn.js";
 import { getIsolatedNpxSpawnOptions, probeToolAsync } from "./tool-probe.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
@@ -557,12 +558,8 @@ export class SgRunner {
 
 		// Search roots: local node_modules and any parent node_modules directories.
 		const searchRoots: string[] = [];
-		let dir = process.cwd();
-		for (let depth = 0; depth < 5; depth++) {
+		for (const dir of walkUpDirs(process.cwd(), { maxDepth: 5 })) {
 			searchRoots.push(path.join(dir, "node_modules"));
-			const parent = path.dirname(dir);
-			if (parent === dir) break;
-			dir = parent;
 		}
 
 		for (const suffix of pkgSuffixes) {
@@ -718,6 +715,7 @@ export class SgRunner {
 			case "cwd-unresolvable":
 			case "permission-denied":
 			case "spawn-failed":
+			case "trust-refused":
 			case undefined:
 				return result.error ? "cli-failure" : undefined;
 		}
@@ -882,7 +880,7 @@ export class SgRunner {
 		configFile: string;
 	} {
 		const sessionDir = fs.mkdtempSync(
-			path.join(os.tmpdir(), `pi-lens-temp-${ruleId}-`),
+			path.join(scannerReportParentDir(), `pi-lens-temp-${ruleId}-`),
 		);
 		try {
 			const rulesSubdir = path.join(sessionDir, "rules");

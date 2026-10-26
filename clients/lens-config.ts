@@ -5,7 +5,6 @@ import {
 } from "./config-warn.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
 import { errorClassName } from "./error-class.js";
-import * as path from "node:path";
 import {
 	assignFlagConfigSection,
 	flagConfigSectionKeys,
@@ -13,7 +12,9 @@ import {
 	getLensFlagSpec,
 	GLOBAL_NON_FLAG_CONFIG_SECTIONS,
 	LENS_FLAGS,
+	PROJECT_NON_FLAG_CONFIG_SECTIONS,
 	readFlagConfigValue,
+	readLazyToolsSetting,
 } from "./lens-flag-registry.js";
 import {
 	type ConfigLocation,
@@ -45,6 +46,7 @@ import {
 	findNestedProjectMutationValue,
 	type PiLensProjectConfig,
 } from "./project-lens-config.js";
+import { pathsEqual } from "./path-utils.js";
 import { readToolConfig } from "./tool-config.js";
 
 /**
@@ -347,6 +349,16 @@ export function loadPiLensGlobalConfig(
 		const config: Record<string, unknown> = {};
 		const toolConfig = readToolConfig(raw, warnInvalid);
 		if (toolConfig) config.tools = toolConfig;
+		// #4687 item 7: `tools.lazy` is "auto" | true | false. Its registry row
+		// reads it through `readGlobal`, so the boolean copy below skips it and
+		// this is where an invalid value is reported, never silently dropped.
+		const toolsSection = asConfigObject(raw.tools);
+		if (toolsSection && "lazy" in toolsSection) {
+			const lazy = readLazyToolsSetting(raw);
+			if (lazy === undefined)
+				warnInvalid('tools.lazy must be "auto", true, or false');
+			else config.tools = { ...(config.tools as object), lazy };
+		}
 
 		for (const spec of LENS_FLAGS) {
 			if (spec.readGlobal) continue;
@@ -491,7 +503,9 @@ export function loadPiLensGlobalConfig(
 		for (const key of Object.keys(raw)) {
 			if (!knownGlobalConfigKeys.has(key)) {
 				warnInvalid(
-					`unknown key "${key}" is not a recognized pi-lens setting (check for a typo); ignored`,
+					PROJECT_NON_FLAG_CONFIG_SECTIONS.includes(key)
+						? `"${key}" is a project-scoped pi-lens setting; set it in <project>/.pi-lens.json, not in the global config; ignored`
+						: `unknown key "${key}" is not a recognized pi-lens setting (check for a typo); ignored`,
 				);
 			}
 		}
@@ -600,10 +614,9 @@ export function resolvePiLensFlagWithSource(
 		if (nested) {
 			return {
 				value: flagValueFromConfig(spec, nested.value),
-				source:
-					path.resolve(nested.dir) === path.resolve(projectRoot as string)
-						? "project"
-						: (`nested-project:${nested.dir}` as const),
+				source: pathsEqual(nested.dir, projectRoot as string)
+					? "project"
+					: (`nested-project:${nested.dir}` as const),
 			};
 		}
 		const projectValue = readFlagConfigValue(projectConfig, spec.configKey);

@@ -26,6 +26,7 @@ import { launchLSP, stopLSP } from "../../../clients/lsp/launch.js";
 import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 import { removeTempDirSync } from "../test-utils.js";
 import { CacheManager } from "../../../clients/cache-manager.js";
+import { getDegradationSummary } from "../../../clients/degradation-ledger.js";
 import { registerMutationBridge } from "../../../clients/mutation-bridge.js";
 import { normalizeMapKey } from "../../../clients/path-utils.js";
 import { readChangesSince } from "../../../clients/project-changes.js";
@@ -65,11 +66,6 @@ describe("LSP Client Integration", () => {
 			}
 			proc = undefined;
 		}
-	});
-
-	it("initializes and reports connected", () => {
-		expect(client).toBeDefined();
-		expect(client!.isAlive()).toBe(true);
 	});
 
 	it("detects operation capabilities from initialize result", () => {
@@ -960,6 +956,32 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 	let filePath: string;
 	let prevDataDir: string | undefined;
 
+	// The mutation-bridge slot is process-wide and first-wins
+	// (clients/mutation-bridge.ts), so the first mount in this file freezes
+	// its getters. Mount once and read each case's runtime through a holder
+	// (the readDeps shape io-bridge.test.ts uses), so every case sees its own
+	// runtime whatever order shuffle runs them in (#4561 L3).
+	const bridgeHolder: { runtime?: unknown; cacheManager?: CacheManager } = {};
+	let bridgeMounted = false;
+	function bindMutationBridge(
+		runtime: unknown,
+		cacheManager: CacheManager,
+	): void {
+		bridgeHolder.runtime = runtime;
+		bridgeHolder.cacheManager = cacheManager;
+		if (bridgeMounted) return;
+		bridgeMounted = true;
+		registerMutationBridge({
+			getRuntime: () => bridgeHolder.runtime as never,
+			getCacheManager: () => bridgeHolder.cacheManager as never,
+			getProjectRoot: () => tmpDir,
+			getDispatchCwd: () => tmpDir,
+			countFileLines,
+			isRecordable: () => true,
+			dbg: () => {},
+		});
+	}
+
 	// #2450 review round 2 (F2): 8 lines, with the edit target on line 7
 	// (1-based) — never line 1 — so the real recorded range ({7,7}) cannot
 	// collide with the {1,1} resource-op/whole-file-fallback default. A test
@@ -1017,15 +1039,7 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 		runtime.setTelemetryIdentity({ sessionId: "s-2450-fallback" });
 		runtime.beginTurn();
 		const cacheManager = new CacheManager(false);
-		registerMutationBridge({
-			getRuntime: () => runtime as never,
-			getCacheManager: () => cacheManager,
-			getProjectRoot: () => tmpDir,
-			getDispatchCwd: () => tmpDir,
-			countFileLines,
-			isRecordable: () => true,
-			dbg: () => {},
-		});
+		bindMutationBridge(runtime, cacheManager);
 
 		// Same call shape as "applies a server-initiated edit solicited during
 		// executeCommand" above: no mutationContext argument. The edit lands on
@@ -1122,15 +1136,7 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 			});
 			bridgeRuntime.beginTurn();
 			const bridgeCacheManager = new CacheManager(false);
-			registerMutationBridge({
-				getRuntime: () => bridgeRuntime as never,
-				getCacheManager: () => bridgeCacheManager,
-				getProjectRoot: () => tmpDir,
-				getDispatchCwd: () => tmpDir,
-				countFileLines,
-				isRecordable: () => true,
-				dbg: () => {},
-			});
+			bindMutationBridge(bridgeRuntime, bridgeCacheManager);
 
 			const outerContext = {
 				cwd: outerCwd,
@@ -1346,15 +1352,7 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 			bridgeRuntime.setTelemetryIdentity({ sessionId: "s-2479-bridge" });
 			bridgeRuntime.beginTurn();
 			const bridgeCacheManager = new CacheManager(false);
-			registerMutationBridge({
-				getRuntime: () => bridgeRuntime as never,
-				getCacheManager: () => bridgeCacheManager,
-				getProjectRoot: () => tmpDir,
-				getDispatchCwd: () => tmpDir,
-				countFileLines,
-				isRecordable: () => true,
-				dbg: () => {},
-			});
+			bindMutationBridge(bridgeRuntime, bridgeCacheManager);
 
 			const outerContext = {
 				cwd: outerCwd,
@@ -1456,4 +1454,111 @@ describe("LSP Client Integration — mutation-bridge fallback for server-initiat
 			removeTempDirSync(innerCwd);
 		}
 	});
+});
+
+// #4801: `runReadOnlyServerCommand` raced `safeSendRequest` against a timer and
+// passed no signal. A server that accepted the command and never answered left
+// the request pending for good: no `$/cancelRequest` went out and the
+// connection's busy count never dropped, so `ClientRegistry` (which declines to
+// evict `isBusy()` clients, client-registry.ts) could never retire the client.
+// The warm-attach membership probe takes this route, so each attached read
+// could add one more pending request. The commands that share this timeout
+// are `executeReadOnlyCommand` callers only: the tsserver `projectInfo`
+// membership probe (`fetchTsserverProjectIdentity`) and the didOpen
+// project-identity probe (`probeTsserverProjectIdentity`).
+// "1": the server ignores the cancel and never answers (the wedged server the
+// issue names). "cancel": it answers the cancel with RequestCancelled after
+// the client already released the request, a late rejection that must not
+// surface as an unhandled one.
+async function expectTimedOutProjectInfoReleased(
+	mode: "1" | "cancel",
+): Promise<void> {
+	const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ro-cancel-"));
+	const trace = path.join(tmp, "trace.log");
+	const proc = await spawnFakeLspServer({
+		cwd: tmp,
+		env: {
+			...process.env,
+			FAKE_LSP_HANG_PROJECT_INFO: mode,
+			FAKE_LSP_TRACE_FILE: trace,
+		},
+	});
+	const client = await createLSPClient({
+		serverId: "fake",
+		process: proc,
+		root: tmp,
+	});
+	try {
+		expect(client.isBusy?.()).toBe(false);
+
+		// The request `fetchTsserverProjectIdentity` sends for the warm-attach
+		// membership probe, which the server never answers.
+		const res = await client.executeReadOnlyCommand(
+			"typescript.tsserverRequest",
+			[
+				"projectInfo",
+				{ file: path.join(tmp, "a.ts"), needFileNameList: false },
+			],
+		);
+
+		expect(res.executed).toBe(false);
+		expect(res.reason).toContain("timed out");
+		// The client no longer counts the abandoned request, so the registry's
+		// eviction predicate reads it as idle. The server never answered the
+		// cancel, so this is a local release, not a reply. `runReadOnlyServerCommand`
+		// awaits the released request before it returns, so the count is already
+		// down when this promise resolves — no polling, and no dependence on how
+		// many `async` hops sit between the release and the caller (review F1).
+		expect(client.isBusy?.()).toBe(false);
+		// #4801: the release is a production-visible fact, not only a test one.
+		// Its own record is once per server per session, so a wedged server
+		// cannot storm it; a regression of the release leaves this row absent.
+		const released = getDegradationSummary().find(
+			(group) => group.kind === "lsp-readonly-command-released",
+		);
+		expect(released?.latestReasons.map((row) => row.subject)).toContain("fake");
+		// The connection is still usable after the local release. Its answer
+		// also orders the trace: the server reads stdio in order, so it has
+		// read the cancel before it answers a request sent after it.
+		const next = await client.executeReadOnlyCommand(
+			"typescript.tsserverRequest",
+			["version"],
+		);
+		expect(next.executed).toBe(true);
+		expect(client.isBusy?.()).toBe(false);
+		// The server saw the cancel on the wire, and an answered command is
+		// never cancelled: exactly one cancel.
+		expect(
+			fs
+				.readFileSync(trace, "utf-8")
+				.split("\n")
+				.filter((line) => line === "recv $/cancelRequest"),
+		).toHaveLength(1);
+	} finally {
+		try {
+			await client.shutdown();
+		} catch {
+			/* ignore */
+		}
+		try {
+			await stopLSP(proc);
+		} catch {
+			/* ignore */
+		}
+		removeTempDirSync(tmp);
+	}
+}
+
+describe("LSP Client Integration — a timed-out read-only command is cancelled and released (#4801)", () => {
+	it(
+		"sends $/cancelRequest and drops the busy count for a projectInfo the server never answers",
+		() => expectTimedOutProjectInfoReleased("1"),
+		15_000,
+	);
+
+	it(
+		"sends $/cancelRequest and drops the busy count for a projectInfo the server answers with RequestCancelled",
+		() => expectTimedOutProjectInfoReleased("cancel"),
+		15_000,
+	);
 });
