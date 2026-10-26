@@ -1815,15 +1815,22 @@ describe("flake-shape ratchet — admission gate", () => {
 	// input. Old-vs-new probe through the real seam, not a re-derived copy
 	// of the caching logic, per the behaviour-preserving-refactor proof
 	// shape.
-	it("(#3546) the cached file list and import targets equal the uncached scan", () => {
-		const uncachedFiles = allTestSourceFiles().filter((file) =>
-			file.endsWith(".test.ts"),
-		);
-		expect(cachedAllTestFiles()).toEqual(uncachedFiles);
-		for (const file of uncachedFiles) {
-			expect(cachedLocalImportTargets(file)).toEqual(localImportTargets(file));
-		}
-	});
+	it(
+		"(#3546) the cached file list and import targets equal the uncached scan",
+		() => {
+			const uncachedFiles = allTestSourceFiles().filter((file) =>
+				file.endsWith(".test.ts"),
+			);
+			expect(cachedAllTestFiles()).toEqual(uncachedFiles);
+			for (const file of uncachedFiles) {
+				expect(cachedLocalImportTargets(file)).toEqual(
+					localImportTargets(file),
+				);
+			}
+		},
+		// This compares the whole tree, like the surrounding census tests.
+		WALK_TIMEOUT_MS,
+	);
 
 	// #3546 MUTATION: the cache must be load-bearing, not dead code — poison
 	// it and show `supportHelperHasLaneProof`'s answer for a REAL admitted
