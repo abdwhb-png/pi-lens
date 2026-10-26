@@ -39,6 +39,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
+import { TREE_WALK_TIMEOUT_MS } from "../../support/test-timeout-scale.js";
 import { RunnerRegistry } from "../../../clients/dispatch/dispatcher.js";
 // The production "untracked AND ignored" seam (#679), not a private git call:
 // one rule for what git hides, and no second child-process path in a census.
@@ -754,40 +755,44 @@ describe("captured real-bytes fixture provenance", () => {
 	// no fresh checkout has. The population is every fixture input on disk, not a
 	// list of the extensions that broke, and git itself decides — a spelling list
 	// here would pass the next input shape.
-	it("no captured fixture input is hidden by .gitignore", async () => {
-		const roots = [
-			path.join(repoRoot, "tests/fixtures/runner-output"),
-			path.join(repoRoot, "tests/fixtures/runner-output-clean"),
-			path.join(repoRoot, "tests/fixtures/runner-exit-codes"),
-		];
-		const inputs: string[] = [];
-		const walk = (dir: string): void => {
-			for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-				const full = path.join(dir, entry.name);
-				if (entry.isDirectory()) walk(full);
-				else inputs.push(full);
-			}
-		};
-		for (const root of roots) walk(root);
-		assertNonEmptyScan("captured fixture inputs", inputs.length, 60);
-		_resetUntrackedIgnoredCacheForTests();
-		const hiddenIds = await collectUntrackedIgnoredIds(repoRoot);
-		// Fail closed: no git answer is not an empty population. A census that
-		// reads "unavailable" as "clean" is how the inputs went missing.
-		expect(
-			hiddenIds,
-			`git could not enumerate the ignored files under ${repoRoot}, so this census cannot say whether the fixtures survive a fresh checkout`,
-		).toBeDefined();
-		const hidden = inputs
-			.map((file) => path.relative(repoRoot, file).replace(/\\/g, "/"))
-			.filter((file) =>
-				hiddenIds?.has(normalizeMapKey(path.join(repoRoot, file))),
-			);
-		expect(
-			hidden,
-			`captured fixture input(s) .gitignore hides, so a fresh checkout cannot replay them: ${hidden.join(", ")}`,
-		).toEqual([]);
-	});
+	it(
+		"no captured fixture input is hidden by .gitignore",
+		async () => {
+			const roots = [
+				path.join(repoRoot, "tests/fixtures/runner-output"),
+				path.join(repoRoot, "tests/fixtures/runner-output-clean"),
+				path.join(repoRoot, "tests/fixtures/runner-exit-codes"),
+			];
+			const inputs: string[] = [];
+			const walk = (dir: string): void => {
+				for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+					const full = path.join(dir, entry.name);
+					if (entry.isDirectory()) walk(full);
+					else inputs.push(full);
+				}
+			};
+			for (const root of roots) walk(root);
+			assertNonEmptyScan("captured fixture inputs", inputs.length, 60);
+			_resetUntrackedIgnoredCacheForTests();
+			const hiddenIds = await collectUntrackedIgnoredIds(repoRoot);
+			// Fail closed: no git answer is not an empty population. A census that
+			// reads "unavailable" as "clean" is how the inputs went missing.
+			expect(
+				hiddenIds,
+				`git could not enumerate the ignored files under ${repoRoot}, so this census cannot say whether the fixtures survive a fresh checkout`,
+			).toBeDefined();
+			const hidden = inputs
+				.map((file) => path.relative(repoRoot, file).replace(/\\/g, "/"))
+				.filter((file) =>
+					hiddenIds?.has(normalizeMapKey(path.join(repoRoot, file))),
+				);
+			expect(
+				hidden,
+				`captured fixture input(s) .gitignore hides, so a fresh checkout cannot replay them: ${hidden.join(", ")}`,
+			).toEqual([]);
+		},
+		TREE_WALK_TIMEOUT_MS,
+	);
 
 	it("every captured fixture belongs to a registered runner", () => {
 		const registered = new Set(registeredRunnerIds());
