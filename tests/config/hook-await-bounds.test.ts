@@ -2607,7 +2607,11 @@ const HELPER_UNBOUNDED: Readonly<Record<string, number>> = {
 	// shared directory reader once per directory of its bounded (128) search.
 	// Both are local reads on the spawn-policy path of `spawnClient`, which no
 	// hook awaits; hook-signal threading stays #2523 AC4.
-	"clients/lsp/server.ts": 124,
+	// The retained fork lookup for an explicit agent-level tsconfig adds two
+	// awaits: its existing markerExists filesystem probe and the root caller's
+	// wait for that result. RootFunction carries no hook signal; these use the
+	// same root-resolution path as the adjacent marker lookups above.
+	"clients/lsp/server.ts": 126,
 	"clients/map-with-concurrency.ts": 2,
 	"clients/observed-mutation.ts": 18,
 	// #4493: 10 -> 12, the `git rev-parse` in readGitHead and the `git diff`

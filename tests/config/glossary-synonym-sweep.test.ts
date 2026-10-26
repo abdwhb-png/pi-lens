@@ -1141,7 +1141,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 124 -> 121 (#4689 item 6): the root walks take their start, stop and
 		// refused home through `realpathOrResolve`, replacing three
 		// `path.resolve` calls; the extensions walk keeps its count.
-		"clients/lsp/server.ts": 121,
+		// The retained fork's agent-level tsconfig lookup adds path.dirname:
+		// this is the node:path namespace, not a retired domain identifier.
+		"clients/lsp/server.ts": 122,
 		"clients/lsp/session-roots.ts": 8,
 		// 13 -> 15 (#4346): a creation's path joins the entry's dependency
 		// scope test (Go package directory, created-file stem/directory names).
