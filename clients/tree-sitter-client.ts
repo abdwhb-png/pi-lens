@@ -45,6 +45,7 @@ import {
 	vendoredGrammarsDir,
 } from "./grammar-source.js";
 import { getPackageRoot, resolvePackagePath } from "./package-root.js";
+import { walkUpDirs } from "./path-utils.js";
 import { resolveWebTreeSitterPackageDir } from "../scripts/lib/web-tree-sitter-dir.mjs";
 import {
 	assertInstallAllowed,
@@ -88,6 +89,56 @@ const TREE_SITTER_MAX_SCAN_FILES = 20_000;
 // failure (offline lazy fetch, mid-scan load error) recover on a later scan
 // instead of paying the 3.3x per-rule fallback for the process lifetime (#889).
 const QUERY_BATCH_MAX_LOAD_FAILURES = 3;
+
+/**
+ * Rule fields a combined batch neither compiles nor hands to a result
+ * consumer: documentation the loader reads from the YAML, plus `predicates`.
+ * RuleCache persists none of them (#5260). The first dispatch in a project
+ * builds its batch from the loader's objects, every later one from the cache's
+ * projection of the same rules; hashing these fields gave the two different
+ * identities and recompiled the batch on the second dispatch. `predicates` is
+ * parsed by the loader and read by no code after that: the batch compiles the
+ * `query` text, where native `#eq?` predicates live (#5278 review). A field
+ * missing from this set is hashed, so a new rule field can only cost a
+ * rebuild, never serve a stale batch. A future reader of `predicates` removes
+ * it from this set. `runQueriesOnFile`'s two consumers (the dispatch runner and
+ * the project scanner) read none of these.
+ */
+const BATCH_IDENTITY_IGNORED_FIELDS: ReadonlySet<string> = new Set([
+	"category",
+	"description",
+	"tags",
+	"cwe",
+	"owasp",
+	"confidence",
+	"predicates",
+]);
+
+/**
+ * The identity a rule set's combined batch is cached under: a hash of every
+ * rule field outside `BATCH_IDENTITY_IGNORED_FIELDS`, in sorted key order so
+ * the order a producer wrote the keys in does not matter. It keys on rule
+ * CONTENT, not just ids (#878): the batch stores each rule (its message
+ * reaches diagnostics) and the compiled patterns, and rule ids are stable
+ * across edits. sha256 keeps the key bounded without #889's 32-bit collision
+ * risk. The language prefix is added by `getQueryCacheKey`.
+ */
+function queryBatchIdentity(queryDefs: readonly TreeSitterQuery[]): string {
+	const canonical = queryDefs.map((queryDef) => {
+		const fields: Array<[string, unknown]> = [];
+		for (const [field, value] of Object.entries(queryDef)) {
+			if (value === undefined || BATCH_IDENTITY_IGNORED_FIELDS.has(field)) {
+				continue;
+			}
+			fields.push([field, value]);
+		}
+		return fields.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	});
+	return crypto
+		.createHash("sha256")
+		.update(JSON.stringify(canonical))
+		.digest("hex");
+}
 
 // Keep post-filter tree walks bounded. A malformed or unexpectedly huge tree
 // must not stall the batched query walk; the filter fails open when this cap
@@ -298,18 +349,22 @@ function isGrammarLoadTimeout(err: unknown): boolean {
  * creates it — so the nearest EXISTING ancestor is what gets probed.
  */
 function grammarWriteBlockedReason(dir: string): string | undefined {
-	let probe = dir;
-	while (!fs.existsSync(probe)) {
-		const parent = path.dirname(probe);
-		if (parent === probe) return "ENOENT";
-		probe = parent;
+	// #4689 item 6 (batch 7): the nearest directory that exists, on the walk
+	// that climbs the DIR's path identity. A hand-rolled `path.dirname` chain
+	// over the caller's spelling compares ancestors the kernel does not
+	// necessarily open for this directory; `walkUpDirs` answers each candidate
+	// already on the identity axis, and the first one on disk is the one whose
+	// writability decides.
+	for (const candidate of walkUpDirs(dir)) {
+		if (!fs.existsSync(candidate)) continue;
+		try {
+			fs.accessSync(candidate, fs.constants.W_OK);
+			return undefined;
+		} catch (err) {
+			return (err as { code?: string })?.code ?? "EACCES";
+		}
 	}
-	try {
-		fs.accessSync(probe, fs.constants.W_OK);
-		return undefined;
-	} catch (err) {
-		return (err as { code?: string })?.code ?? "EACCES";
-	}
+	return "ENOENT";
 }
 
 /**
@@ -2539,11 +2594,10 @@ export class TreeSitterClient {
 		languageId: string,
 		retain = false,
 	): Promise<QueryBatch | null> {
-		const identity = crypto
-			.createHash("sha256")
-			.update(JSON.stringify(queryDefs))
-			.digest("hex");
-		const cacheKey = this.getQueryCacheKey(`batch:${identity}`, languageId);
+		const cacheKey = this.getQueryCacheKey(
+			`batch:${queryBatchIdentity(queryDefs)}`,
+			languageId,
+		);
 		const cached = this.queryBatchCache.get(cacheKey);
 		if (cached !== undefined) {
 			this.queryBatchCache.delete(cacheKey);
@@ -2586,17 +2640,11 @@ export class TreeSitterClient {
 		languageId: string,
 		lease: QueryBatchLease,
 	): Promise<QueryBatch | null> {
-		// Key on rule CONTENT, not just ids: the batch stores each queryDef (its
-		// message reaches diagnostics) and the compiled patterns. Rule ids are
-		// stable across edits, so an id-only key kept serving the pre-edit batch
-		// for the process lifetime even after the runner reloaded the rules from
-		// disk on a RuleCache miss (#878). sha256 keeps the key bounded without
-		// #889's 32-bit collision risk.
-		const identity = crypto
-			.createHash("sha256")
-			.update(JSON.stringify(queryDefs))
-			.digest("hex");
-		const cacheKey = this.getQueryCacheKey(`batch:${identity}`, languageId);
+		// Same key as `compileQueryBatch` computed (see `queryBatchIdentity`).
+		const cacheKey = this.getQueryCacheKey(
+			`batch:${queryBatchIdentity(queryDefs)}`,
+			languageId,
+		);
 		const inputKeys = [
 			cacheKey,
 			...queryDefs.map((queryDef) =>

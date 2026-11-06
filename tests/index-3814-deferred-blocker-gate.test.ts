@@ -70,6 +70,7 @@ import { formatDiagnostics } from "../clients/dispatch/utils/format-utils.js";
 import { resetPendingRunnerFindings } from "../clients/dispatch/pending-runner-findings.js";
 import type { Diagnostic, RunnerResult } from "../clients/dispatch/types.js";
 import { markDisposition } from "../clients/diagnostic-dispositions.js";
+import { BLOCKER_REPEAT_HEADING } from "../clients/runtime-context.js";
 import {
 	clearLatencyLog,
 	flushLatencyLog,
@@ -82,7 +83,9 @@ import {
 	makeContextWithSystemEvent,
 	makeSessionStartEvent,
 } from "./support/host-event-factory.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
+import { useGlobalConfig } from "./support/global-config.js";
 
 const SESSION_ID = "pi-3814-deferred-gate-session";
 const RUNNER_ID = "slow-runner";
@@ -181,7 +184,9 @@ beforeEach(async () => {
 	);
 });
 
-afterEach(() => {
+afterEach(async () => {
+	// #5146: end the case's sessions before its root goes.
+	await endMockSessions();
 	_resetSessionLifecycleForTests();
 	if (previousTestMode === undefined) delete process.env.PI_LENS_TEST_MODE;
 	else process.env.PI_LENS_TEST_MODE = previousTestMode;
@@ -280,8 +285,8 @@ const answersClean = async (): Promise<RunnerResult> => ({
 });
 
 async function startSession(guard = true) {
+	setGlobalConfig({ guard: { enabled: guard } });
 	const pi = createPiMock();
-	pi.setFlag("lens-guard", guard);
 	extension(pi.asExtensionAPI());
 	await pi.emit(
 		"session_start",
@@ -334,6 +339,8 @@ function editAfterScan(content: string): void {
 	const later = new Date(Date.now() + 2_000);
 	fs.utimesSync(filePath, later, later);
 }
+
+const setGlobalConfig = useGlobalConfig();
 
 describe("#3814: deferred blocking findings gate the commit", () => {
 	for (const shape of ["succeeded", "failed"] as const) {
@@ -521,14 +528,21 @@ describe("#3814: deferred blocking findings gate the commit", () => {
 		await host.edit();
 		await settle();
 		expect((await host.gate()).block).toBe(true);
-		await host.turnEnd();
+		const delivered = await host.turnEnd();
+		// #4921: the merged set reaches the agent once as a delivery. #5240: the
+		// next prompt names the unchanged set once more, as a repeat of the
+		// blockers alone (never a second delivery), and the gate still holds it.
 		const replay = await (async () => {
 			await host.turnStart();
 			return await host.turnEnd();
 		})();
 
-		expect(replay).toContain("inline finding on beta");
-		expect(replay).toContain("alpha is not a function");
+		expect(delivered).toContain("inline finding on beta");
+		expect(delivered).toContain("alpha is not a function");
+		expect(delivered).not.toContain(BLOCKER_REPEAT_HEADING);
+		expect(replay).toContain(BLOCKER_REPEAT_HEADING);
+		expect(replay.split("alpha is not a function")).toHaveLength(2);
+		expect(replay.split("inline finding on beta")).toHaveLength(2);
 		expect((await host.gate()).block).toBe(true);
 	});
 

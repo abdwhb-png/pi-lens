@@ -20,7 +20,7 @@
 					"items": {
 						"type": "string"
 					},
-					"maxItems": 200
+					"maxItems": 100
 				},
 				"selector": {
 					"type": "string"
@@ -100,6 +100,12 @@
 					]
 				},
 				"path": {
+					"type": "string"
+				},
+				"file": {
+					"type": "string"
+				},
+				"filePath": {
 					"type": "string"
 				},
 				"concurrency": {
@@ -195,6 +201,12 @@
 				"path": {
 					"type": "string"
 				},
+				"file": {
+					"type": "string"
+				},
+				"filePath": {
+					"type": "string"
+				},
 				"line": {
 					"type": "number"
 				},
@@ -247,6 +259,9 @@
 				"callHierarchyItem": {
 					"type": "object",
 					"properties": {}
+				},
+				"view": {
+					"type": "string"
 				}
 			}
 		}
@@ -269,7 +284,7 @@
 					"items": {
 						"type": "string"
 					},
-					"maxItems": 200
+					"maxItems": 100
 				},
 				"selector": {
 					"type": "string"
@@ -355,6 +370,12 @@
 					]
 				},
 				"path": {
+					"type": "string"
+				},
+				"file": {
+					"type": "string"
+				},
+				"filePath": {
 					"type": "string"
 				},
 				"concurrency": {
@@ -450,6 +471,12 @@
 				"path": {
 					"type": "string"
 				},
+				"file": {
+					"type": "string"
+				},
+				"filePath": {
+					"type": "string"
+				},
 				"line": {
 					"type": "number"
 				},
@@ -502,6 +529,9 @@
 				"callHierarchyItem": {
 					"type": "object",
 					"properties": {}
+				},
+				"view": {
+					"type": "string"
 				},
 				"cwd": {
 					"type": "string"

@@ -79,6 +79,7 @@ const UNPROVEN_IDS = [
 	"elixir",
 	"fsharp",
 	"go",
+	"groovy",
 	"haskell",
 	"java",
 	"nix",
@@ -86,6 +87,7 @@ const UNPROVEN_IDS = [
 	"ruby",
 	"swift",
 	"omnisharp",
+	"fallow",
 ] as const;
 
 export function idleEvictionRegistryIssues(

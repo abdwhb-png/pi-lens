@@ -1,3 +1,4 @@
+// flake-shape: real-process-spawn — willRenameFiles edits are merged from real clients over the wire; a stub returns only the edits it was given
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -9,6 +10,7 @@ import {
 } from "../../../clients/degradation-ledger.js";
 import { createLSPClient } from "../../../clients/lsp/client.js";
 import { LSPService } from "../../../clients/lsp/index.js";
+import { LspRequestTimeoutError } from "../../../clients/lsp/request-timeout-error.js";
 import { stopLSP } from "../../../clients/lsp/launch.js";
 import { spawnFakeLspServer } from "../../support/fake-lsp-server.js";
 import type { RenameClientDouble } from "../../support/lsp-rename-client-double.js";
@@ -92,6 +94,54 @@ describe("LSPService.renameFile", () => {
 			expect(secondary.willRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
 			expect(primary.didRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
 			expect(secondary.didRenameFiles).toHaveBeenCalledWith(oldPath, newPath);
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	// #5013: the rename description folds each `path.relative` result through
+	// `toPosix`, so a backslash-spelled relative path is reported with forward
+	// slashes. Two on-disk spellings of the same logical file are created for
+	// one reason: the preflight decodes the URI through `uriToPath` ->
+	// `normalizeFilePath`, which folds the separator before it stats the source,
+	// while the apply step renames the caller's raw spelling verbatim. Neither
+	// reads the other's path, and both behaviours predate the fold; only the
+	// description under test folds. On win32 the two spellings are the same path
+	// and `path.relative` hands back a backslash on its own.
+	it("describes the rename with a folded relative path (lsp/index.ts fold)", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-rename-fold-"),
+		);
+		const physicalDir = path.join(tmpDir, "sub", "dir");
+		const spelledDir = path.join(tmpDir, "sub\\dir");
+		for (const dir of [physicalDir, spelledDir]) {
+			fs.mkdirSync(dir, { recursive: true });
+			fs.writeFileSync(
+				path.join(dir, "old.ts"),
+				"export const value = 1;\n",
+				"utf-8",
+			);
+		}
+		const oldPath = path.join(spelledDir, "old.ts");
+		const newPath = path.join(spelledDir, "new.ts");
+
+		const service = new LSPService();
+		addRenameClient(
+			service,
+			"typescript",
+			tmpDir,
+			makeRenameClient(tmpDir, null),
+		);
+
+		try {
+			const result = await service.renameFile(oldPath, newPath, {
+				cwd: tmpDir,
+				apply: true,
+			});
+
+			expect(result.descriptions).toContain(
+				"Renamed sub/dir/old.ts → sub/dir/new.ts",
+			);
 		} finally {
 			removeTempDirSync(tmpDir);
 		}
@@ -432,6 +482,28 @@ describe("LSPService.renameFile", () => {
 			expect(fs.existsSync(oldPath)).toBe(true);
 			expect(fs.existsSync(newPath)).toBe(false);
 			expect(failing.didRenameFiles).not.toHaveBeenCalled();
+		} finally {
+			removeTempDirSync(tmpDir);
+		}
+	});
+
+	it("preserves a typed willRenameFiles timeout through the aggregate", async () => {
+		const tmpDir = fs.mkdtempSync(
+			path.join(os.tmpdir(), "pi-lens-lsp-rename-timeout-"),
+		);
+		const oldPath = path.join(tmpDir, "old.ts");
+		const newPath = path.join(tmpDir, "new.ts");
+		fs.writeFileSync(oldPath, "export const value = 1;\n", "utf-8");
+		const failing = makeRenameClient(tmpDir, null);
+		failing.willRenameFiles.mockRejectedValueOnce(
+			new LspRequestTimeoutError("workspace/willRenameFiles", 100, 101),
+		);
+		const service = new LSPService();
+		addRenameClient(service, "typescript", tmpDir, failing);
+		try {
+			await expect(
+				service.renameFile(oldPath, newPath, { cwd: tmpDir, apply: true }),
+			).rejects.toBeInstanceOf(LspRequestTimeoutError);
 		} finally {
 			removeTempDirSync(tmpDir);
 		}

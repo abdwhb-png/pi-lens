@@ -8,6 +8,7 @@
  * seam and `createVenvFinder` are the real modules.
  */
 
+import { uncheckedReason } from "../../support/dispatch-verdict.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,7 +29,6 @@ import { BiomeClient } from "../../../clients/biome-client.js";
 import { getGlobalPiLensDir } from "../../../clients/file-utils.js";
 import { FormatService } from "../../../clients/format-service.js";
 import { clearFormatterRuntimeState } from "../../../clients/formatters.js";
-import { MetricsClient } from "../../../clients/metrics-client.js";
 import { RuffClient } from "../../../clients/ruff-client.js";
 import {
 	acquireWarmWordIndex,
@@ -594,7 +594,6 @@ describe("#4242 adopted-root runner allowlist", () => {
 					{
 						biomeClient: new BiomeClient(),
 						ruffClient: new RuffClient(),
-						metricsClient: new MetricsClient(),
 						fixedThisTurn: new Set(),
 						getFormatService: () => new FormatService("adopted-pipeline-r2"),
 					},
@@ -717,6 +716,57 @@ describe("#4242 adopted-root runner allowlist", () => {
 				refused: "tflint",
 				noAdmittedRunner: false,
 			});
+		} finally {
+			fixture.cleanup();
+		}
+	});
+
+	// Recurrence this guards (PR #5238 review r3, coderabbit): the empty-group
+	// return carried no `unconfirmedStatus`, so a write to a file whose every
+	// planned runner the adopted root refuses read "✓ <Kind> clean" (master did
+	// the same for Python and TypeScript). Nothing checked the file.
+	it("reads an adopted file whose planned runners are all refused as not analyzed", async () => {
+		const fixture = adoptedFixture();
+		try {
+			for (const [name, label] of [
+				["Jenkinsfile", "Groovy"],
+				["main.py", "Python"],
+				["main.ts", "JavaScript/TypeScript"],
+			] as const) {
+				const file = path.join(fixture.adoptedRoot, name);
+				fs.writeFileSync(file, "x\n");
+				const result = await runPipeline(
+					{
+						filePath: file,
+						cwd: fixture.adoptedRoot,
+						projectRoot: fixture.sessionRoot,
+						analysisRootMode: "adopted",
+						toolName: "write",
+						dbg: () => {},
+						getFlag: () => false,
+					},
+					{
+						biomeClient: new BiomeClient(),
+						ruffClient: new RuffClient(),
+						fixedThisTurn: new Set(),
+						getFormatService: () => new FormatService("adopted-not-analyzed"),
+					},
+				);
+				expect(result.output, name).toContain(
+					`${label} unconfirmed — not analyzed (adopted analysis root`,
+				);
+				expect(result.output, name).not.toContain("clean");
+			}
+			// A plan of nothing refused nothing, and checked nothing either (#5258:
+			// it used to claim nothing, which the all-clear line read as clean).
+			const unplanned = await dispatchForFile(
+				makeCtx(fixture.file, fixture.sessionRoot),
+				[],
+				new RunnerRegistry(),
+			);
+			expect(uncheckedReason(unplanned)).toBe(
+				"no runner is planned for this file",
+			);
 		} finally {
 			fixture.cleanup();
 		}
@@ -1105,7 +1155,6 @@ describe("#4242 adopted-root runner allowlist", () => {
 				{
 					biomeClient: new BiomeClient(),
 					ruffClient: new RuffClient(),
-					metricsClient: new MetricsClient(),
 					fixedThisTurn: new Set(),
 					getFormatService: () => new FormatService("adopted-word-index"),
 				},

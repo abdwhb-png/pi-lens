@@ -18,7 +18,10 @@
  * is no second place to remember.
  */
 
-import { DEPRECATED_CONFIG_SURFACES } from "./config-diagnostic-codes.js";
+import {
+	type ConfigDiagnosticCode,
+	DEPRECATED_CONFIG_SURFACES,
+} from "./config-diagnostic-codes.js";
 
 type LensFlagScope = "global" | "project";
 
@@ -174,6 +177,38 @@ export const LENS_FLAGS: readonly LensFlagSpec[] = [
 		scope: "global",
 	},
 	{
+		name: "no-ast-grep",
+		description:
+			"Disable the ast-grep auxiliary LSP server (default-on; serves the bundled and repo ast-grep rules). Also via astGrep.enabled=false in ~/.pi-lens/config.json.",
+		configKey: "astGrep.enabled",
+		negated: true,
+		default: false,
+		scope: "global",
+	},
+	{
+		name: "no-zizmor",
+		description:
+			"Disable the zizmor auxiliary LSP server (default-on; audits GitHub Actions workflows). Also via zizmor.enabled=false in ~/.pi-lens/config.json.",
+		configKey: "zizmor.enabled",
+		negated: true,
+		default: false,
+		scope: "global",
+	},
+	{
+		name: "no-typos",
+		description:
+			"Disable the typos auxiliary LSP server (default-on; flags known misspellings in source and Markdown). Also via typos.enabled=false in ~/.pi-lens/config.json.",
+		configKey: "typos.enabled",
+		negated: true,
+		default: false,
+		scope: "global",
+	},
+	globalOptInFlag(
+		"lens-spotbugs",
+		"Opt-in: run SpotBugs on Java and Kotlin files when a Java build descriptor and a compiled .class directory exist (heavyweight: JVM cold start plus whole-tree analysis). Default off. Also via spotbugs.enabled=true in ~/.pi-lens/config.json.",
+		"spotbugs.enabled",
+	),
+	{
 		name: "no-read-guard",
 		description:
 			"Disable read-before-edit behavior monitor. Also via readGuard.enabled=false in ~/.pi-lens/config.json.",
@@ -290,6 +325,15 @@ export const LENS_FLAGS: readonly LensFlagSpec[] = [
 		default: false,
 		scope: "global",
 	},
+	{
+		name: "lens-fallow",
+		description:
+			"Opt-in (#4929): run fallow-lsp beside the TypeScript server on JS/TS files, an advisory auxiliary LSP for unused code, duplication and cycles (auto-installs the pinned release; never blocks; knip, jscpd and madge keep running). Default off. Also via fallow.enabled=true in ~/.pi-lens/config.json.",
+		configKey: "fallow.enabled",
+		negated: false,
+		default: false,
+		scope: "global",
+	},
 	...(
 		[
 			"knip",
@@ -373,10 +417,14 @@ export const GLOBAL_NON_FLAG_CONFIG_SECTIONS: readonly string[] = [
  * reports the section. Swept at #3131: every other non-flag dotted key either
  * loader parses (`dispatch.runnerTimeoutFloorMs`, `widget.visible`,
  * `startup.mode`, `startup.scans.enabled`) fails (a) or (c) — see that PR's
- * body for the per-member table — so this is currently the only member.
+ * body for the per-member table. `dispatch.runnerTimeoutFloorMs` joined when
+ * `dispatch` became recognized at project scope for `dispatch.disabledRunners`
+ * (it now satisfies (c)), so a project file carrying the floor is told it does
+ * nothing there instead of being silently dropped.
  */
 export const GLOBAL_ONLY_NON_FLAG_KEYS: readonly string[] = [
 	"actionableWarnings.autoFix.maxFixes",
+	"dispatch.runnerTimeoutFloorMs",
 ];
 
 /**
@@ -441,9 +489,14 @@ const LSP_PROJECT_HONORED_KEYS: readonly string[] =
  * keys beside it, so a project config that has already been migrated must not
  * be told its `lsp` section is a global-only setting. Its tolerance is
  * SUB-KEY-SCOPED — see {@link PROJECT_FOREIGN_NAMESPACE_HONORED_KEYS}.
+ *
+ * `dispatch` joined for `dispatch.disabledRunners`, the dispatch loader's
+ * denial list (`clients/dispatch/disabled-runners.ts`). It is mixed-scope the
+ * same way: `dispatch.runnerTimeoutFloorMs` stays global-only.
  */
 export const PROJECT_FOREIGN_CONFIG_NAMESPACES: readonly string[] = [
 	"lsp",
+	"dispatch",
 	// DERIVED, not restated: the four legacy root keys are exactly the
 	// `kind: "key"` rows of the deprecation registry, and a hand-copied second
 	// list of them would be a place for the accepted set and the removal
@@ -470,7 +523,10 @@ export const PROJECT_FOREIGN_CONFIG_NAMESPACES: readonly string[] = [
 export const PROJECT_FOREIGN_NAMESPACE_HONORED_KEYS: ReadonlyMap<
 	string,
 	readonly string[]
-> = new Map([["lsp", LSP_PROJECT_HONORED_KEYS]]);
+> = new Map([
+	["lsp", LSP_PROJECT_HONORED_KEYS],
+	["dispatch", ["disabledRunners"]],
+]);
 
 /**
  * The distinct TOP-LEVEL section keys a set of flags lives under (the first
@@ -512,7 +568,7 @@ interface FlagConfigPath {
 function resolveFlagConfigPath(
 	raw: Record<string, unknown>,
 	configKey: string,
-	warnInvalid?: (reason: string) => void,
+	warnInvalid?: (reason: string, code: ConfigDiagnosticCode) => void,
 ): FlagConfigPath | undefined {
 	const segments = configKey.split(".");
 	let source = raw;
@@ -526,7 +582,10 @@ function resolveFlagConfigPath(
 		const next = asConfigObject(object[segment]);
 		if (!next) {
 			if (warnInvalid) {
-				warnInvalid(`${segments.slice(0, i + 1).join(".")} must be an object`);
+				warnInvalid(
+					`${segments.slice(0, i + 1).join(".")} must be an object`,
+					"PILENS_CFG_0005",
+				);
 			}
 			return undefined;
 		}
@@ -599,7 +658,7 @@ export function assignFlagConfigSection(
 	raw: Record<string, unknown>,
 	out: Record<string, unknown>,
 	configKey: string,
-	warnInvalid: (reason: string) => void,
+	warnInvalid: (reason: string, code: ConfigDiagnosticCode) => void,
 ): void {
 	const path = resolveFlagConfigPath(raw, configKey, warnInvalid);
 	if (!path) return;
@@ -612,7 +671,7 @@ export function assignFlagConfigSection(
 
 	const leaf = path.segments[path.segments.length - 1];
 	if (leaf in path.source && typeof path.source[leaf] !== "boolean") {
-		warnInvalid(`${configKey} must be a boolean`);
+		warnInvalid(`${configKey} must be a boolean`, "PILENS_CFG_0005");
 		target[leaf] = undefined;
 		return;
 	}

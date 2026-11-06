@@ -2042,6 +2042,64 @@ describe("test-runner-client", () => {
 			expect(found?.testFile).toBe(testFile);
 		});
 
+		// #2556 RECURRENCE GUARDED: `relativeSourceDir` read `path.relative(...)
+		// .startsWith("..")`, so a source directory named `..gen` (inside cwd) had
+		// no mirrored subdirectory and its test under tests/..gen/ was not found.
+		it("finds a mirrored test for a source under a ..-named directory (#2556)", () => {
+			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+			cleanups.push(cleanup);
+
+			fs.writeFileSync(
+				path.join(tmpDir, "vitest.config.ts"),
+				"export default {}\n",
+			);
+			const srcDir = path.join(tmpDir, "..gen");
+			fs.mkdirSync(srcDir, { recursive: true });
+			const src = path.join(srcDir, "knip-client.ts");
+			fs.writeFileSync(src, "export const x = 1;\n");
+
+			const testDir = path.join(tmpDir, "tests", "..gen");
+			fs.mkdirSync(testDir, { recursive: true });
+			const testFile = path.join(testDir, "knip-client.test.ts");
+			fs.writeFileSync(testFile, "// test\n");
+
+			const client = new TestRunnerClient(false);
+			expect(client.findTestFile(src, tmpDir)?.testFile).toBe(testFile);
+		});
+
+		// #2556: the other direction of the same guard. A source directory outside
+		// cwd has no mirrored subdirectory, so a file planted where the OUTSIDE
+		// directory's absolute spelling would land under tests/ is not a match.
+		// lane: Unit tests (ubuntu) — joining an absolute segment onto tests/ makes
+		// a path only a POSIX host can create, so the decoy cannot sit there on win32.
+		it.skipIf(process.platform === "win32")(
+			"does not mirror a source directory outside cwd under the tests tree (#2556)",
+			() => {
+				const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
+				cleanups.push(cleanup);
+
+				const project = path.join(tmpDir, "proj");
+				const outside = path.join(tmpDir, "outside");
+				fs.mkdirSync(project, { recursive: true });
+				fs.mkdirSync(outside, { recursive: true });
+				fs.writeFileSync(
+					path.join(project, "vitest.config.ts"),
+					"export default {}\n",
+				);
+				const src = path.join(outside, "knip-client.ts");
+				fs.writeFileSync(src, "export const x = 1;\n");
+				const decoyDir = path.join(project, "tests", outside);
+				fs.mkdirSync(decoyDir, { recursive: true });
+				fs.writeFileSync(
+					path.join(decoyDir, "knip-client.test.ts"),
+					"// decoy\n",
+				);
+
+				const client = new TestRunnerClient(false);
+				expect(client.findTestFile(src, project)).toBeNull();
+			},
+		);
+
 		it("finds a mirrored test under __tests__/<subdir>/", () => {
 			const { tmpDir, cleanup } = setupTestEnvironment("pi-lens-tests-");
 			cleanups.push(cleanup);
@@ -2381,6 +2439,9 @@ describe("test-runner-client", () => {
 				...RUNNERS.vitest,
 				command: process.execPath,
 				binName: "pi-lens-failed-vitest-fixture",
+				// The fixture is `node -e`, not the vitest CLI: it prints its report to
+				// stdout and would read `--outputFile=…` as a node option.
+				reportToFile: false,
 				args: (testFile: string) => [
 					"-e",
 					`console.log(JSON.stringify({ numPassedTests: 0, numFailedTests: 1, numPendingTests: 0, testResults: [{ name: ${JSON.stringify(testFile)}, assertionResults: [{ status: "failed", title: "fixture", failureMessages: ["boom"] }] }] })); process.exitCode = 1;`,

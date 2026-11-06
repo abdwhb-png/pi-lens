@@ -8,7 +8,7 @@
 //
 // `marked` is loaded lazily, on the first call, so a script that imports this
 // module and never reads markdown structure (`scripts/check-close-keywords.mjs`
-// in the `Close-keyword syntax` and `Verify merged PR close keywords` jobs,
+// in the `PR metadata` and `Verify merged PR close keywords` jobs,
 // which run with no install) never resolves it. The `PR body (advisory)` job
 // installs marked alone, pinned by the lockfile's integrity
 // (`.github/workflows/pr-metadata.yml`). A missing install throws: a gate that
@@ -36,7 +36,11 @@ function normalized(text) {
 	return String(text ?? "").replace(/\r\n?/g, "\n");
 }
 
-function children(token) {
+/**
+ * A token's child tokens as the reader nests them: a list's items, a table's
+ * cell contents, any other token's own `tokens`. Empty for a leaf.
+ */
+export function markdownChildren(token) {
 	if (token.type === "list") return token.items;
 	if (token.type === "table")
 		return [...token.header, ...token.rows.flat()].flatMap(
@@ -87,7 +91,7 @@ function layout(source) {
 		const visit = (node, limit, block) => {
 			const placed =
 				limit === null ? null : place(source, node.raw ?? "", cursor, limit);
-			const kids = children(node);
+			const kids = markdownChildren(node);
 			if (!kids.length)
 				leaves.push({ token: node, spans: placed?.spans ?? null, block });
 			if (placed) cursor = placed.spans[0]?.[0] ?? cursor;
@@ -315,6 +319,22 @@ export function markdownHeadings(text) {
 		});
 	}
 	return headings;
+}
+
+/**
+ * The lexer's top-level tokens in document order, each with its first line
+ * (0-based over `text.split(/\r?\n/)`). A budget reads the whole tree from
+ * here instead of scanning the text for the constructs it knows (#5026): a
+ * token kind nobody listed is still a token, and the caller counts it.
+ */
+export function markdownTokens(text) {
+	const source = normalized(text);
+	let offset = 0;
+	return lex(source).map((token) => {
+		const line = lineOf(source, offset);
+		offset += token.raw.length;
+		return { token, line };
+	});
 }
 
 /**

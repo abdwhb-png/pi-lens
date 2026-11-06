@@ -82,6 +82,7 @@ import { McpStdioClient } from "./lib/mcp-stdio-client.mjs";
 import { parseTable } from "./lib/md-matrix.mjs";
 import { parseNdjsonEntries } from "./lib/latency-log-phases.mjs";
 import { startRpcSession } from "./rpc-load-check.mjs";
+import { isMainModule } from "./lib/is-main-module.mjs";
 
 // ===========================================================================
 // Pure core — parsing, outcome rules, arithmetic, rendering.
@@ -896,7 +897,11 @@ export function runPublishToolchainProbe(ctx) {
 	};
 }
 
-/** pi's first release with the built-in `codemode` tool. */
+/**
+ * pi's first release with the built-in `codemode` tool: the earliest pi on
+ * which the codemode row can run. It is not pi-lens's supported pi range; the
+ * devDependency pins pi-coding-agent at `^1.5.0`.
+ */
 const CODEMODE_MIN_PI_VERSION = Object.freeze([0, 99, 0]);
 
 /** The text pi-lens's read guard puts on an edit of a file the agent never read. */
@@ -3198,9 +3203,7 @@ function describePi(piBin, env) {
 	}
 }
 
-const invokedDirectly =
-	process.argv[1] &&
-	path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+const invokedDirectly = isMainModule(import.meta.url);
 if (invokedDirectly) {
 	main().catch((err) => {
 		console.error("[release-qa] crashed:", err);

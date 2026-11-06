@@ -158,7 +158,7 @@ env:
   # below 0.86 falls outside the window and needs no dedicated host. A pi below
   # 0.86 emits no `context_with_system`, so pi-lens delivers no findings there
   # since #4644 (#4688: the floor moved rather than reviving the old hosts).
-  PI_HOST_SUPPORTED_RANGE: ">=0.86.1 <1.5.0"
+  PI_HOST_SUPPORTED_RANGE: ">=0.86.1 <1.6.0"
 
 jobs:
   # #4291: classify the diff once. `smoke` is true when a pull request touches
@@ -178,6 +178,7 @@ jobs:
       pull-requests: read
     outputs:
       smoke: ${{ steps.classify.outputs.smoke }}
+      install: ${{ steps.classify.outputs.install }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -197,6 +198,19 @@ jobs:
 
   smoke:
     name: ${{ matrix.os }} · ${{ matrix.pm }}
+    # #5112: a pull request starts this job only when its diff touches an
+    # install path (INSTALL_PATHS in scripts/ci-changed-files.mjs: the manifests,
+    # the lifecycle scripts, the Install test's scripts, this workflow). It cost
+    # 1,447 runner minutes in 30 days with 0 real catches (#3995 slice A), and
+    # the PRs that reach this workflow only for the RPC, LSP or trust seams
+    # (PR_SMOKE_PATHS) are served by pi-load and lsp-handshake, which the deep
+    # `scope` verdict still runs in full. The #3043 rule holds: an edit to this
+    # job's own lines is an edit to this file, which is an install path, so the
+    # lines it changes still run before the merge. Every other event runs the
+    # full matrix below, and an empty or missing verdict runs the cell (fail
+    # open, like pi-load's reading of `scope.smoke`).
+    needs: scope
+    if: github.event_name != 'pull_request' || needs.scope.outputs.install != 'false'
     # #3043's shape, swept (2026-09-15 retro F2): this job carried
     # `if: github.event_name != 'pull_request'`, so an edit to any of its four
     # package-manager arms reached master with NO pre-merge lane able to
@@ -322,7 +336,8 @@ jobs:
   # the install ROOT's package.json, never from an installed dependency's. pi
   # installs `npm:pi-lens` into a generated root, `{"name":"pi-extensions",
   # "private":true}` (`PackageManager#ensureNpmProject`), with `npm install
-  # <spec> --prefix <root> --legacy-peer-deps` (`getNpmInstallArgs`), and writes
+  # <spec> --prefix <root> --legacy-peer-deps --no-audit --no-fund`
+  # (`getNpmInstallArgs`), and writes
   # no `allowScripts` there. The first step pins that consequence: strict
   # install into pi's unmodified root FAILS CLOSED on @ast-grep/cli. The second
   # installs into a root that carries pi-lens's own declared approvals, which is
@@ -616,7 +631,7 @@ jobs:
           node-version: "22"
 
       # yamllint disable-line rule:line-length
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 

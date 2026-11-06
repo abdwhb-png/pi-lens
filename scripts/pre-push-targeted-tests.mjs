@@ -115,18 +115,32 @@ let recordWriteWarningEmitted = false;
 // armed together in a `maxWorkers: 1` lane whose phase does (#4724), so they
 // are excluded from the local pre-push selection and run in CI instead
 // (#3426 H3432-1). Never a blanket skip: each entry carries a reason and a CI
-// row, and `--include-ci-only` admits them in the CI job that owns them. The
-// governance suite pins this table, the exclusion, and the CI invocation.
+// row (the gating Unit tests shards: every entry is in the default vitest
+// collection, #3215), and `--include-ci-only` admits them in a local run. The
+// governance suite pins this table, the exclusion, and the CI row.
 const REAL_HARNESS_CI_ONLY =
-	"real pi sessions in the serialized real-harness lane (maxWorkers 1, its own phase), and any tests/ change arms all 12 registered suites: 105 s of CI time together (scripts/test-shard-weights.json), and 117 s locally with the route matrix on 2026-10-21, the whole 120s pre-push budget (#4724). Runs in the Targeted tests (advisory) CI job via --include-ci-only and in the gating Unit tests job.";
+	"real pi sessions in the serialized real-harness lane (maxWorkers 1, its own phase), and any tests/ change arms all 12 registered suites: 105 s of CI time together (scripts/test-shard-weights.json), and 117 s locally with the route matrix on 2026-10-21, the whole 120s pre-push budget (#4724). Runs in the gating Unit tests job (the default vitest collection; the advisory CI job that also admitted it via --include-ci-only was removed in #3215) and, with --include-ci-only, in a local run.";
+const ROUTE_MATRIX_COLUMNS_CI_ONLY =
+	"real LSP handshakes in the serialized lsp-spawn-heavy lane (maxWorkers 1, its own phase): three columns of the diagnostics route matrix, split out of tests/tools/diagnostics-route-switch-matrix.test.ts (#3801), 20 to 29 s each locally on 2026-10-31, and any production change arms them through their imports. Runs in the gating Unit tests job (the default vitest collection) and, with --include-ci-only, in a local run.";
 export const CI_ONLY_PRE_PUSH_TESTS = {
 	"tests/scripts/guard-bash-hook.test.ts":
-		"spawns ~1,270 real hook child processes: the transcript corpus alone measured 169s and the file measured 211s end to end, over the 120s pre-push budget. Runs in the Targeted tests (advisory) CI job via --include-ci-only and in the gating Unit tests job.",
+		"spawns ~1,270 real hook child processes: the transcript corpus alone measured 169s and the file measured 211s end to end, over the 120s pre-push budget. Runs in the gating Unit tests job (the default vitest collection; the advisory CI job that also admitted it via --include-ci-only was removed in #3215) and, with --include-ci-only, in a local run.",
 	"tests/tools/diagnostics-route-switch-matrix.test.ts":
-		"real LSP handshakes in the serialized lsp-spawn-heavy lane (maxWorkers 1, its own phase), and any production change arms it: 60 s of CI time (scripts/test-shard-weights.json) and 50 s locally alone on 2026-10-21 (#4724). Runs in the Targeted tests (advisory) CI job via --include-ci-only and in the gating Unit tests job.",
+		"real LSP handshakes in the serialized lsp-spawn-heavy lane (maxWorkers 1, its own phase), and any production change arms it: 60 s of CI time (scripts/test-shard-weights.json) and 50 s locally alone on 2026-10-21 (#4724). Runs in the gating Unit tests job (the default vitest collection; the advisory CI job that also admitted it via --include-ci-only was removed in #3215) and, with --include-ci-only, in a local run.",
+	"tests/tools/diagnostics-route-switch-matrix-cols-1.test.ts":
+		ROUTE_MATRIX_COLUMNS_CI_ONLY,
+	"tests/tools/diagnostics-route-switch-matrix-cols-2.test.ts":
+		ROUTE_MATRIX_COLUMNS_CI_ONLY,
+	"tests/tools/diagnostics-route-switch-matrix-cols-3.test.ts":
+		ROUTE_MATRIX_COLUMNS_CI_ONLY,
+	"tests/tools/diagnostics-route-switch-matrix-cols-4.test.ts":
+		ROUTE_MATRIX_COLUMNS_CI_ONLY,
+	"tests/tools/diagnostics-route-switch-matrix-cols-5.test.ts":
+		ROUTE_MATRIX_COLUMNS_CI_ONLY,
 	"tests/real-harness/bridge-reload-ts.test.ts": REAL_HARNESS_CI_ONLY,
 	"tests/real-harness/bridge-reload.test.ts": REAL_HARNESS_CI_ONLY,
 	"tests/real-harness/child-exit.test.ts": REAL_HARNESS_CI_ONLY,
+	"tests/real-harness/clean-verdict.test.ts": REAL_HARNESS_CI_ONLY,
 	"tests/real-harness/diagnostic-provenance.test.ts": REAL_HARNESS_CI_ONLY,
 	"tests/real-harness/lifecycle.test.ts": REAL_HARNESS_CI_ONLY,
 	"tests/real-harness/negative.test.ts": REAL_HARNESS_CI_ONLY,
@@ -180,6 +194,9 @@ export const TREE_SCANNING_GOVERNANCE_TESTS = [
 	"tests/clients/availability-classifiedby-ok-sweep.test.ts",
 	"tests/clients/availability-policy-coverage.test.ts",
 	"tests/clients/bounded-telemetry-sweep.test.ts",
+	// Shape 4: walks clients/tools/mcp + index.ts for abort listeners, so an
+	// unreleased race added outside the `untilAborted` seam reds.
+	"tests/clients/abort-listener-release-sweep.test.ts",
 	"tests/clients/single-flight-ratchet.test.ts",
 	"tests/config/bounded-container-guard.test.ts",
 	// #4239: walks scripts/lib for static dist/ imports and checks each is in
@@ -199,6 +216,10 @@ export const TREE_SCANNING_GOVERNANCE_TESTS = [
 	// #4689: walks clients/ for raw realpath calls and raw path.resolve keys
 	// outside the path identity seam.
 	"tests/config/path-identity-sweep.test.ts",
+	// #2556: walks clients/, tools/, mcp/, index.ts AND tests/support/ for a
+	// hand-rolled `..` containment test over a `path.relative` result, so it is
+	// a both-tree scanner and is registered in TEST_TREE_GOVERNANCE_TESTS too.
+	"tests/config/path-containment-sweep.test.ts",
 	// #4590: the one scanner that walks BOTH trees (clients/, scripts/ AND
 	// tests/), so it is registered in both lists: a production change arms it
 	// here, a tests/ change through TEST_TREE_GOVERNANCE_TESTS below.
@@ -207,6 +228,13 @@ export const TREE_SCANNING_GOVERNANCE_TESTS = [
 	// identity writes (its own walkFiles helper), so it is registered in both
 	// lists, as the #4590 rule requires for a both-tree scanner.
 	"tests/config/git-fixture-governance.test.ts",
+	// #4946: walks clients/, tools/, mcp/ and index.ts for flag names the code
+	// reads, against the flag registry; a production change arms it.
+	"tests/config/flag-read-registry-sweep.test.ts",
+	// #5273 r1 F1: walks clients/, tools/ and mcp/ for `includeNamedFiles`
+	// callers, so a production change that passes the option to another walk
+	// consumer arms it.
+	"tests/clients/source-filter-named-files.test.ts",
 ];
 
 // Suites that scan the TESTS tree for a test shape (a real spawn, a raw timer
@@ -225,6 +253,7 @@ export const TEST_TREE_GOVERNANCE_TESTS = [
 	"tests/real-harness/bridge-reload-ts.test.ts",
 	"tests/real-harness/bridge-reload.test.ts",
 	"tests/real-harness/child-exit.test.ts",
+	"tests/real-harness/clean-verdict.test.ts",
 	"tests/real-harness/diagnostic-provenance.test.ts",
 	"tests/real-harness/lifecycle.test.ts",
 	"tests/real-harness/negative.test.ts",
@@ -241,6 +270,10 @@ export const TEST_TREE_GOVERNANCE_TESTS = [
 	"tests/config/pi-mock-importer-sweep.test.ts",
 	// #4381: walks tests/ for log-sink reads with no drain of that sink first.
 	"tests/config/sink-read-drain-sweep.test.ts",
+	// #2556: the tests/support half of the containment ratchet; its production
+	// half is the same file, registered in TREE_SCANNING_GOVERNANCE_TESTS above
+	// (a both-tree scanner, #4590).
+	"tests/config/path-containment-sweep.test.ts",
 	// #4590: the tests/ half of the env PATH-key composition sweep; its
 	// production half is the same file, registered in
 	// TREE_SCANNING_GOVERNANCE_TESTS above (a both-tree scanner).
@@ -408,17 +441,20 @@ export function resolveDiffRange(
 
 /**
  * @param {string} range
- * @param {{ diffFilter?: string, cwd?: string, env?: NodeJS.ProcessEnv }} [options]
+ * @param {{ diffFilter?: string, noRenames?: boolean, cwd?: string, env?: NodeJS.ProcessEnv }} [options]
  *   `diffFilter: "A"` lists only the files the range adds (the changed-test
  *   shuffle step runs them first, #4456)
+ *   `noRenames: true` turns rename detection off, so a rename lists its old
+ *   path as well as its new one (the prose selector's config check, #5249 r2)
  */
-export function changedFiles(range, { diffFilter, cwd, env } = {}) {
+export function changedFiles(range, { diffFilter, noRenames, cwd, env } = {}) {
 	try {
 		const out = execFileSync(
 			"git",
 			[
 				"diff",
 				"--name-only",
+				...(noRenames ? ["--no-renames"] : []),
 				...(diffFilter ? [`--diff-filter=${diffFilter}`] : []),
 				range,
 			],
@@ -519,9 +555,9 @@ function buildTestImportIndex(allTests) {
  * @param {string[]} changed
  * @param {string[]} allTests
  * @param {{ includeCiOnly?: boolean, historyPicks?: string[] }} [options]
- *   `includeCiOnly` admits the `CI_ONLY_PRE_PUSH_TESTS` tier (the CI job passes
- *   it); the local pre-push caller leaves it false so a budget-busting suite
- *   never runs there. `historyPicks` are the history pass's additions
+ *   `includeCiOnly` admits the `CI_ONLY_PRE_PUSH_TESTS` tier (a local run
+ *   passes it; no CI job does since #3215); the pre-push hook leaves it false
+ *   so a budget-busting suite never runs there. `historyPicks` are the history pass's additions
  *   (`loadHistorySelection`): bounded by their own cap, so they join the
  *   registries and the change's own tests in surviving the import cap, and
  *   they are never counted toward it.
@@ -613,7 +649,7 @@ export function selectTargetedTests(changed, allTests, options = {}) {
 	}
 
 	// CI-only tier (#3426 H3432-1): remove the suites measured to exceed the
-	// pre-push budget unless the caller is the CI job that owns them. The
+	// pre-push budget unless the caller asked for them (`--include-ci-only`). The
 	// count is disclosed on the summary surface, never silently dropped.
 	const excludedCiOnly = [];
 	if (options.includeCiOnly !== true) {

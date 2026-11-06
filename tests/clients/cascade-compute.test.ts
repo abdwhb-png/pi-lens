@@ -200,6 +200,60 @@ describe("computeCascadeForFile", () => {
 		}
 	});
 
+	// #5147 verify V2. Recurrence: an untrusted repo's
+	// `lsp.servers.x = {"name":"x"}` registered a server with no `extensions`,
+	// and the cascade's per-neighbour server selection
+	// (`shouldReadCascadeFromSnapshot`) threw "server.extensions is not iterable".
+	it("computes the cascade when a project declares a server with no extensions", async () => {
+		const env = setupTestEnvironment("cascade-no-ext-");
+		const savedHome = process.env.PI_LENS_HOME;
+		process.env.PI_LENS_HOME = path.join(env.tmpDir, ".pi-lens-home");
+		const config = await import("../../clients/lsp/config.js");
+		const trust = await import("../../clients/project-trust.js");
+		try {
+			const primary = path.join(env.tmpDir, "src", "primary.ts");
+			const neighbor = path.join(env.tmpDir, "src", "neighbor.ts");
+			fs.mkdirSync(path.dirname(primary), { recursive: true });
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			fs.writeFileSync(neighbor, "import { x } from './primary';\n");
+			fs.writeFileSync(
+				path.join(env.tmpDir, ".pi-lens.json"),
+				JSON.stringify({ lsp: { servers: { x: { name: "x" } } } }),
+			);
+			trust.setProjectTrustState("untrusted");
+			await config.initLSPConfig(env.tmpDir);
+			mocks.computeImpactCascade.mockReturnValue(impact(primary, [neighbor]));
+			installLspService({
+				...makeLspServiceDouble(),
+				getAllDiagnostics: vi
+					.fn()
+					.mockResolvedValue(
+						new Map([
+							[
+								neighbor.split(path.sep).join("/"),
+								{ diags: [lspError()], ts: postEditTs() },
+							],
+						]),
+					),
+				touchFile: vi.fn(),
+				getDiagnostics: vi.fn(),
+			});
+			const { computeCascadeForFile } =
+				await import("../../clients/dispatch/integration.js");
+			const result = await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+			expect(result?.result?.neighbors[0]?.filePath).toBe(neighbor);
+		} finally {
+			config.resetLSPConfigStateForTests();
+			trust.resetProjectTrust();
+			if (savedHome === undefined) delete process.env.PI_LENS_HOME;
+			else process.env.PI_LENS_HOME = savedHome;
+			env.cleanup();
+		}
+	});
+
 	it("includes bounded transitive (depth>1) dependents as neighbors", async () => {
 		const env = setupTestEnvironment("cascade-transitive-");
 		try {
@@ -466,6 +520,114 @@ describe("computeCascadeForFile", () => {
 			env.cleanup();
 			vi.useRealTimers();
 		}
+	});
+
+	// #5174: the references leg asks the server for up to 3 changed symbols one
+	// at a time, and the loop stays serial on purpose (tsserver answers one
+	// request at a time). Recurrence guarded: the overlap tried in #5284 r1
+	// (5bf92b2de), where the three calls shared one 750ms window and a
+	// one-at-a-time server returned only the first symbol's files.
+	describe("references leg stays serial (#5174)", () => {
+		it("returns the files of all three changed symbols from a server that answers one request at a time", async () => {
+			vi.useFakeTimers();
+			const env = setupTestEnvironment("cascade-lsp-refs-serial-");
+			try {
+				const symbols = ["alpha", "beta", "gamma"];
+				const primary = path.join(env.tmpDir, "src", "primary.ts");
+				fs.mkdirSync(path.dirname(primary), { recursive: true });
+				fs.writeFileSync(primary, "export const alpha = 1;\n");
+				const consumers = symbols.map((name) => {
+					const file = path.join(env.tmpDir, "src", `uses-${name}.ts`);
+					fs.writeFileSync(file, `import { ${name} } from './primary';\n`);
+					return file;
+				});
+				const graph = emptyGraph();
+				const normalizedPrimary = primary.split(path.sep).join("/");
+				graph.symbolNodesByFile.set(
+					normalizedPrimary,
+					symbols.map((name) => `${normalizedPrimary}:${name}`),
+				);
+				symbols.forEach((name, index) => {
+					const id = `${normalizedPrimary}:${name}`;
+					graph.nodes.set(id, {
+						id,
+						kind: "symbol",
+						language: "jsts",
+						filePath: normalizedPrimary,
+						symbolName: name,
+						symbolKind: "function",
+						metadata: { line: index + 1, column: 14 },
+					});
+				});
+				mocks.buildOrUpdateGraph.mockResolvedValue(graph);
+				mocks.computeImpactCascade.mockReturnValue({
+					...impact(primary, []),
+					changedSymbols: symbols,
+				});
+				// One request at a time, 400ms each: a call's answer lands 400ms after
+				// the previous call's. `line` is the symbol's zero-based line, which
+				// picks its consumer file.
+				let previous: Promise<unknown> = Promise.resolve();
+				const references = vi.fn((_file: string, line: number) => {
+					const answer = previous.then(
+						() =>
+							new Promise<unknown[]>((resolve) => {
+								setTimeout(
+									() =>
+										resolve([
+											{
+												uri: pathToFileURL(consumers[line]).href,
+												range: {
+													start: { line: 1, character: 0 },
+													end: { line: 1, character: 5 },
+												},
+											},
+										]),
+									400,
+								);
+							}),
+					);
+					previous = answer.catch(() => undefined);
+					return answer;
+				});
+				installLspService({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi
+						.fn()
+						.mockResolvedValue(
+							new Map(
+								consumers.map((file) => [
+									file.split(path.sep).join("/"),
+									{ diags: [lspError("reference broken")], ts: postEditTs() },
+								]),
+							),
+						),
+					touchFile: vi.fn(),
+					getDiagnostics: vi.fn(),
+					references,
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const run = computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+				await vi.advanceTimersByTimeAsync(2_000);
+				const result = await run;
+
+				expect(references).toHaveBeenCalledTimes(3);
+				const impactKeys = (result?.result?.impact.neighborFiles ?? []).map(
+					(f) => f.split(path.sep).join("/"),
+				);
+				expect(impactKeys).toEqual(
+					consumers.map((f) => f.split(path.sep).join("/")),
+				);
+			} finally {
+				env.cleanup();
+				vi.useRealTimers();
+			}
+		});
 	});
 
 	it("active-touches non-jsts neighbors silently", async () => {
@@ -1296,6 +1458,46 @@ describe("computeCascadeForFile", () => {
 		expect(call).toBeDefined();
 		return (call![0] as { metadata: Record<string, unknown> }).metadata;
 	}
+
+	// #5013: `cascade_result`'s `neighbors[].file` is the only surface that reads
+	// the posix fold (the widget and formatted paths keep the full neighbour
+	// path), so it is the record that witnesses the fold at that site. On win32
+	// every nested path spells its separators with backslashes; on POSIX the fold
+	// is observable only through a literal backslash in a directory name.
+	it("#5013: cascade_result folds a backslash-spelled neighbour path for display (integration.ts)", async () => {
+		const env = setupTestEnvironment("cascade-neighbor-fold-");
+		try {
+			const primary = path.join(env.tmpDir, "hub.py");
+			fs.writeFileSync(primary, "class Hub: pass\n");
+			const neighbourDir =
+				process.platform === "win32" ? path.join("sub", "dir") : "sub\\dir";
+			const neighborPath = path.join(env.tmpDir, neighbourDir, "dep.py");
+			fs.mkdirSync(path.dirname(neighborPath), { recursive: true });
+			fs.writeFileSync(neighborPath, "from hub import Hub\n");
+			mocks.computeImpactCascade.mockReturnValue(
+				impact(primary, [neighborPath]),
+			);
+			installLspService({
+				...makeLspServiceDouble(),
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				touchFile: vi.fn().mockResolvedValue({ diags: [lspError()] }),
+				getDiagnostics: vi.fn(),
+			});
+
+			const { computeCascadeForFile } =
+				await import("../../clients/dispatch/integration.js");
+			await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+
+			expect(cascadeResultMetadata().neighbors).toContainEqual(
+				expect.objectContaining({ file: "dir/dep.py" }),
+			);
+		} finally {
+			env.cleanup();
+		}
+	}, 30_000);
 
 	it("#1462: a cascade inside the rescue band walks fewer neighbours instead of overrunning the on-time window", async () => {
 		const env = setupTestEnvironment("cascade-budget-pressured-");
@@ -2177,6 +2379,51 @@ describe("computeCascadeForFile", () => {
 			expect(run.skipReason).toBe("indeterminate");
 			expect(run.indeterminate?.reason).toBe("graph_degraded");
 			expect(run.indeterminate?.detail).toContain("5000");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	// #5055 recurrence: the `unresolved_reference` marker is set after the
+	// degraded-graph marker, and a run both degraded AND holding an unplaced
+	// referrer must keep the more fundamental reason (the graph is unavailable),
+	// not be relabelled as an ambiguous-name gap.
+	it("keeps a graph_degraded marker when a name-only referrer is also unplaced (#5055)", async () => {
+		const env = setupTestEnvironment("cascade-degraded-unplaced-");
+		try {
+			const primary = path.join(env.tmpDir, "primary.ts");
+			const referrer = path.join(env.tmpDir, "caller.ts");
+			fs.writeFileSync(primary, "export const x = 1;\n");
+			fs.writeFileSync(referrer, "x;\n");
+			mocks.computeImpactCascade.mockReturnValue({
+				...impact(primary, []),
+				nameOnlyReferrers: [referrer],
+			});
+			installLspService({
+				...makeLspServiceDouble(),
+				getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+				touchFile: vi.fn(),
+				getDiagnostics: vi.fn(),
+			});
+
+			const { computeCascadeForFile } =
+				await import("../../clients/dispatch/integration.js");
+			const { _setLastGraphBuildInfoForTests } =
+				await import("../../clients/review-graph/builder.js");
+			_setLastGraphBuildInfoForTests({
+				reused: false,
+				mode: "skipped",
+				skipReason: "too_many_files",
+				sourceFileCount: 5000,
+				maxFileCount: 4000,
+			} as any);
+
+			const run = await computeCascadeForFile(primary, env.tmpDir, {
+				turnSeq: 1,
+				writeSeq: 1,
+			});
+			expect(run.skipReason).toBe("indeterminate");
+			expect(run.indeterminate?.reason).toBe("graph_degraded");
 		} finally {
 			env.cleanup();
 		}
@@ -4049,7 +4296,12 @@ describe("computeCascadeForFile", () => {
 				expect(run.unconfirmed).toEqual({
 					count: 1,
 					servers: [
-						{ serverId: "typescript", waitMs: 1000, paths: [neighbor] },
+						{
+							serverId: "typescript",
+							reason: "no-answer",
+							waitMs: 1000,
+							paths: [neighbor],
+						},
 					],
 				});
 				expect(run.selectedNeighborPaths).toEqual([neighbor]);
@@ -4430,6 +4682,52 @@ describe("computeCascadeForFile", () => {
 				expect(later.result).toBeUndefined();
 				expect(later.skipReason).toBe("indeterminate");
 				expect(later.unconfirmed).toBeUndefined();
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// Recurrence (#5034 review F2, #5014): a `fallbackFor` alternate answered
+		// the neighbour while its owner did not, so the touch named the owner and
+		// carried the alternate's findings. The primary-unavailable branch
+		// returned `diagnostics: []`: the line reached the agent, the findings
+		// did not. Once the line was delivered, the neighbour was dropped whole.
+		it("a fallback's findings on a neighbour whose primary did not answer are delivered with the line, and after it", async () => {
+			const { env, primary } = project("cascade-5014-fallback-");
+			try {
+				installLspService({
+					...makeLspServiceDouble(),
+					getAllDiagnostics: vi.fn().mockResolvedValue(new Map()),
+					touchFile: vi.fn(async () => ({
+						diags: [lspError("fallback finding")],
+						inconclusive: true,
+						inconclusiveReason: "primary-unavailable",
+						inconclusiveServerIds: ["typescript"],
+						primaryUnavailableCause: "unstarted",
+					})),
+				});
+
+				const { computeCascadeForFile } =
+					await import("../../clients/dispatch/integration.js");
+				const { markCascadeUnansweredPrimariesDelivered } =
+					await import("../../clients/cascade-format.js");
+				const first = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 1,
+					writeSeq: 1,
+				});
+				expect(first.result?.formatted).toContain("fallback finding");
+				expect(first.result?.unansweredPrimaries?.notes).toHaveLength(1);
+				// A fallback never confirms the neighbour.
+				expect(first.observedNeighborPaths).toBeUndefined();
+				markCascadeUnansweredPrimariesDelivered(["typescript"]);
+
+				const later = await computeCascadeForFile(primary, env.tmpDir, {
+					turnSeq: 2,
+					writeSeq: 1,
+				});
+				expect(later.result?.formatted).toContain("fallback finding");
+				expect(later.result?.unansweredPrimaries).toBeUndefined();
+				expect(later.observedNeighborPaths).toBeUndefined();
 			} finally {
 				env.cleanup();
 			}

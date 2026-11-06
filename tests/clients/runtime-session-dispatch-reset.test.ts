@@ -13,6 +13,7 @@
 
 import { withResidentBootstrap } from "../support/bootstrap-access.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { withEnv } from "../support/with-env.js";
 import { handleSessionStart } from "../../clients/runtime-session.js";
 import { safeSpawnAsync } from "../../clients/safe-spawn.js";
 import { removeTempDirSync, setupTestEnvironment } from "./test-utils.js";
@@ -60,7 +61,6 @@ function makeDeps(ctxCwd: string) {
 		dbg: () => {},
 		log: () => {},
 		runtime: makeDefaultRuntime(),
-		metricsClient: { reset: () => {} },
 		cacheManager: { writeCache: () => {}, readCache: () => null },
 		todoScanner: { scanDirectory: () => ({ items: [] }) },
 		astGrepClient: {
@@ -104,8 +104,12 @@ function makeDeps(ctxCwd: string) {
 
 describe("dispatch availability suppression is reset at session start (#1266)", () => {
 	let tmpDir: string;
+	// #5231: govulncheck's install honours PI_LENS_DISABLE_TOOL_INSTALL, which
+	// vitest-setup defaults to "1"; the exhausted-`go install` case drives it.
+	let restoreInstallSwitch: () => void = () => {};
 
 	beforeEach(async () => {
+		restoreInstallSwitch = withEnv({ PI_LENS_DISABLE_TOOL_INSTALL: "0" });
 		// The real config loader walks up from the session cwd to HOME (#4709);
 		// a pinned fixture HOME keeps that read off the maintainer's home.
 		pinFixtureHome("runtime-session-dispatch-reset");
@@ -120,6 +124,7 @@ describe("dispatch availability suppression is reset at session start (#1266)", 
 	});
 
 	afterEach(() => {
+		restoreInstallSwitch();
 		resetLSPConfigStateForTests();
 		removeTempDirSync(tmpDir);
 		// #4560: the formatter-reprobe cell creates `${tmpDir}-next` at the tmp

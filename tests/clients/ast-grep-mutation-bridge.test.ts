@@ -27,16 +27,19 @@ type Recorded = {
 	provenance?: string;
 	toolCallId?: string;
 	lineage?: LineageHandle;
+	sessionId?: string;
 };
 
 const recorded: Recorded[] = [];
+/** Files the capture bridge declines, as the real one does for an out-of-scope path. */
+const refused = new Set<string>();
 
 Object.defineProperty(globalThis, MUTATION_BRIDGE_KEY, {
 	value: Object.freeze({
 		version: 1 as const,
 		recordMutation(entry: Recorded): boolean {
 			recorded.push(entry);
-			return true;
+			return !refused.has(entry.filePath);
 		},
 	}),
 	writable: false,
@@ -134,6 +137,201 @@ describe("#2423 ast_grep_replace records its applied rewrites", () => {
 });
 
 /**
+ * #5239: the apply reports the files the bridge ACCEPTED, because the
+ * `tool_result` handler dispatches exactly those.
+ *
+ * RECURRENCE GUARDED: an applied rewrite reached the bridge's bookkeeping and
+ * nothing named its files to the dispatcher, so a blocker it introduced
+ * reached neither the turn-end check nor the commit gate. The list must also
+ * not name a file the bridge refused, or the handler would dispatch a path
+ * pi-lens declined to track.
+ */
+describe("#5239 the apply names the files the bridge accepted", () => {
+	const RULE =
+		"id: agent-rule\nlanguage: typescript\nrule:\n  pattern: var $X\nfix: let $X\n";
+	const abs = (rel: string) => path.resolve(process.cwd(), rel);
+
+	it("lists every accepted file once, for the pattern apply", async () => {
+		recorded.length = 0;
+		refused.clear();
+		const client = clientWithExec(execFor(MATCHES));
+		const result = await client.replace(
+			"var $X",
+			"let $X",
+			"typescript",
+			["src"],
+			true,
+		);
+		expect(result.appliedFiles).toEqual([abs("src/a.ts"), abs("src/b.ts")]);
+	});
+
+	it("omits a file the bridge refused, for the pattern apply", async () => {
+		recorded.length = 0;
+		refused.clear();
+		refused.add(abs("src/b.ts"));
+		const client = clientWithExec(execFor(MATCHES));
+		const result = await client.replace(
+			"var $X",
+			"let $X",
+			"typescript",
+			["src"],
+			true,
+		);
+		refused.clear();
+		expect(result.appliedFiles).toEqual([abs("src/a.ts")]);
+	});
+
+	it("lists the accepted files for the structural apply and none for a dry run", async () => {
+		recorded.length = 0;
+		refused.clear();
+		const runner = {
+			tempScanDetailedAsync: vi.fn(async () => ({
+				matches: MATCHES,
+				status: 0,
+			})),
+			tempScanWithFixAsync: vi.fn(async () => ({ matches: MATCHES })),
+		};
+		const client = new AstGrepClient();
+		(client as unknown as { runner: unknown }).runner = runner;
+		const applied = await client.replaceWithRule(RULE, ["src"], true);
+		expect(applied.appliedFiles).toEqual([abs("src/a.ts"), abs("src/b.ts")]);
+		const dry = await client.replaceWithRule(RULE, ["src"], false);
+		expect(dry.appliedFiles).toEqual([]);
+	});
+
+	// Recurrence prevented (Greptile T3 on #5244 r3): the structural apply loop
+	// returned early on a later path's stale preview or CLI error with no
+	// `appliedFiles`, so files an earlier path had already rewritten never
+	// reached the tool's details and the `tool_result` dispatch.
+	describe("a later path stops the structural apply after an earlier one wrote", () => {
+		const A = MATCHES.filter((m) => m.file === "src/a.ts");
+		function runnerOver(second: {
+			detailed: Record<string, unknown>;
+			withFix?: Record<string, unknown>;
+		}) {
+			const runner = {
+				tempScanDetailedAsync: vi.fn(async (dir: string) =>
+					path.basename(dir) === "a.ts"
+						? { matches: A, status: 0 }
+						: second.detailed,
+				),
+				tempScanWithFixAsync: vi.fn(async (dir: string) =>
+					path.basename(dir) === "a.ts"
+						? { matches: A }
+						: (second.withFix ?? { matches: [] }),
+				),
+			};
+			const client = new AstGrepClient();
+			(client as unknown as { runner: unknown }).runner = runner;
+			return client;
+		}
+		const RULE =
+			"id: agent-rule\nlanguage: typescript\nrule:\n  pattern: var $X\nfix: let $X\n";
+
+		it("names the earlier file when the later path is stale", async () => {
+			recorded.length = 0;
+			refused.clear();
+			const result = await runnerOver({
+				detailed: { matches: [], status: 0 },
+			}).replaceWithRule(RULE, ["src/a.ts", "src/b.ts"], true);
+			expect(result.stalePreview).toBe(true);
+			expect(result.appliedFiles).toEqual([abs("src/a.ts")]);
+			expect(recorded.map((r) => r.filePath)).toEqual([abs("src/a.ts")]);
+		});
+
+		it("names the earlier file when the later path's apply errors", async () => {
+			recorded.length = 0;
+			refused.clear();
+			const result = await runnerOver({
+				detailed: { matches: MATCHES, status: 0 },
+				withFix: { matches: [], error: "boom" },
+			}).replaceWithRule(RULE, ["src/a.ts", "src/b.ts"], true);
+			expect(result.error).toBe("boom");
+			expect(result.appliedFiles).toEqual([abs("src/a.ts")]);
+		});
+
+		it("names the earlier file when the later path's preview fails", async () => {
+			recorded.length = 0;
+			refused.clear();
+			const result = await runnerOver({
+				detailed: { matches: [], status: 2, error: "no such path" },
+			}).replaceWithRule(RULE, ["src/a.ts", "src/b.ts"], true);
+			expect(result.error).toBe("no such path");
+			expect(result.appliedFiles).toEqual([abs("src/a.ts")]);
+		});
+
+		// The tool is the only carrier from the client's result to the
+		// `tool_result` handler; a stale or error branch that drops the list
+		// dispatches nothing whatever the client returned.
+		it.each([
+			["stale", { matches: [], status: 0 }, undefined, { stalePreview: true }],
+			[
+				"error",
+				{ matches: MATCHES, status: 0 },
+				{ matches: [], error: "boom" },
+				{},
+			],
+		])(
+			"the tool's %s details carry the earlier file",
+			async (_label, detailed, withFix, expected) => {
+				recorded.length = 0;
+				refused.clear();
+				const client = runnerOver({
+					detailed,
+					...(withFix && { withFix }),
+				});
+				vi.spyOn(client, "ensureAvailable").mockResolvedValue(true);
+				const tool = createAstGrepReplaceTool(client);
+				const result = await tool.execute(
+					"call-5244-r4",
+					{
+						pattern: "var $X",
+						rewrite: "let $X",
+						lang: "typescript",
+						insideKind: "function_declaration",
+						paths: ["src/a.ts", "src/b.ts"],
+						apply: true,
+					},
+					new AbortController().signal,
+					undefined,
+					{ cwd: process.cwd() },
+				);
+				expect(result.isError).toBe(true);
+				expect(result.details).toEqual({
+					...expected,
+					appliedFiles: [abs("src/a.ts")],
+				});
+			},
+		);
+
+		it("names nothing when the first path is the one that is stale", async () => {
+			recorded.length = 0;
+			refused.clear();
+			const result = await runnerOver({
+				detailed: { matches: [], status: 0 },
+			}).replaceWithRule(RULE, ["src/b.ts", "src/a.ts"], true);
+			expect(result.stalePreview).toBe(true);
+			expect(result.appliedFiles).toEqual([]);
+			expect(recorded).toEqual([]);
+		});
+	});
+
+	it("lists none for a dry run of the pattern replace", async () => {
+		recorded.length = 0;
+		refused.clear();
+		const client = clientWithExec(execFor(MATCHES));
+		const result = await client.replace(
+			"var $X",
+			"let $X",
+			"typescript",
+			["src"],
+			false,
+		);
+		expect(result.appliedFiles).toBeUndefined();
+	});
+});
+
+/**
  * #4140 (F9 of #4185 round 1): the structural apply (`replaceWithRule`, the
  * `insideKind`/`hasKind`/`follows` options) rewrites files with `--update-all`
  * through `tempScanWithFixAsync` and never reached the bridge: no stamp, no
@@ -192,6 +390,82 @@ describe("#4140 the structural ast_grep_replace apply records through the bridge
 		const result = await client.replaceWithRule(RULE, ["src"], false);
 		expect(result.applied).toBe(false);
 		expect(recorded).toHaveLength(0);
+	});
+
+	it("names the calling session on a structural apply, which owns its deferred pass (#4943)", async () => {
+		// RECURRENCE GUARDED: #4943 R1. The structural apply's records named no
+		// session, so a subagent's rewrite was queued under the coordinator.
+		recorded.length = 0;
+		const { client } = clientWithRunner(MATCHES);
+		await client.replaceWithRule(RULE, ["src"], true, {
+			sessionId: "session-sub",
+		});
+		expect(recorded.map((entry) => entry.sessionId)).toEqual([
+			"session-sub",
+			"session-sub",
+		]);
+	});
+});
+
+describe("#4943 ast_grep_replace names the session it was called in", () => {
+	it("tags every rewritten file with the calling session's id", async () => {
+		// RECURRENCE GUARDED: #4943 R1. A subagent's `ast_grep_replace` apply was
+		// queued under the coordinator's id, so the primary's settle formatted it.
+		recorded.length = 0;
+		const client = clientWithExec(execFor(MATCHES));
+		vi.spyOn(client, "ensureAvailable").mockResolvedValue(true);
+		vi.spyOn(client, "formatMatches").mockReturnValue("");
+		const tool = createAstGrepReplaceTool(client);
+
+		await tool.execute(
+			"call-4943-ast-grep",
+			{ pattern: "var $X", rewrite: "let $X", lang: "typescript", apply: true },
+			new AbortController().signal,
+			undefined,
+			{ cwd: ".", sessionManager: { getSessionId: () => "session-sub" } },
+		);
+
+		expect(recorded.map((entry) => entry.sessionId)).toEqual([
+			"session-sub",
+			"session-sub",
+		]);
+	});
+
+	it("tags a structural apply's rewrites with the calling session's id", async () => {
+		// RECURRENCE GUARDED: #4943 R1. The tool's structural branch
+		// (`insideKind` and its siblings) is a second call site; one that drops
+		// the session queues the subagent's rewrite under the coordinator.
+		recorded.length = 0;
+		const client = new AstGrepClient();
+		(client as unknown as { runner: unknown }).runner = {
+			tempScanDetailedAsync: vi.fn(async () => ({
+				matches: MATCHES,
+				status: 0,
+			})),
+			tempScanWithFixAsync: vi.fn(async () => ({ matches: MATCHES })),
+		};
+		vi.spyOn(client, "ensureAvailable").mockResolvedValue(true);
+		vi.spyOn(client, "formatMatches").mockReturnValue("");
+		const tool = createAstGrepReplaceTool(client);
+
+		await tool.execute(
+			"call-4943-ast-grep-rule",
+			{
+				pattern: "var $X",
+				rewrite: "let $X",
+				lang: "typescript",
+				insideKind: "function_declaration",
+				apply: true,
+			},
+			new AbortController().signal,
+			undefined,
+			{ cwd: ".", sessionManager: { getSessionId: () => "session-sub" } },
+		);
+
+		expect(recorded.map((entry) => entry.sessionId)).toEqual([
+			"session-sub",
+			"session-sub",
+		]);
 	});
 });
 

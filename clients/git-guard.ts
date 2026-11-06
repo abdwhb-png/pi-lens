@@ -7,9 +7,23 @@ import {
 } from "./cache-manager.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
-import { isOutsideProjectRoot, toProjectRelativePath } from "./path-utils.js";
+import {
+	isOutsideProjectRoot,
+	isUnderDir,
+	pathsEqual,
+	toPosix,
+	toProjectRelativePath,
+} from "./path-utils.js";
+import {
+	resolveGitCheckout,
+	sameCheckoutOtherRoot,
+	type GitCheckout,
+} from "./review-graph/git-identity.js";
 import { decodeShellWords, type DecodedShellWord } from "./bash-file-access.js";
-import { incrementDegradationCount } from "./degradation-ledger.js";
+import {
+	incrementDegradationCount,
+	recordDegradationOnce,
+} from "./degradation-ledger.js";
 import { absorbSettledRunnerBlockers } from "./deferred-runner-blockers.js";
 import { logLatency } from "./latency-logger.js";
 import { resolveLensToolName, type LensToolHost } from "./tool-config.js";
@@ -42,6 +56,13 @@ export interface TurnEndFindingsCache {
 	blockingFiles?: string[] | undefined;
 	/** Context has consumed the message, but the guard still owns the state. */
 	consumed?: boolean;
+	/**
+	 * #5240: `content` is the repeat of blockers the model was already told
+	 * about (`blockerRepeatContent`), staged by a duplicate turn end. A pi
+	 * request takes it only as the first request of a prompt; any other request
+	 * leaves it staged. Absent on every record released before #5240.
+	 */
+	repeat?: boolean | undefined;
 	testFailures?: boolean;
 	testFailureContent?: string;
 	testFailureFiles?: string[];
@@ -56,6 +77,13 @@ export interface TurnEndFindingsCache {
 	carriedBlockers?: BlockerPartition[] | undefined;
 	/** When `sessionId` wrote the top-level sections (#4750, `BlockerPartition`). */
 	blockerWrittenAt?: number | undefined;
+	/**
+	 * The session whose turn end composed `content` (#4943), the only session
+	 * whose next request takes it. Absent, `content` is the owner's
+	 * (`sessionId`): a commit-gate writer that rewrites `content` as the
+	 * owner's blocker text leaves it out. Not a claim: the gate never reads it.
+	 */
+	deliverTo?: string | undefined;
 }
 
 /** One session's blocker sections in the record, with their owner (#4738). */
@@ -294,7 +322,7 @@ function getShellCommand(input: unknown): string {
 }
 
 function executableName(value: string): string {
-	const normalized = value.replace(/\\/g, "/");
+	const normalized = toPosix(value);
 	let name = (
 		normalized.slice(normalized.lastIndexOf("/") + 1) ?? ""
 	).toLowerCase();
@@ -1002,6 +1030,148 @@ export function isGitCommitOrPushAttempt(
 	return detectGuardedGitVerb(toolName, input, COMMIT_PUSH_MATCHER);
 }
 
+/**
+ * The working trees one commit/push command writes to (#4941): what the gate
+ * judges, instead of every blocker the process holds. `contains` answers
+ * whether a path (a blocker's file, or the directory a latch is about) lies
+ * in one of them. A tree is a git checkout, found by the one seam the review
+ * graph and the analysis root use (`resolveGitCheckout`); a linked worktree is
+ * a tree of its own.
+ */
+export interface CommitScope {
+	contains(target: string): boolean;
+}
+
+/**
+ * Commands that cannot move a later `git`'s directory or environment: the
+ * only words besides `git` itself a scoped command may contain. `cd`,
+ * `pushd`, `export`, an assignment, a function, a wrapper or anything else
+ * not listed leaves the command unscoped, so a form nobody planned for is
+ * judged by every blocker (AGENTS.md: gates fail closed).
+ */
+const SCOPE_NEUTRAL_COMMANDS: readonly string[] = [
+	"echo",
+	"printf",
+	"tail",
+	"head",
+	"cat",
+	"grep",
+	"wc",
+	"true",
+];
+
+/**
+ * The words a scoped command may run as `git`: the bare name the shell finds
+ * on PATH and the system locations a resolved path takes. Any other spelling
+ * (`/tmp/evil/git`, `./git`, `git.cmd`) is a file the gate cannot vouch for,
+ * which may retarget before it execs git, so the command goes unscoped
+ * (#4941 r2 F4).
+ */
+const SCOPE_GIT_HEADS: readonly string[] = [
+	"git",
+	"/usr/bin/git",
+	"/usr/local/bin/git",
+	"/bin/git",
+	"/opt/homebrew/bin/git",
+];
+
+/**
+ * Variables git reads to find its repository or working tree before it looks
+ * at the cwd. Set in the process, they retarget a command that names none of
+ * them, so a scope read from the cwd would name the wrong tree (#4941 r2 F3).
+ */
+const GIT_RETARGETING_ENV: readonly string[] = [
+	"GIT_DIR",
+	"GIT_WORK_TREE",
+	"GIT_COMMON_DIR",
+];
+
+/** A stat that fails any way but ENOENT leaves the target unreadable, not scoped. */
+function isExistingDirectory(directory: string): boolean {
+	try {
+		return (
+			nodeFs.statSync(directory, { throwIfNoEntry: false })?.isDirectory() ??
+			false
+		);
+	} catch {
+		// none: an unreadable `-C` target (EACCES, ELOOP) is not a tree the gate
+		// can place, so the command goes unscoped and every blocker is judged.
+		return false;
+	}
+}
+
+/**
+ * The trees a bash `git commit`/`git push` command targets, or `undefined`
+ * when it is not a form this reads, in which case the gate judges every
+ * blocker. Admitted: segments that are a plain `git` (no assignment,
+ * wrapper or substitution that runs git, and only a {@link SCOPE_GIT_HEADS}
+ * spelling of it) or a {@link SCOPE_NEUTRAL_COMMANDS} word, with at least one
+ * commit/push segment whose only global options are `-C <readable existing
+ * directory>` and whose directory is inside a git checkout, in a process
+ * whose environment does not retarget git ({@link GIT_RETARGETING_ENV}).
+ */
+export function resolveCommitScope(
+	toolName: string,
+	input: unknown,
+	cwd: string,
+): CommitScope | undefined {
+	if (toolName !== "bash") return undefined;
+	if (GIT_RETARGETING_ENV.some((name) => process.env[name])) return undefined;
+	const command = getShellCommand(input);
+	if (!command) return undefined;
+	const canonical = canonicalizeGuardCommand(command);
+	if (containsGuardedSubstitution(canonical, 0, COMMIT_PUSH_MATCHER)) {
+		return undefined;
+	}
+	const trees: GitCheckout[] = [];
+	for (const segment of decodeShellWords(canonical)) {
+		const words = segment.words;
+		const head = words[0]?.text;
+		if (head === undefined) continue;
+		if (!SCOPE_GIT_HEADS.includes(head)) {
+			if (!SCOPE_NEUTRAL_COMMANDS.includes(head)) return undefined;
+			continue;
+		}
+		const tokens = words.map((word) => word.text);
+		if (!matchGitVerbAtCommandPosition(tokens, COMMIT_PUSH_MATCHER)) continue;
+		const verbAt = gitVerbIndex(tokens);
+		if (verbAt === undefined) return undefined;
+		for (let i = 1; i < verbAt; i += 2) {
+			const value = words[i + 1];
+			if (
+				tokens[i] !== "-C" ||
+				value === undefined ||
+				value.hidden ||
+				value.tildeExpands
+			) {
+				return undefined;
+			}
+		}
+		const directory = resolveGitTargetDirectory(tokens, cwd);
+		if (!isExistingDirectory(directory)) return undefined;
+		const checkout = resolveGitCheckout(directory);
+		if (!checkout) return undefined;
+		trees.push(checkout);
+	}
+	if (trees.length === 0) return undefined;
+	return {
+		// The target's own checkout, or one nested inside a committed tree: the
+		// parent's commit stages a tracked file under it (#4941 r2 F2). A linked
+		// worktree of the committed repository is a tree of its own, never the
+		// parent's.
+		contains: (target) => {
+			const owner = resolveGitCheckout(target);
+			if (!owner) return false;
+			return trees.some(
+				(tree) =>
+					pathsEqual(tree.root, owner.root) ||
+					(isUnderDir(owner.root, tree.root) &&
+						!sameCheckoutOtherRoot(tree, owner)),
+			);
+		},
+	};
+}
+
 function isTurnEndFindingsCache(value: unknown): value is TurnEndFindingsCache {
 	if (!value || typeof value !== "object") return false;
 	const record = value as Partial<TurnEndFindingsCache>;
@@ -1319,11 +1489,15 @@ function pastFreshnessWindow(
  * it through the freshness window, so a day-old record was invisible to it and
  * its write replaced the record whole), the partitions to carry, and what the
  * write leaves out, for `logCarriedDrops` once it has written.
+ *
+ * #4921: `sessionId` is the composing turn's session, the one whose own
+ * partition the write replaces; omitted, the coordinator's.
  */
 export function readTurnEndGuardRecord(
 	cacheManager: CacheManager,
 	runtime: RuntimeCoordinator,
 	cwd: string,
+	sessionId?: string,
 ): {
 	stored: Partial<TurnEndFindingsCache> | undefined;
 	carried: BlockerPartition[];
@@ -1332,19 +1506,23 @@ export function readTurnEndGuardRecord(
 	const stored = storedRecord(cacheManager, cwd)?.fields;
 	// The composer writes on every path that reads, so a stamp this read gave
 	// a released partition reaches the record with that write.
-	const { carried, dropped } = carriedTurnEndBlockers(stored, runtime, cwd);
+	const { carried, dropped } = carriedTurnEndBlockers(
+		stored,
+		cwd,
+		sessionId ?? runtime.telemetrySessionId,
+	);
 	return { stored, carried, dropped };
 }
 
 function carriedTurnEndBlockers(
 	stored: StoredRecord | undefined,
-	runtime: RuntimeCoordinator,
 	cwd: string,
+	/** The session whose own partition is not carried. */
+	me: string,
 ): { carried: BlockerPartition[]; dropped: CarriedDrops; stamped: boolean } {
 	const dropped: CarriedDrops = { gone: false, noFile: false };
 	if (!isTurnEndFindingsCache(stored))
 		return { carried: [], dropped, stamped: false };
-	const me = runtime.telemetrySessionId;
 	const now = Date.now();
 	const carried: BlockerPartition[] = [];
 	// A released partition carried whole gets its first stamp here.
@@ -1396,12 +1574,14 @@ function carriedTurnEndBlockers(
  * The only fields a record that makes NO claim carries (#4733 r1 F3): what the
  * `--lens-guard`-off turn-end writer stores for delivery
  * (`clients/runtime-turn.ts`, the `else` branch), and 3.8.74's `{ content }`.
+ * `deliverTo` (#4943) addresses the content; it claims nothing.
  */
 const NO_CLAIM_FIELDS = [
 	"content",
 	"affectedFiles",
 	"affectedFilesTruncated",
 	"provenance",
+	"deliverTo",
 ] as const;
 
 /**
@@ -1460,17 +1640,22 @@ function logRecordRetired(
  * re-checks the files it names). The latch that described the record goes
  * with it; a dispatch latch stays (`RecordLatchReason`).
  *
+ * #4921: `sessionId` is the settling turn's session, whose own partition
+ * leaves; omitted, the coordinator's.
+ *
  * @returns true when the record was retired.
  */
 export function retireSettledGitGuardRecord(
 	runtime: RuntimeCoordinator,
 	cacheManager: CacheManager,
 	cwd: string,
+	sessionId?: string,
 ): boolean {
 	const stored = storedRecord(cacheManager, cwd)?.fields;
 	if (!stored) return false;
+	const me = sessionId ?? runtime.telemetrySessionId;
 	const own =
-		stored.sessionId === runtime.telemetrySessionId &&
+		stored.sessionId === me &&
 		stored.testFailures !== true &&
 		stored.carriedBlockers === undefined;
 	const basis = own
@@ -1482,11 +1667,11 @@ export function retireSettledGitGuardRecord(
 				: undefined;
 	if (basis) {
 		cacheManager.clearCache("turn-end-findings", cwd);
-		runtime.clearGitGuardCacheUnknown();
+		runtime.clearGitGuardCacheUnknown(cwd);
 		logRecordRetired(cwd, "turn_end", basis);
 		return true;
 	}
-	return retireOwnPartition(runtime, cacheManager, cwd, stored);
+	return retireOwnPartition(runtime, cacheManager, cwd, stored, me);
 }
 
 /**
@@ -1503,9 +1688,9 @@ function retireOwnPartition(
 	cacheManager: CacheManager,
 	cwd: string,
 	stored: StoredRecord,
+	me: string,
 ): boolean {
 	if (!isTurnEndFindingsCache(stored)) return false;
-	const me = runtime.telemetrySessionId;
 	// A record this session owns whole: the rule above decided it.
 	if (stored.sessionId === me && stored.carriedBlockers === undefined)
 		return false;
@@ -1516,7 +1701,7 @@ function retireOwnPartition(
 		carried: kept,
 		dropped,
 		stamped,
-	} = carriedTurnEndBlockers(stored, runtime, cwd);
+	} = carriedTurnEndBlockers(stored, cwd, me);
 	if (!ownDropped && !dropped.gone && !dropped.noFile) {
 		// #4762 r3: nothing dropped, so the partitions kept are the stored ones
 		// in their order. A released one just got its first stamp, and only a
@@ -1538,7 +1723,7 @@ function retireOwnPartition(
 	// of theirs.
 	if (kept.length === 0 && !testFailures) {
 		cacheManager.clearCache("turn-end-findings", cwd);
-		runtime.clearGitGuardCacheUnknown();
+		runtime.clearGitGuardCacheUnknown(cwd);
 		logRecordRetired(cwd, "turn_end", dropped.noFile ? "no_file" : "file_gone");
 		return true;
 	}
@@ -1562,6 +1747,9 @@ function retireOwnPartition(
 		sessionId: owner,
 		// Nothing new to deliver: the sections kept were already in the record.
 		consumed: stored.consumed === true,
+		// #4943: the content is now the owner's blocker text, not the message
+		// the composer addressed.
+		deliverTo: undefined,
 	});
 	return false;
 }
@@ -1585,8 +1773,9 @@ type RecordLatchReason =
 function markCacheUnknown(
 	runtime: RuntimeCoordinator,
 	reason: RecordLatchReason,
+	cwd: string,
 ): void {
-	runtime.markGitGuardCacheUnknown(reason);
+	runtime.markGitGuardCacheUnknown(reason, cwd);
 }
 
 /**
@@ -1652,10 +1841,10 @@ export function writeGitGuardRecord(
 	};
 	try {
 		cacheManager.writeCache("turn-end-findings", data, cwd);
-		runtime.clearGitGuardCacheUnknown();
+		runtime.clearGitGuardCacheUnknown(cwd);
 		return true;
 	} catch {
-		markCacheUnknown(runtime, "cache_write_failed");
+		markCacheUnknown(runtime, "cache_write_failed", cwd);
 		return false;
 	}
 }
@@ -1714,7 +1903,8 @@ function shownLatchFile(filePath: string, cwd: string): string {
 function unconfirmedRecordRemedy(
 	stored: StoredValue | undefined,
 	inspection: CacheInspection,
-	runtime: RuntimeCoordinator,
+	/** #4921: the session attempting the commit. */
+	me: string,
 	cwd: string,
 ): string | undefined {
 	if (stored === undefined) return undefined;
@@ -1727,7 +1917,7 @@ function unconfirmedRecordRemedy(
 	if (
 		record &&
 		inspection === "fresh" &&
-		record.sessionId === runtime.telemetrySessionId &&
+		record.sessionId === me &&
 		record.carriedBlockers === undefined
 	) {
 		// #4733 r1 F5: a write re-checks this session's own files, and clears no
@@ -1831,7 +2021,9 @@ function unknown(
  * Colocated with the gate rather than inlined at the wiring site so the claim
  * is testable without booting the extension.
  *
- * @returns true when an entry was retired (the caller logs it — #1432 Gap 1).
+ * @returns true when the record was retired OR narrowed (at least one source
+ * row left it; #4990 gap 1). Either way the caller records it — #1432 Gap 1 —
+ * and the latch recompute below keeps a non-covered row gating the commit.
  */
 export function retireInlineBlockerAndResyncGuard(args: {
 	runtime: RuntimeCoordinator;
@@ -1842,12 +2034,37 @@ export function retireInlineBlockerAndResyncGuard(args: {
 	coveredSources: readonly string[];
 	lensGuardEnabled: boolean;
 }): boolean {
+	// #4921: the retired record's section sits in its owner's partition, so
+	// the resync speaks as that owner, whichever session ran the check.
+	const owner = args.runtime.inlineBlockerOwner(args.filePath);
 	const retired = args.runtime.retireInlineBlockerOnConfirmedClean(
 		args.filePath,
 		args.writeIndex,
 		args.coveredSources,
 	);
 	if (!retired) return false;
+	resyncGitGuardAfterRetire({ ...args, owner });
+	return true;
+}
+
+/**
+ * The gate half of a retirement: the latch re-derived from the map, then the
+ * persisted record rewritten without `filePath`'s section, speaking as the
+ * record's `owner`. Shared by every retire that leaves the map (the confirmed
+ * clean above, and #5020's rows of other files, whose cited file was fixed or
+ * deleted), so none of them can retire a record and leave the gate quoting it.
+ */
+export function resyncGitGuardAfterRetire(args: {
+	runtime: RuntimeCoordinator;
+	cacheManager: CacheManager;
+	cwd: string;
+	filePath: string;
+	owner: string | undefined;
+	lensGuardEnabled: boolean;
+	analysisRootMode?: AnalysisRootMode;
+	/** #5052 r2: the commit gate's checkout scope (see `syncGitGuardRecord`). */
+	inCheckout?: ((filePath: string) => boolean) | undefined;
+}): void {
 	args.runtime.updateGitGuardStatus(false, "");
 	if (args.lensGuardEnabled) {
 		syncGitGuardRecord(
@@ -1855,9 +2072,12 @@ export function retireInlineBlockerAndResyncGuard(args: {
 			args.cacheManager,
 			args.cwd,
 			args.filePath,
+			args.analysisRootMode,
+			undefined,
+			args.owner,
+			args.inCheckout,
 		);
 	}
-	return true;
 }
 
 /**
@@ -1892,9 +2112,15 @@ export function resyncGitGuardAfterInlinePolicy(args: {
 	runtime: RuntimeCoordinator;
 	/** Files whose EVERY inline blocker the turn-end policy suppressed. */
 	suppressedFilePaths: readonly string[];
+	/**
+	 * #4921: the turn session whose policy pass this is: only its records were
+	 * judged, so only theirs take a verdict.
+	 */
+	sessionId: string | undefined;
 }): void {
 	const changed = args.runtime.applyInlineBlockerPolicyVerdicts(
 		args.suppressedFilePaths,
+		{ sessionId: args.sessionId },
 	);
 	// Nothing left the gate's view of the map and nothing rejoined it. This is
 	// what keeps the recompute off every ordinary turn end: `updateGitGuardStatus`
@@ -1915,6 +2141,11 @@ export function resyncGitGuardAfterInlinePolicy(args: {
  * no verdict (failed, unanswered, in flight, edit-scoped) observes nothing
  * (AGENTS.md shape 10), and this session's map, which carries its own blockers
  * through such runs, holds nothing of another session's.
+ *
+ * #4921: `sessionId` is the writing turn's session (omitted: the
+ * coordinator's). Its partition is built from its own inline-blocker records
+ * only and carries its id; a concurrent in-process session's records are its
+ * own partition's, written by its own writes.
  */
 export function syncGitGuardRecord(
 	runtime: RuntimeCoordinator,
@@ -1923,14 +2154,25 @@ export function syncGitGuardRecord(
 	editedFilePath?: string,
 	analysisRootMode: AnalysisRootMode = "session",
 	editedCleanVerdict = false,
+	sessionId?: string,
+	/**
+	 * #5048 (PR #5052 review): the commit gate's checkout scope. Its sync
+	 * persists only the blockers in the committed tree, so another checkout's
+	 * blocker is neither written into this cwd's cache nor judged by the
+	 * commit. Omitted, every blocker of the session counts.
+	 */
+	inCheckout?: (filePath: string) => boolean,
 ): void {
 	if (!canWriteAnalysisRoot(analysisRootMode)) return;
 	// #3248: a record the turn-end policy fully suppressed is not a blocker the
 	// commit gate may persist — the agent was shown nothing for it. The entry
 	// stays in the map so the next turn re-derives the verdict from current
 	// bytes; it just stops speaking for the gate.
-	const entries = (runtime.getInlineBlockersSnapshot?.() ?? []).filter(
-		(entry) => !entry.policySuppressed,
+	const entries = (
+		runtime.getInlineBlockersSnapshot?.({ sessionId }) ?? []
+	).filter(
+		(entry) =>
+			!entry.policySuppressed && (!inCheckout || inCheckout(entry.filePath)),
 	);
 	// #4725: the record is read whatever its age (`storedRecord`). Read through
 	// the freshness window, a stale record latched `cache_stale` here on every
@@ -1941,7 +2183,7 @@ export function syncGitGuardRecord(
 	// replaces a missing record (the clear branch below).
 	if (entries.length === 0 && claimsNoBlocker(stored)) {
 		cacheManager.clearCache("turn-end-findings", cwd);
-		runtime.clearGitGuardCacheUnknown();
+		runtime.clearGitGuardCacheUnknown(cwd);
 		logRecordRetired(cwd, "write", "no_blocker");
 		return;
 	}
@@ -1949,7 +2191,7 @@ export function syncGitGuardRecord(
 	const editedKey = editedFilePath
 		? guardPathKey(editedFilePath, cwd)
 		: undefined;
-	const me = runtime.telemetrySessionId;
+	const me = sessionId ?? runtime.telemetrySessionId;
 	const blockerSections = existing?.blockerContent
 		? blockingProvenance(
 				existing.blockerContent,
@@ -1994,13 +2236,26 @@ export function syncGitGuardRecord(
 		droppedForeign === 0 &&
 		droppedOwn === 0
 	) {
-		markCacheUnknown(runtime, "session_mismatch");
+		// #4921 r2 F1: the latch is process-wide, so it speaks for the record's
+		// owner. Only the coordinator's own write may say "another session's
+		// record"; a concurrent session's write leaves the record and the
+		// latch to the session that owns them.
+		if (sessionId !== undefined && !runtime.isCoordinatorSession(sessionId)) {
+			recordDegradationOnce({
+				kind: "git-guard-non-owner-write",
+				subject: sessionId,
+				reason:
+					"a concurrent session's write left another session's commit-gate record and latch untouched",
+			});
+			return;
+		}
+		markCacheUnknown(runtime, "session_mismatch", cwd);
 		return;
 	}
 	if (!existing && entries.length === 0) {
 		const inspection = cacheManager.inspectCache("turn-end-findings", cwd);
 		if (inspection !== "missing") {
-			markCacheUnknown(runtime, `cache_${inspection}`);
+			markCacheUnknown(runtime, `cache_${inspection}`, cwd);
 			return;
 		}
 	}
@@ -2012,7 +2267,7 @@ export function syncGitGuardRecord(
 		resolveGuardPath(entry.filePath, cwd),
 	);
 	if (existing?.blockerContent && !blockerSections) {
-		markCacheUnknown(runtime, "blocking_provenance_untrusted");
+		markCacheUnknown(runtime, "blocking_provenance_untrusted", cwd);
 		return;
 	}
 	// This session's own new evidence replaces its own partition and leads the
@@ -2074,7 +2329,7 @@ export function syncGitGuardRecord(
 		// this, a reason latched earlier in the session outlived the record it
 		// described and refused every commit after it, with no re-run able to
 		// clear it.
-		runtime.clearGitGuardCacheUnknown();
+		runtime.clearGitGuardCacheUnknown(cwd);
 		if (droppedForeign > goneForeign)
 			logRecordRetired(cwd, "write", "rechecked");
 		else if (goneForeign > 0) logRecordRetired(cwd, "write", "file_gone");
@@ -2176,7 +2431,7 @@ export function clearGitGuardTestFailure(
 	const blockerContent = existing.blockerContent ?? "";
 	if (!blockerContent && remainingFiles.length === 0) {
 		cacheManager.clearCache("turn-end-findings", cwd);
-		runtime.clearGitGuardCacheUnknown();
+		runtime.clearGitGuardCacheUnknown(cwd);
 		return;
 	}
 	// #4738: every owner's blocking files stay affected, not only the top
@@ -2218,6 +2473,8 @@ export function clearGitGuardTestFailure(
 				.map(([filePath, seq]) => [guardPathKey(filePath, cwd), seq]),
 		),
 		fileContentHashes: {},
+		// #4943: the content is now the owner's blocker text.
+		deliverTo: undefined,
 	});
 }
 
@@ -2231,9 +2488,12 @@ export function clearGitGuardTestFailure(
  * is therefore only true while those bytes are still there. Everything that
  * changes a file THROUGH pi-lens re-establishes the verdict on its own — a
  * dispatch replaces the record wholesale, and the turn-end freshness sweep
- * demotes a self-drifted record before the policy loop can suppress it, which
- * clears the verdict. Bytes that move OUTSIDE dispatch (an external formatter, a
- * `git checkout`, an editor write) trigger neither, and the commit gate can be
+ * demotes a self-drifted record. Since #4990 the demoted channel runs the same
+ * policy pass, so a demoted record CAN be stamped suppressed; what keeps that
+ * from opening the gate is the content check below, because a demoted record's
+ * bytes no longer match the `recordedHash` its verdict was computed against.
+ * Bytes that move OUTSIDE dispatch (an external formatter, a `git checkout`, an
+ * editor write) trigger neither, and the commit gate can be
  * reached with no turn end in between at all — so the gate, the one reader that
  * can let a verdict OPEN a commit, confirms it here instead of trusting the
  * latch memo.
@@ -2253,9 +2513,11 @@ export function clearGitGuardTestFailure(
  */
 function firstExpiredSuppressionVerdict(
 	runtime: RuntimeCoordinator,
+	inScope: ((filePath: string) => boolean) | undefined,
 ): { filePath: string; tier: string } | undefined {
 	for (const entry of runtime.getInlineBlockersSnapshot?.() ?? []) {
 		if (!entry.policySuppressed) continue;
+		if (inScope && !inScope(entry.filePath)) continue;
 		if (entry.recordedHash === undefined) {
 			return { filePath: entry.filePath, tier: "no_baseline" };
 		}
@@ -2271,7 +2533,33 @@ export function evaluateGitGuard(
 	cacheManager: CacheManager,
 	cwd: string,
 	host: LensToolHost = "pi",
+	/**
+	 * #4921: the session attempting the commit (`ToolCallDeps.sessionId`);
+	 * omitted, the coordinator's. A record only it owns is its own to judge.
+	 */
+	sessionId?: string,
+	/**
+	 * #4941: the command being gated. A commit/push in one repository is
+	 * judged by that tree's blockers, whoever wrote them; omitted, or a form
+	 * {@link resolveCommitScope} does not read, every blocker counts.
+	 */
+	invocation?: { toolName: string; input: unknown },
 ): GuardDecision {
+	const me = sessionId ?? runtime.telemetrySessionId;
+	const scope = invocation
+		? resolveCommitScope(invocation.toolName, invocation.input, cwd)
+		: undefined;
+	const inScope = scope
+		? (target: string) => scope.contains(resolveGuardPath(target, cwd))
+		: undefined;
+	// A record-failure latch names a project directory. One outside every
+	// checkout (a workspace root above several repositories) cannot be placed
+	// in a tree, so it counts for every commit (fail closed).
+	const latchInScope = scope
+		? (project: string) =>
+				!resolveGitCheckout(resolveGuardPath(project, cwd)) ||
+				scope.contains(resolveGuardPath(project, cwd))
+		: undefined;
 	// #2535 F3: a known tool with no mapping on this host resolves to
 	// undefined — rephrase rather than naming a dead tool. `lens_diagnostics`
 	// is pinned available on both hosts, so the fallback is defensive only.
@@ -2288,12 +2576,56 @@ export function evaluateGitGuard(
 		const absorbed = absorbSettledRunnerBlockers(runtime, cwd);
 		// The inline path refreshes the persisted record beside the latch at
 		// `tool_result`; a recording at the gate has no turn end to do it, and a
-		// session boundary reads the record, not the latch (r1 M3).
-		if (absorbed.recorded > 0) syncGitGuardRecord(runtime, cacheManager, cwd);
+		// session boundary reads the record, not the latch (r1 M3). #5048: both
+		// resyncs persist only the committing session's records into this cwd's
+		// cache, and only those in the committed checkout (#5052 review:
+		// `inScope`). An answer absorbed for another session joins the map (and
+		// the latch) for its owner, whose own write or turn end persists it.
+		if (absorbed.recorded > 0) {
+			syncGitGuardRecord(
+				runtime,
+				cacheManager,
+				cwd,
+				undefined,
+				undefined,
+				undefined,
+				sessionId,
+				inScope,
+			);
+		}
 		// #4484 r2: a retire speaks for its file, as a clean write does, so the
 		// persisted record drops that file's section.
 		for (const filePath of absorbed.retiredFiles) {
-			syncGitGuardRecord(runtime, cacheManager, cwd, filePath);
+			syncGitGuardRecord(
+				runtime,
+				cacheManager,
+				cwd,
+				filePath,
+				undefined,
+				undefined,
+				sessionId,
+				inScope,
+			);
+		}
+		// #5020: a row naming a file that was deleted since the record was made
+		// has nothing left to fix, and no dispatch will ever re-take it. The gate
+		// is the read that matters, so it retires them before it judges. Only the
+		// committing session's records: the resync below writes this cwd's
+		// cache, which holds that session's records and no other's, so another
+		// session's row is left to its own gate or turn end, which writes the
+		// owner's cache (PR #5033 round 3 item 4).
+		for (const retired of runtime.retireForeignRowsOfMissingFiles({
+			sessionId,
+		})) {
+			resyncGitGuardAfterRetire({
+				runtime,
+				cacheManager,
+				cwd,
+				filePath: retired.filePath,
+				owner: retired.owner,
+				lensGuardEnabled: true,
+				inCheckout: inScope,
+			});
 		}
 	} catch (failure) {
 		incrementDegradationCount({
@@ -2302,13 +2634,15 @@ export function evaluateGitGuard(
 			reason: failure instanceof Error ? failure.message : String(failure),
 		});
 	}
-	if (runtime.gitGuardHasBlockers) {
+	const held = runtime.gitGuardStatus(inScope);
+	if (held.hasBlockers) {
 		logDecision(cwd, "blocked", "runtime_blockers", {
 			projectSeq: runtime.projectSeq,
+			// #4941: whether the refusal is this tree's blockers or, for a command
+			// the scope does not read, every blocker the process holds.
+			scoped: scope !== undefined,
 		});
-		const detail = runtime.gitGuardSummary
-			? `\n${runtime.gitGuardSummary}`
-			: "";
+		const detail = held.summary ? `\n${held.summary}` : "";
 		return {
 			block: true,
 			reason: `🔴 COMMIT BLOCKED (--lens-guard): unresolved blockers must be fixed before commit/push.${detail}\n${inspectLine}`,
@@ -2318,7 +2652,7 @@ export function evaluateGitGuard(
 	// pass, and a pass can only speak for the bytes it read. A verdict whose file
 	// has moved since is no answer at all, so it must not be the reason this
 	// commit is allowed.
-	const expired = firstExpiredSuppressionVerdict(runtime);
+	const expired = firstExpiredSuppressionVerdict(runtime, inScope);
 	if (expired) {
 		return unknown(cwd, "inline_policy_stale", {
 			file: expired.filePath,
@@ -2331,8 +2665,10 @@ export function evaluateGitGuard(
 	const stored =
 		inspection === "missing" ? undefined : storedRecord(cacheManager, cwd);
 	const recordRemedy = () =>
-		unconfirmedRecordRemedy(stored, inspection, runtime, cwd) ?? RECHECK_REMEDY;
-	const latched = runtime.gitGuardCacheUnknownReason;
+		unconfirmedRecordRemedy(stored, inspection, me, cwd) ?? RECHECK_REMEDY;
+	// #4941: a reason latched about another tree's stored record is not this
+	// commit's; any form scoping does not read still refuses on every reason.
+	const latched = runtime.gitGuardCacheUnknownFor(latchInScope);
 	if (latched) return unknown(cwd, latched, {}, recordRemedy());
 	// #4733 r2 F12: a dispatch that never answered refuses until that file's own
 	// dispatch returns, whatever happened to the record since. #4733 r3 F16: a
@@ -2341,8 +2677,9 @@ export function evaluateGitGuard(
 	// so bytes back at that path are gated again.
 	const unanswered = runtime.gitGuardUnansweredDispatches.find(
 		(entry) =>
+			(!inScope || inScope(entry.filePath)) &&
 			currentFileFingerprint(resolveGuardPath(entry.filePath, cwd)) !==
-			"missing",
+				"missing",
 	);
 	if (unanswered) {
 		const shown = shownLatchFile(unanswered.filePath, cwd);
@@ -2382,10 +2719,7 @@ export function evaluateGitGuard(
 	}
 	// #4738: the record speaks for every session that owns a section of it, so
 	// this session judges it alone only when it is the only owner.
-	if (
-		record.sessionId !== runtime.telemetrySessionId ||
-		record.carriedBlockers !== undefined
-	) {
+	if (record.sessionId !== me || record.carriedBlockers !== undefined) {
 		return unknown(cwd, "session_mismatch", {}, recordRemedy());
 	}
 	if (record.projectSeqEnd !== runtime.projectSeq) {

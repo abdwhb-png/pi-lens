@@ -14,8 +14,11 @@ import {
 import {
 	blankMarkdownRegions,
 	markdownBlockComments,
+	markdownChildren,
 	markdownHeadings,
+	markdownTokens,
 } from "./lib/markdown-lexer.mjs";
+import { splitMarkdownRow } from "./lib/markdown-cell.mjs";
 import { githubGet, parseOwnerRepoFromGitRemote } from "./lib/github-rest.mjs";
 import {
 	changedHookAnchors,
@@ -23,6 +26,7 @@ import {
 	loadCoverageMap,
 	matchGlob,
 	parseChangedFiles,
+	withoutDeclaredFamilies,
 } from "./lib/tla-coverage.mjs";
 import { evaluateWorkflowRunEvidence } from "./lib/workflow-run-evidence.mjs";
 import {
@@ -33,8 +37,13 @@ import {
 	parseCloseKeywords,
 } from "./lib/close-keywords.mjs";
 import { checkProse, proseSections } from "./check-prose.mjs";
+import { isMainModule } from "./lib/is-main-module.mjs";
 
 const TEMPLATE_PATH = ".github/PULL_REQUEST_TEMPLATE.md";
+
+// #4361: the numbered defect-shape entries live here; AGENTS.md keeps the
+// trigger-grouped index. Read from the PR's base commit, never the checkout.
+const SHAPE_CATALOG_PATH = "docs/defect-shapes.md";
 const TEMPLATE_FILE = resolve(
 	dirname(fileURLToPath(import.meta.url)),
 	"..",
@@ -45,15 +54,33 @@ const TEMPLATE_FILE = resolve(
 // tests build carry no `formal/` tree, and a diff path is repo-relative.
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REQUIRED_SECTIONS = [
-	"Why",
+	"Summary",
 	"Notes for the reviewer",
 	"Change outline",
+	"Proof and checks",
 	"Tests",
-	"Blast radius",
 	"Class sweep",
 	"Observability",
 	"Fold check",
 ];
+// The one list of alignment families (#5026). The script keeps no copy: the
+// names are parsed from this file's table on every lint.
+const ALIGNMENT_FAMILIES_PATH = "docs/alignment-families.md";
+const ALIGNMENT_NONE_MIN_REASON = 12;
+// #5003: what a reader scrolls past. Code holds the required transcripts, so
+// it stays out of the character count and is capped by its own lines, width
+// and body-wide total instead. Every cap reads the lexer's token tree
+// (`lintBodyBudgets`); none is a scan for a spelling.
+const SUMMARY_MAX_SENTENCES = 3;
+const SUMMARY_MAX_CHARS = 600;
+const REVIEWER_NOTES_MAX_BULLETS = 5;
+const VISIBLE_BODY_MAX_CHARS = 5000;
+const CODE_MAX_LINES = 20;
+// A chosen bound, not a pinned measurement: the last 80 merged bodies put the
+// p90 of their widest code line at 391 columns, so 400 admits a long test path
+// and its title (verify r2 on #5026; 240 refused 28 of the 80).
+const CODE_MAX_WIDTH = 400;
+const CODE_TOTAL_MAX_LINES = 100;
 // The PR footer the template requires (.github/PULL_REQUEST_TEMPLATE.md).
 const GENERATED_FOOTER =
 	/^🤖 Generated with \[Claude Code\]\(https:\/\/claude\.com\/claude-code\)$/;
@@ -68,6 +95,7 @@ const REPAIR_HEADINGS = [
 	"Why",
 	"Notes for the reviewer",
 	"Change outline",
+	"Proof and checks",
 	"Summary",
 	"Tests",
 	"Test assessment",
@@ -85,6 +113,7 @@ const CORRUPTED_HEADING_TAILS = [
 	"hy",
 	"otes for the reviewer",
 	"hange outline",
+	"roof and checks",
 	"ummary",
 	"ests",
 	"est assessment",
@@ -99,11 +128,13 @@ const CORRUPTED_IDENTIFIER_TAILS = ["etchOpenPullRequests", "px"];
 // Fleet census from the review of 11 bodies: ## OBSERVABILITY x5,
 // ## what changed x6, ## verification x7, and ## Summary x1. “What changed”
 // (with or without “and why”) satisfies Summary; “Verification” satisfies
-// Tests. Heading matching is deliberately case-insensitive.
+// Tests. Heading matching is deliberately case-insensitive. #5003: `Why` folded
+// into `Summary` and still reads as it, so an open body keeps its structure.
 const SECTION_SYNONYMS = new Map([
-	["why", "why"],
+	["why", "summary"],
 	["notes for the reviewer", "notes for the reviewer"],
 	["change outline", "change outline"],
+	["proof and checks", "proof and checks"],
 	["summary", "summary"],
 	["problem", "summary"],
 	["what changed", "summary"],
@@ -129,8 +160,9 @@ const SECTION_SYNONYMS = new Map([
 ]);
 const REVIEW_HEADER_REPAIR_PREFIX =
 	"## Why\nLegacy body normalized for the required review contract.\n\n" +
-	"## Notes for the reviewer\nNone.\n\n" +
-	"## Change outline\n- existing body structure\n";
+	"## Notes for the reviewer\n- None.\n\n" +
+	"## Change outline\n- existing body structure\n\n" +
+	"## Proof and checks\nThe sections below hold the proof.\n";
 
 function sectionMessage(name, detail) {
 	return `PR body ${detail} "## ${name}". See ${TEMPLATE_PATH}.`;
@@ -475,6 +507,22 @@ function isRuntimeObservabilityPath(name) {
 // 50-PR calibration in the #3875 body flagged nothing extra for them.
 const DECISION_BRANCH_G = /\bif\s*\(|\belse\b|\bswitch\s*\(|\bcase\b/g;
 
+// The failure-path tokens the Observability lint counts, by kind. Every spelling
+// of one kind is the same kind, so a re-spell of the whitespace between `return`
+// and `null` never reads as a new token (#5019).
+const FAILURE_TOKEN_G =
+	/\b(catch|recordDegradationOnce|throw|return\s+null)\b/g;
+
+// Failure tokens per kind in comment- and string-blanked text, added into
+// `counts` when a caller passes one.
+function countFailureTokens(text, counts = new Map()) {
+	for (const match of text.matchAll(FAILURE_TOKEN_G)) {
+		const kind = match[1].replace(/\s+/g, " ");
+		counts.set(kind, (counts.get(kind) ?? 0) + 1);
+	}
+	return counts;
+}
+
 function loadSeamMap(cwd = REPO_ROOT) {
 	try {
 		return loadCoverageMap(cwd);
@@ -578,6 +626,21 @@ function gitHeaderPaths(rest) {
 // itself starts with `++` is emitted as `+++…` and must be harvested, not
 // skipped (#3906 R3-B), and a removed `--…` line likewise must not advance the
 // POST cursor.
+//
+// Each hunk also records the POST lines it adds and the removed lines it
+// deletes, and removals are keyed by the POST line they follow, so a reader can
+// pair a hunk's removals against its additions and rebuild the pre-image it
+// came from (#5019).
+function hunkFor(current) {
+	// A bare fixture with no `@@` still gets one hunk, so its added lines are
+	// additions with nothing to credit them against.
+	if (!current.hunk) {
+		current.hunk = { added: [], removed: [] };
+		current.hunks.push(current.hunk);
+	}
+	return current.hunk;
+}
+
 export function parseRuntimeHunks(diff) {
 	const files = [];
 	let current = null;
@@ -593,6 +656,9 @@ export function parseRuntimeHunks(diff) {
 				added: new Map(),
 				deletedAfter: new Set(),
 				removed: [],
+				removedAfter: new Map(),
+				hunks: [],
+				hunk: null,
 				// The diff states a whole-file removal explicitly. It is the one
 				// post-image state that needs no read: there is nothing to classify
 				// (#4605 V2).
@@ -622,17 +688,27 @@ export function parseRuntimeHunks(diff) {
 		if (hunk) {
 			current.postLine = Number(hunk[1]);
 			inHunk = true;
+			current.hunk = { added: [], removed: [] };
+			current.hunks.push(current.hunk);
 			continue;
 		}
 		if (!inHunk && (line.startsWith("+++") || line.startsWith("---"))) continue;
 		if (line.startsWith("+")) {
-			current.added.set(current.postLine, line.slice(1));
+			const postLine = current.postLine;
+			current.added.set(postLine, line.slice(1));
+			hunkFor(current).added.push(postLine);
 			current.postLine += 1;
 		} else if (line.startsWith(" ")) current.postLine += 1;
 		else if (inHunk && line.startsWith("-")) {
 			// A deletion sits between post-image lines `postLine - 1` and `postLine`.
-			current.deletedAfter.add(current.postLine - 1);
+			const after = current.postLine - 1;
+			const index = current.removed.length;
+			current.deletedAfter.add(after);
 			current.removed.push(line.slice(1));
+			hunkFor(current).removed.push(index);
+			const bucket = current.removedAfter.get(after) ?? [];
+			bucket.push(index);
+			current.removedAfter.set(after, bucket);
 		}
 	}
 	return files;
@@ -642,10 +718,15 @@ export function parseRuntimeHunks(diff) {
 // `--unified=0` a call's closing brace may be unchanged and the opener may be
 // outside the hunk (#2915, #3906). Only a call whose span contains an added
 // POST-image line counts, so an untouched record never passes as new. The
-// failure-path and seam-branch scans read the added lines alone. A file whose
-// post-image is missing, unreadable, oversize, or does not match the diff's own
-// added text is reported `indeterminate` (visibly inconclusive), never
-// classified from the ambiguous hunk.
+// seam-branch scan reads the added lines alone; the failure-path scan credits a
+// hunk's removals of a token kind against that hunk's additions of the same
+// kind, because a re-spelled line is not a new failure path (#5019). The credit
+// is per hunk and per kind, never per file, so one hunk's removal cannot excuse
+// another hunk's or another file's addition, and a removed line is lexed as the
+// pre-image it came from so a token inside a comment or a string credits
+// nothing. A file whose post-image is missing, unreadable, oversize, or does not
+// match the diff's own added text is reported `indeterminate` (visibly
+// inconclusive), never classified from the ambiguous hunk.
 function runtimeObservabilityFromDiff(diff, seamMap, options = {}) {
 	const files = parseRuntimeHunks(diff);
 	const runtimeTouched = files.some(
@@ -712,11 +793,45 @@ function runtimeObservabilityFromDiff(diff, seamMap, options = {}) {
 				}
 			}
 		}
-		for (const postLine of file.added.keys()) {
-			failurePath ||=
-				/\bcatch\b|\brecordDegradationOnce\b|\bthrow\b|\breturn\s+null\b/.test(
-					blankedRows[postLine - 1] ?? "",
+		// The pre-image the diff removed these lines from: the post-image with its
+		// added lines dropped and its removed lines restored in diff order. Lexing
+		// it, not the removed text alone, keeps a removed JSDoc continuation or
+		// string from crediting a token it never carried as code (#5019). A file
+		// with no removed line builds none of it.
+		const preRows = [];
+		const preLineOfRemoved = [];
+		if (file.removed.length) {
+			for (let postLine = 1; postLine <= rows.length; postLine += 1) {
+				for (const removed of file.removedAfter.get(postLine - 1) ?? []) {
+					preLineOfRemoved[removed] = preRows.length;
+					preRows.push(file.removed[removed]);
+				}
+				if (!file.added.has(postLine)) preRows.push(rows[postLine - 1]);
+			}
+			for (const removed of file.removedAfter.get(rows.length) ?? []) {
+				preLineOfRemoved[removed] = preRows.length;
+				preRows.push(file.removed[removed]);
+			}
+		}
+		const preBlankedRows = file.removed.length
+			? blankCommentsAndStrings(preRows.join("\n")).text.split("\n")
+			: [];
+		for (const hunk of file.hunks) {
+			const credited = new Map();
+			for (const removed of hunk.removed)
+				countFailureTokens(
+					preBlankedRows[preLineOfRemoved[removed]] ?? "",
+					credited,
 				);
+			for (const postLine of hunk.added) {
+				for (const [kind, count] of countFailureTokens(
+					blankedRows[postLine - 1] ?? "",
+				)) {
+					const left = (credited.get(kind) ?? 0) - count;
+					credited.set(kind, Math.max(0, left));
+					if (left < 0) failurePath = true;
+				}
+			}
 		}
 		if (isSeamFile(file.post, seamMap)) {
 			let count = 0;
@@ -1179,13 +1294,14 @@ function splitMarkdownSentences(text) {
 	return sentences;
 }
 
-function countSentenceTerminators(lines) {
-	let count = 0;
-	const masked = codeSpanMasked(lines.join("\n").trim());
+/** The offsets of every sentence terminator in `text`, code spans masked. */
+function sentenceEndOffsets(text) {
+	const offsets = [];
+	const masked = codeSpanMasked(text);
 	for (let index = 0; index < masked.length; index += 1) {
-		if (endsSentence(masked, index, lines.join("\n").trim())) count += 1;
+		if (endsSentence(masked, index, text)) offsets.push(index);
 	}
-	return count;
+	return offsets;
 }
 
 export function splitMarkdownUnits(body = "") {
@@ -1498,14 +1614,13 @@ function lintTestReferences(body, options = {}) {
 	};
 	const lines = visibleBody.split(/\r?\n/);
 	let tableHeaders = null;
-	const tableCells = (line) => line.split("|").map((cell) => cell.trim());
 	const isValidSeparator = (line, headers) => {
 		if (!headers) return false;
 		if (!/^\s*\|.*\|\s*$/.test(line)) return false;
-		const cells = tableCells(line);
+		const cells = splitMarkdownRow(line);
 		return (
 			cells.length === headers.length &&
-			cells.slice(1, -1).every((cell) => /^:?-{3,}:?$/.test(cell))
+			cells.every((cell) => /^:?-{3,}:?$/.test(cell))
 		);
 	};
 	for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
@@ -1516,30 +1631,33 @@ function lintTestReferences(body, options = {}) {
 		if (
 			table &&
 			lineIndex + 1 < lines.length &&
-			isValidSeparator(lines[lineIndex + 1], tableCells(line))
+			isValidSeparator(lines[lineIndex + 1], splitMarkdownRow(line))
 		) {
-			tableHeaders = tableCells(line);
+			tableHeaders = splitMarkdownRow(line);
 			continue;
 		}
 		const inTable = table && tableHeaders !== null;
 		if (inTable && isValidSeparator(line, tableHeaders)) continue;
-		for (const match of line.matchAll(/`([^`]+)`/g)) {
-			const cellIndex = inTable
-				? line.slice(0, match.index).split("|").length - 1
-				: -1;
-			const inTestColumn = Boolean(
-				// Word-boundary match (#3013): a bare "id" substring qualified
-				// every "Evidence" column as a test column, so claim-matrix
-				// evidence cells holding commands and code read as missing test
-				// references. A column names tests only when it says so as a
-				// word ("Test", "Test id", "Case").
-				inTable &&
-				/\b(?:test|probe|case|witness|id)\b/i.test(
-					tableHeaders[cellIndex] ?? "",
-				),
-			);
-			addToken(match[1], inTestColumn || (table && !inTable), inTestColumn);
-		}
+		// A table row is read cell by cell, the way GitHub splits it: a code
+		// span cannot hold an unescaped pipe, so it never spans two cells.
+		const segments = inTable
+			? splitMarkdownRow(line).map((cell, index) => [cell, index])
+			: [[line, -1]];
+		for (const [segment, cellIndex] of segments)
+			for (const match of segment.matchAll(/`([^`]+)`/g)) {
+				const inTestColumn = Boolean(
+					// Word-boundary match (#3013): a bare "id" substring qualified
+					// every "Evidence" column as a test column, so claim-matrix
+					// evidence cells holding commands and code read as missing test
+					// references. A column names tests only when it says so as a
+					// word ("Test", "Test id", "Case").
+					inTable &&
+					/\b(?:test|probe|case|witness|id)\b/i.test(
+						tableHeaders[cellIndex] ?? "",
+					),
+				);
+				addToken(match[1], inTestColumn || (table && !inTable), inTestColumn);
+			}
 		for (const match of line.matchAll(/\bit\(\s*(["'])(.*?)\1\s*\)/g))
 			if (isBullet || !inTable) addToken(match[0]);
 	}
@@ -2533,8 +2651,9 @@ function globToRegExp(pattern, { directory }) {
 }
 
 /** The record-shaped mentions of a section, in the order the body makes them. */
-function recordMentions(content) {
-	const source = String(content ?? "");
+function recordMentions(content, families = []) {
+	// A `TLA+ unaffected: <family>` line names a family, not a record (#3902).
+	const source = withoutDeclaredFamilies(content ?? "", families);
 	const mentioned = new Map();
 	for (const match of source.matchAll(/`([^`\n]+)`/g)) {
 		const span = match[1].trim();
@@ -2731,7 +2850,8 @@ function warnRecordReadBackSkipped(step, names, reason = "git grep failed") {
 
 function lintObservabilityRecordsTested(lines, headings, options = {}) {
 	const content = observabilitySectionContent(lines, headings);
-	const { mentions, truncated } = recordMentions(content);
+	const families = loadSeamMap(options.cwd)?.families ?? [];
+	const { mentions, truncated } = recordMentions(content, families);
 	if (!mentions.length) return [];
 	if (truncated)
 		console.warn(
@@ -2991,14 +3111,14 @@ export const DETECTION_MESSAGE =
 	'PR body "## Detection" must state the bug-detection lesson in five lines: ' +
 	'"Caught by: <layer>", "Should have been caught by: <layer|this layer>", ' +
 	'"Gap: <issue ref> | exists: <path of a test already on master> | none: <reason>", ' +
-	'"Shape: #N (an AGENTS.md Recurring defect shapes number) | new: <name>", ' +
+	'"Shape: #N (a docs/defect-shapes.md number) | new: <name>", ' +
 	'and "Enforcer: <tree-wide test path on master> | #N (an issue to build one) | none: judgment-only, <reason>". ' +
 	DETECTION_LAYER_HINT;
 
 // #4519: the retro read 139 of 363 closed bugs as "unknown". A bug-closing PR
 // owes a layer word and a reason; "unknown", "n/a", "tbd" and "?" are neither.
 export const DETECTION_UNKNOWN_MESSAGE =
-	'PR body "## Detection" answers "unknown", "n/a", "tbd" or "?" (or a reason that starts with "unknown"), which is not a detection lesson: a bug-closing PR names the layer that caught the bug (and the layer that should have), a real reason after "Gap: none:", the shape name, and the enforcer reason. ' +
+	'PR body "## Detection" answers "unknown", "n/a", "tbd" or "?" (or a reason that starts with "unknown"), which is not a detection lesson: a PR that closes or references a bug names the layer that caught the bug (and the layer that should have), a real reason after "Gap: none:", the shape name, and the enforcer reason. ' +
 	DETECTION_LAYER_HINT;
 
 // A field value is found by its line prefix, never a sentence mention: a
@@ -3034,6 +3154,9 @@ function isPlaceholderAnswer(value) {
 	return /^unknown\b/.test(text) || /^(?:n\/a|tbd|\?+)$/.test(text);
 }
 
+const TABLE_SHAPE_MESSAGE = (expected, actual, row) =>
+	`PR body table row has ${actual} cell${actual === 1 ? "" : "s"} but its header has ${expected}: ${row.trim().slice(0, 80)}. GitHub splits a row at every pipe that is not written \\| (a backticked pipe too), so the row renders wrong. Escape the pipe as \\| or reword the cell.`;
+
 const BEHAVIOR_EQUIVALENCE_MESSAGE =
 	'PR body "## Behavior equivalence" must contain a markdown table with Site, Before, and After columns and at least one non-placeholder data row.';
 
@@ -3046,13 +3169,37 @@ function isBehaviorEquivalencePlaceholder(value) {
 	);
 }
 
-function behaviorTableCells(line) {
-	if (!/^\s*\|.*\|\s*$/.test(line)) return null;
-	return line
-		.trim()
-		.slice(1, -1)
-		.split("|")
-		.map((cell) => cell.trim());
+// A pipe-table row's cells, or null when the line is not a bordered table row.
+function tableRowCells(line) {
+	return /^\s*\|.*\|\s*$/.test(line) ? splitMarkdownRow(line) : null;
+}
+
+// A row whose cell count differs from its header's renders wrong on GitHub: an
+// unescaped pipe inside a backticked cell splits it, so the Red cell of a
+// mutation row showed a stray "`1 failed" and lost the rest (#5070 merged with
+// 12 of 15 such rows, and no lint looked). A short row is padded and a long
+// one truncated by the renderer, so either is a cell the reader never sees.
+// What is a table, and which lines are its rows, is the lexer's answer, never a
+// row regex of ours: the regex missed a row with no trailing pipe, a short
+// separator, a borderless or quoted table, and refused a table in `<pre>` or a
+// comment (#5026 r4 verify). Each raw line is re-split as GitHub splits it,
+// because the token's own cells are already padded or cut to the header, and
+// the header too, because the lexer splits `\\|` where GitHub does not.
+function lintTableShape(body) {
+	const tables = (tokens) =>
+		tokens.flatMap((token) =>
+			token.type === "table" ? [token] : tables(markdownChildren(token)),
+		);
+	const errors = [];
+	for (const table of tables(markdownTokens(body).map(({ token }) => token))) {
+		const [header, ...lines] = table.raw.replace(/\n+$/, "").split("\n");
+		const width = splitMarkdownRow(header).length;
+		for (const line of lines) {
+			const cells = splitMarkdownRow(line).length;
+			if (cells !== width) errors.push(TABLE_SHAPE_MESSAGE(width, cells, line));
+		}
+	}
+	return errors;
 }
 
 function lintBehaviorEquivalence(body, headings, title) {
@@ -3071,7 +3218,7 @@ function lintBehaviorEquivalence(body, headings, title) {
 		nextHeading?.index ?? lines.length,
 	);
 	for (let index = 0; index + 1 < tableLines.length; index += 1) {
-		const headers = behaviorTableCells(tableLines[index]);
+		const headers = tableRowCells(tableLines[index]);
 		if (!headers) continue;
 		const normalizedHeaders = headers.map((header) => header.toLowerCase());
 		const site = normalizedHeaders.indexOf("site");
@@ -3092,7 +3239,7 @@ function lintBehaviorEquivalence(body, headings, title) {
 			rowIndex < tableLines.length;
 			rowIndex += 1
 		) {
-			const row = behaviorTableCells(tableLines[rowIndex]);
+			const row = tableRowCells(tableLines[rowIndex]);
 			if (!row) break;
 			if (row.length < headers.length) continue;
 			if (
@@ -3206,20 +3353,24 @@ function validDetectionGap(value) {
 
 // #4439: a bug fix names the defect SHAPE and the tree-wide enforcer of that
 // shape, not only a test for the instance. `Shape:` is a catalog number from
-// AGENTS.md "Recurring defect shapes" or `new: <name>`; `Enforcer:` is a test
-// path on the base, an issue to build one, or `none: judgment-only, <reason>`.
-// With `Shape: #N`, a path enforcer must be one the catalog entry for #N names.
+// docs/defect-shapes.md (whose index sits in AGENTS.md "Recurring defect
+// shapes") or `new: <name>`; `Enforcer:` is a test path on the base, an issue to
+// build one, or `none: judgment-only, <reason>`. With `Shape: #N`, a path
+// enforcer must be one the catalog entry for #N names.
+// The unresolved-catalog message names the remedy for the transition window: a
+// branch cut before the catalog landed has no catalog at its merge base, and
+// the honest fix is to merge master in, not to weaken a truthful `Enforcer:`.
 export const DETECTION_SHAPE_CATALOG_UNRESOLVED_MESSAGE =
-	'PR body "## Detection" says "Shape: #N" with a path "Enforcer:", but AGENTS.md "Recurring defect shapes" could not be read from the base commit of the PR (git show <merge-base>:AGENTS.md), so the catalog entry cannot be checked. Give an issue ref (#NNN) or "none: judgment-only, <reason>" as the enforcer instead.';
+	'PR body "## Detection" says "Shape: #N" with a path "Enforcer:", but the defect-shape catalog could not be read from the base commit of the PR (git show <merge-base>:docs/defect-shapes.md), so the catalog entry cannot be checked. A branch cut before docs/defect-shapes.md landed has no catalog at its merge base: merge master into the branch, so the base commit holds the catalog. Otherwise give an issue ref (#NNN) or "none: judgment-only, <reason>" as the enforcer instead.';
 
 export const detectionUnknownShapeMessage = (number) =>
-	`PR body "## Detection" says "Shape: #${number}", but AGENTS.md "Recurring defect shapes" has no shape ${number}. Use a catalog number, or "Shape: new: <name>" for a shape the catalog lacks.`;
+	`PR body "## Detection" says "Shape: #${number}", but the defect-shape catalog (docs/defect-shapes.md) has no shape ${number}. Use a catalog number, or "Shape: new: <name>" for a shape the catalog lacks.`;
 
 export const detectionEnforcerNotOnBaseMessage = (path) =>
 	`PR body "## Detection" says "Enforcer: ${path}", but that file is not on the PR's base commit (git merge-base origin/master HEAD). A test this PR adds is the regression test, not the enforcer of the shape. Name a tree-wide test already on the base, an issue (#NNN) to build one, or "none: judgment-only, <reason>".`;
 
 export const detectionEnforcerNotInCatalogMessage = (path, number) =>
-	`PR body "## Detection" says "Shape: #${number}" and "Enforcer: ${path}", but AGENTS.md shape ${number} does not name that path. Name a test the catalog entry lists, or give an issue (#NNN) to add it, or "none: judgment-only, <reason>".`;
+	`PR body "## Detection" says "Shape: #${number}" and "Enforcer: ${path}", but docs/defect-shapes.md shape ${number} does not name that path. Name a test the catalog entry lists, or give an issue (#NNN) to add it, or "none: judgment-only, <reason>".`;
 
 const stripEmphasis = (value) =>
 	String(value ?? "")
@@ -3289,11 +3440,12 @@ function lintShapeAndEnforcer(content, options) {
 }
 
 /**
- * The `shapeCatalog` reader for `lintDetectionSection`: AGENTS.md as the PR's
- * base commit has it (the base `baseFileReader` reads the enforcer path from),
- * parsed once on first use. `null` when the base or its AGENTS.md cannot be
- * read. The base, never the checkout: a PR that edits entry N to name its own
- * enforcer must not approve itself (#4439).
+ * The `shapeCatalog` reader for `lintDetectionSection`: docs/defect-shapes.md
+ * as the PR's base commit has it (the base `baseFileReader` reads the enforcer
+ * path from), parsed once on first use. `null` when the base or that file
+ * cannot be read; there is no fallback to AGENTS.md, whose index carries only
+ * the screen lines. The base, never the checkout: a PR that edits entry N to
+ * name its own enforcer must not approve itself (#4439).
  */
 export function shapeCatalogReader(cwd = process.cwd(), git = gitExecFileSync) {
 	let catalog;
@@ -3304,7 +3456,7 @@ export function shapeCatalogReader(cwd = process.cwd(), git = gitExecFileSync) {
 		try {
 			catalog = parseDefectShapes(
 				String(
-					git(["show", `${base}:AGENTS.md`], {
+					git(["show", `${base}:${SHAPE_CATALOG_PATH}`], {
 						cwd,
 						encoding: "utf8",
 						maxBuffer: 16 * 1024 * 1024,
@@ -3483,6 +3635,142 @@ function closedIssues(body) {
 	return parseCloseKeywords(
 		blankMarkdownRegions(body, { code: "blocks", codeSpans: true }),
 	).issues;
+}
+
+// #4968: the detection lesson is owed by any PR that references a bug issue,
+// not only one that closes it (the 2026-10-29 audit: 24 bug-linked PRs merged
+// with `Refs #N` and no `## Detection`). A reference is a keyword and the
+// issue token(s) it names: directly after it (`refs #N`, `Closes: #A, #B`), on
+// the rest of a line the keyword opens (`Refs the audit in #N`), or on the
+// next line when the keyword or a trailing comma ends the line (a wrapped
+// `Refs\n#N`). The reader labels one token spelling, `#N` and `GH-N`; a
+// cross-repository token or an issue or pull request URL is returned as
+// unrecognised for the gate to refuse, never skipped. Another URL (a comment
+// permalink) is prose.
+const REFERENCE_KEYWORD = String.raw`(?:close[sd]?|fix(?:e[sd])?|resolv(?:e[sd]?)|refs?|references?)`;
+const REFERENCE_TOKEN = String.raw`(?:https?://[^\s)\]>]+|[\w.-]+/[\w.-]+#\d+|(?:#|GH-)\d+(?!\w))`;
+const REFERENCE_LIST = String.raw`${REFERENCE_TOKEN}(?:(?:[ \t]*(?:,|&|\band\b)[ \t]*|[ \t]+)${REFERENCE_TOKEN})*`;
+const REFERENCE_GAP = String.raw`[ \t:\-\u2013\u2014(\[*_]*`;
+const REFERENCE_READABLE = /^(?:#|GH-)(\d+)$/i;
+const REFERENCE_ISSUE_URL = /^https?:\/\/.*\/(?:issues|pull)\/\d+\/?$/i;
+const REFERENCE_ADJACENT = new RegExp(
+	String.raw`\b${REFERENCE_KEYWORD}\b${REFERENCE_GAP}(${REFERENCE_LIST})`,
+	"gi",
+);
+const REFERENCE_LEADING = new RegExp(
+	String.raw`^[ \t>]*(?:[-*+]|\d+[.)])?[ \t]*(?:\*\*|__)?${REFERENCE_KEYWORD}\b(.*)$`,
+	"i",
+);
+// A line the keyword ends: its tokens are on the next line.
+const REFERENCE_OPEN = new RegExp(
+	String.raw`\b${REFERENCE_KEYWORD}\b${REFERENCE_GAP}$`,
+	"i",
+);
+const REFERENCE_CONTINUATION = new RegExp(
+	String.raw`^[ \t>*_(\[-]*(${REFERENCE_LIST})`,
+);
+const REFERENCE_TOKENS = new RegExp(REFERENCE_TOKEN, "gi");
+const REFERENCE_WHOLE_TOKEN = new RegExp(`^${REFERENCE_TOKEN}$`, "i");
+const LINK_DEFINITION =
+	/^ {0,3}\[([^\]\n]{1,200})\]:[ \t]*<?([^\s>]{1,500})>?/gm;
+const INLINE_LINK =
+	/\[([^\]\n]{0,200})\]\(<?([^)\s>]{0,500})>?(?:[ \t][^)\n]{0,200})?\)/g;
+const SHORTCUT_LINK = /\[([^\]\n]{1,200})\](?![[(:])/g;
+const REFERENCE_LINK = /\[([^\]\n]{0,200})\]\[([^\]\n]{0,200})\]/g;
+
+// The link patterns are length-bounded: an unbounded scan from every `[` of a
+// bracket-only line is quadratic.
+// A link names its target by its text when that text is itself an issue token
+// (`[#12](url)`), and by its destination otherwise (`[the bug](url)`), whether
+// the destination is inline or reached through a definition (`[bug][1]`).
+function linkTarget(text, destination) {
+	const label = text.trim();
+	return REFERENCE_WHOLE_TOKEN.test(label) ? label : (destination ?? "");
+}
+
+/**
+ * The issues a body references and the tokens it cannot read, from the text
+ * outside code. `issues` is in order of first appearance.
+ */
+export function referencedIssues(body = "") {
+	const issues = [];
+	const unrecognised = [];
+	const note = (token) => {
+		const readable = REFERENCE_READABLE.exec(token);
+		if (readable) {
+			if (!issues.includes(Number(readable[1])))
+				issues.push(Number(readable[1]));
+			return;
+		}
+		const shown = token.replace(/[.,;:]+$/, "");
+		if (/^https?:/i.test(shown) && !REFERENCE_ISSUE_URL.test(shown)) return;
+		if (!unrecognised.includes(shown)) unrecognised.push(shown);
+	};
+	// Fenced and indented code is quoted material; an inline code span is not
+	// (fail closed): `Refs` before a code-spanned number still names the issue.
+	const text = blankMarkdownRegions(String(body ?? ""), { code: "blocks" });
+	const definitions = new Map(
+		[...text.matchAll(LINK_DEFINITION)].map((m) => [m[1].toLowerCase(), m[2]]),
+	);
+	const lines = text.split(/\r?\n/).map((line) =>
+		line
+			.replace(INLINE_LINK, (_, label, destination) =>
+				linkTarget(label, destination),
+			)
+			.replace(REFERENCE_LINK, (match, label, key) => {
+				const destination = definitions.get((key || label).toLowerCase());
+				return destination === undefined
+					? match
+					: linkTarget(label, destination);
+			})
+			.replace(SHORTCUT_LINK, (match, label) => {
+				const destination = definitions.get(label.toLowerCase());
+				return destination === undefined
+					? match
+					: linkTarget(label, destination);
+			}),
+	);
+	let continues = false;
+	for (const line of lines) {
+		const spans = [...line.matchAll(REFERENCE_ADJACENT)].map((m) => m[1]);
+		const leading = REFERENCE_LEADING.exec(line);
+		if (leading) spans.push(leading[1]);
+		if (continues) {
+			const next = REFERENCE_CONTINUATION.exec(line);
+			if (next) spans.push(next[1]);
+		}
+		for (const span of spans)
+			for (const [token] of span.matchAll(REFERENCE_TOKENS)) note(token);
+		continues =
+			REFERENCE_OPEN.test(line) ||
+			(spans.length > 0 && /(?:[,&]|\band)[ \t]*$/i.test(line));
+	}
+	return { issues, unrecognised };
+}
+
+// #4968: the title channel. The template makes the title carry the issue
+// (`(refs #NNN)`), a short regular field, so every `#N` in it is a reference
+// whatever words the body uses (PR #4924: title `(refs #4532)`, body `Part (a)
+// of #4532`). A `#N` glued to a word (`owner/repo#N`) is another repository's.
+function titleIssues(title) {
+	return [...String(title ?? "").matchAll(/(?<!\w)#(\d+)(?!\w)/g)].map(
+		(match) => Number(match[1]),
+	);
+}
+
+// What the reference rule reads: the author's text (a bot block quoting a
+// commit title is not the author's reference) and every `#N` of the title,
+// minus the issues the whole body closes, which keep their own `bugClosing`
+// route.
+function referencedOnly(fullBody, title = "") {
+	const closed = closedIssues(fullBody);
+	const { issues, unrecognised } = referencedIssues(authorText(fullBody));
+	for (const number of titleIssues(title))
+		if (!issues.includes(number)) issues.push(number);
+	return {
+		issues: issues.filter((number) => !closed.includes(number)),
+		unrecognised,
+	};
 }
 
 function sectionVerdict(section, text, { closes = [] } = {}) {
@@ -3738,11 +4026,7 @@ function controlsNameFile(rows, file) {
 	return rows.some((row) => {
 		if (!namesFile(row, file)) return false;
 		if (/^\s*\|/.test(row)) {
-			const cells = row
-				.split("|")
-				.slice(1, -1)
-				.map((cell) => cell.trim())
-				.filter(Boolean);
+			const cells = splitMarkdownRow(row).filter(Boolean);
 			return cells.length >= 2 && wordCount(cells.join(" ")) >= 2;
 		}
 		return /(?:—|:|because)\s+[A-Za-z0-9].+/.test(row);
@@ -3841,10 +4125,7 @@ function mutationTableRows(visibleRows, headingByLine) {
 		if (!mutationSection || !row.trim()) continue;
 		if (/^\s*\|/.test(row)) {
 			if (/^\s*\|[\s:|-]+\|?\s*$/.test(row)) continue;
-			const cells = row
-				.split("|")
-				.slice(1, -1)
-				.map((cell) => cell.trim());
+			const cells = splitMarkdownRow(row);
 			const label = (cells.at(-1) ?? "").replace(/`/g, "").trim();
 			rows.push({
 				text: row,
@@ -4134,6 +4415,342 @@ function lintDiffCompliance(body, options) {
 	return errors;
 }
 
+// ASCII whitespace only: a no-break space renders as space the reader scrolls past.
+const collapsedLength = (text) =>
+	String(text ?? "").replace(/[ \t\r\n]+/g, " ").length;
+// A link destination is not rendered text, so only what exceeds an ordinary URL is charged.
+const LINK_DESTINATION_ALLOWANCE = 200;
+
+/**
+ * What the body costs a reader, from the lexer's tokens (#5003, #5026). Known
+ * kinds are charged for the text they render: prose and code spans count as
+ * visible characters, and a `code` token is measured on its own (lines, widest
+ * line, total). Fail closed: a token kind this function does not list, raw
+ * HTML (a tag, a comment, a `<details>` block), a reference definition, an
+ * image, a hard line break and a rule are charged for their whole `raw`, never
+ * for nothing; a link also pays for a long destination and its title. A container whose
+ * children the lexer did not place is charged the same way.
+ */
+function tallyTokens(tokens, tally) {
+	for (const token of tokens) {
+		switch (token.type) {
+			case "space":
+				break;
+			case "code": {
+				const rows = token.raw.replace(/\n+$/, "").split("\n");
+				tally.code.push({
+					lines: token.text === "" ? 0 : token.text.split("\n").length,
+					width: Math.max(...rows.map((row) => row.length)),
+				});
+				break;
+			}
+			case "codespan":
+			case "escape":
+				tally.chars += collapsedLength(token.text);
+				break;
+			case "text":
+			case "paragraph":
+			case "heading":
+			case "blockquote":
+			case "list":
+			case "list_item":
+			case "table":
+			case "strong":
+			case "em":
+			case "del":
+			case "link": {
+				const kids = markdownChildren(token);
+				if (kids.length) tallyTokens(kids, tally);
+				else tally.chars += collapsedLength(token.raw);
+				if (token.type === "link")
+					tally.chars +=
+						Math.max(
+							0,
+							String(token.href ?? "").length - LINK_DESTINATION_ALLOWANCE,
+						) + collapsedLength(token.title);
+				break;
+			}
+			default:
+				tally.chars += collapsedLength(token.raw);
+		}
+	}
+	return tally;
+}
+
+/** A Summary paragraph as the reader reads it: code spans kept, raw HTML and images dropped. */
+function summaryText(tokens) {
+	return tokens
+		.map((token) => {
+			if (token.type === "codespan") return token.raw;
+			if (token.type === "br") return " ";
+			if (token.type === "html" || token.type === "image") return "";
+			const kids = markdownChildren(token);
+			return kids.length ? summaryText(kids) : (token.text ?? token.raw ?? "");
+		})
+		.join("");
+}
+
+// #5208: the `Refs #N`, `Remaining #N:` and `Closes #N` lines an author keeps
+// in the Summary section are bookkeeping, and counted sentences in them count
+// toward the same SUMMARY_MAX_SENTENCES cap as the prose. A refusal that named
+// only the cap sent the author back to the summary text while the fourth
+// sentence sat in the bookkeeping line below it (3 retries on #5176, 4 on
+// #5202). The form is matched, not the first word, so prose that opens
+// "Remaining work is documented" stays prose (#5215 F2).
+const SUMMARY_BOOKKEEPING = /^(refs?|remaining|closes?)\s*#(\d+)/i;
+const SUMMARY_SECTION = "the summary";
+
+function counted(count, noun) {
+	return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+/**
+ * Every counted sentence of a Summary section, aggregated per labelled line:
+ * the bookkeeping keyword and issue the line the terminator sits on opens
+ * with ("the summary" for prose), in the order the labels first appear, plus
+ * the total.
+ * The sentences are counted over the section as one text and then attributed
+ * to the line each terminator sits in, so the count keeps its abbreviation
+ * tolerance (#3262): a sentence that starts in lower case counts with the one
+ * before it, and the character cap, not the count, bounds a Summary written
+ * that way. Reading the label off the terminator's own line reports `Refs #N`
+ * then `Remaining #N:` inside one paragraph as the `Remaining #N` line the
+ * sentence ends on (#5215 F1, F3, F10).
+ */
+function summarySentenceCounts(tokens) {
+	const text = tokens
+		.map((token) =>
+			token.type === "paragraph" ? summaryText(token.tokens ?? []) : "",
+		)
+		.join("\n")
+		.trim();
+	const lines = [];
+	let start = 0;
+	for (const line of text.split("\n")) {
+		const match = SUMMARY_BOOKKEEPING.exec(line.trim());
+		lines.push({
+			start,
+			end: start + line.length,
+			label: match ? `the ${match[1]} #${match[2]} line` : SUMMARY_SECTION,
+		});
+		start += line.length + 1;
+	}
+	const ends = sentenceEndOffsets(text);
+	const counts = new Map();
+	for (const at of ends) {
+		const label =
+			lines.find((each) => at >= each.start && at < each.end)?.label ??
+			SUMMARY_SECTION;
+		counts.set(label, (counts.get(label) ?? 0) + 1);
+	}
+	return { counts, sentences: ends.length };
+}
+
+/**
+ * Where the sentences over the cap sit: the labelled line holding the most of
+ * them, so a refusal whose bookkeeping fills the cap does not tell the author
+ * to cut prose that is already one sentence (#5215 F5).
+ */
+function summaryExcessGroup(groups, excess) {
+	const [label, groupSentences] = groups.reduce(
+		(worst, group) => (group[1] > worst[1] ? group : worst),
+		[SUMMARY_SECTION, 0],
+	);
+	if (excess > groupSentences) {
+		const labels = groups.map(([groupLabel]) =>
+			groupLabel === SUMMARY_SECTION
+				? "the summary"
+				: groupLabel.replace(/^the /, "").replace(/ line$/, ""),
+		);
+		const last = labels.pop();
+		const listed = labels.length ? `${labels.join(", ")} and ${last}` : last;
+		return `across ${listed} lines`;
+	}
+	return `from ${label === SUMMARY_SECTION ? "the summary prose" : label}`;
+}
+
+/**
+ * Does a Summary section hold what the template admits: paragraphs only, one
+ * to SUMMARY_MAX_SENTENCES sentences, at most SUMMARY_MAX_CHARS characters?
+ * Every other token kind refuses (a list, a table, code, raw HTML, a nested
+ * heading). Returns the refusal, which states what it counted and where the
+ * count sits, or `null` when the section is admitted.
+ */
+function summaryRefusal(tokens, name) {
+	const rule = `PR body "## ${name}" must hold plain paragraphs of one to ${SUMMARY_MAX_SENTENCES} sentences and at most ${SUMMARY_MAX_CHARS} characters, with no list, table, code or HTML`;
+	if (
+		!tokens.every(
+			(token) => token.type === "paragraph" || token.type === "space",
+		)
+	)
+		return `${rule}. See ${TEMPLATE_PATH}.`;
+	const { counts, sentences } = summarySentenceCounts(tokens);
+	const chars = tallyTokens(tokens, { chars: 0, code: [] }).chars;
+	const groups = [...counts];
+	const where = groups.length
+		? ` (${groups.map(([label, count]) => `${count} in ${label}`).join(", ")})`
+		: "";
+	const breaches = [];
+	if (sentences > SUMMARY_MAX_SENTENCES)
+		breaches.push(
+			`it holds ${counted(sentences, "counted sentence")}${where}, over the ${SUMMARY_MAX_SENTENCES}-sentence cap`,
+		);
+	if (sentences < 1)
+		breaches.push(
+			`it holds no counted sentence${where}, under the one-sentence minimum`,
+		);
+	if (chars > SUMMARY_MAX_CHARS)
+		breaches.push(
+			`${counted(chars, "visible character")}, over the ${SUMMARY_MAX_CHARS}-character cap`,
+		);
+	if (breaches.length === 0) return null;
+	const prose = counts.get(SUMMARY_SECTION) ?? 0;
+	const bookkeeping = sentences - prose;
+	const spare = SUMMARY_MAX_SENTENCES - bookkeeping;
+	const advice = [];
+	if (sentences > SUMMARY_MAX_SENTENCES)
+		advice.push(
+			bookkeeping > 0 && spare >= 1
+				? `Counted sentences in the "Refs #N", "Remaining #N:" and "Closes #N" lines also count toward the cap, so keep the summary prose to ${counted(spare, "sentence")}`
+				: `Cut ${counted(sentences - SUMMARY_MAX_SENTENCES, "sentence")} ${summaryExcessGroup(groups, sentences - SUMMARY_MAX_SENTENCES)}`,
+		);
+	if (sentences < 1)
+		advice.push(
+			`Write the summary as plain prose of one to ${SUMMARY_MAX_SENTENCES} sentences, because a "Refs #N", "Remaining #N:" or "Closes #N" line alone does not read as one`,
+		);
+	if (chars > SUMMARY_MAX_CHARS)
+		advice.push(
+			`Cut ${counted(chars - SUMMARY_MAX_CHARS, "visible character")}`,
+		);
+	return `${rule}: ${breaches.join(" and ")}. ${advice.join(". ")}. See ${TEMPLATE_PATH}.`;
+}
+
+/**
+ * Does the reviewer-notes section hold what the template admits: exactly one
+ * list of at most REVIEWER_NOTES_MAX_BULLETS items, each holding text or
+ * paragraphs and a task checkbox, nothing nested? Every other token kind
+ * refuses, so a spelling nobody listed (a paragraph, `1)`, an indent, a quote,
+ * a pipe-less table) is refused too.
+ */
+function notesAdmitted(tokens) {
+	const content = tokens.filter((token) => token.type !== "space");
+	if (content.length === 0) return true;
+	const [list] = content;
+	return (
+		content.length === 1 &&
+		list.type === "list" &&
+		list.items.length <= REVIEWER_NOTES_MAX_BULLETS &&
+		list.items.every((item) =>
+			item.tokens.every((token) =>
+				["text", "paragraph", "space", "checkbox"].includes(token.type),
+			),
+		)
+	);
+}
+
+/**
+ * The family names of `docs/alignment-families.md`: the text before the first
+ * colon in the Family column of its table. A file with no such table throws,
+ * so a gate that cannot read the list never reads a body as clean.
+ */
+function alignmentFamilies() {
+	const table = markdownTokens(
+		readFileSync(resolve(REPO_ROOT, ALIGNMENT_FAMILIES_PATH), "utf8"),
+	)
+		.map(({ token }) => token)
+		.find((token) => token.type === "table");
+	const names = (table?.rows ?? []).map((row) =>
+		String(row[1]?.text ?? "")
+			.split(":")[0]
+			.trim(),
+	);
+	if (
+		table?.header[1]?.text !== "Family" ||
+		names.length === 0 ||
+		names.some((name) => !name || name.includes(","))
+	)
+		throw new Error(
+			`${ALIGNMENT_FAMILIES_PATH} holds no readable family table`,
+		);
+	return names;
+}
+
+/**
+ * `### Class sweep` carries exactly one `Alignment:` line (#5026): the family
+ * names the change touches, comma-separated and spelled as in
+ * `docs/alignment-families.md`, or `none: <reason>` with a reason of at least
+ * ALIGNMENT_NONE_MIN_REASON characters. Fail closed: anything else refuses,
+ * a bare `none` and the template's own placeholder included.
+ */
+function lintAlignmentLine(sweepLines) {
+	const found = sweepLines
+		.map((line) => /^Alignment:(.*)$/.exec(line.trim())?.[1])
+		.filter((value) => value !== undefined);
+	const names = alignmentFamilies();
+	const message = `PR body "Class sweep" needs exactly one line "Alignment: <family names, comma-separated>" or "Alignment: none: <reason of ${ALIGNMENT_NONE_MIN_REASON}+ characters>". Families: ${names.join("; ")}. See ${ALIGNMENT_FAMILIES_PATH}.`;
+	if (found.length !== 1) return [message];
+	const value = found[0].trim();
+	if (value.startsWith("none:"))
+		return value.slice(5).trim().length >= ALIGNMENT_NONE_MIN_REASON
+			? []
+			: [message];
+	const listed = value.split(",").map((name) => name.trim());
+	return listed.every((name) => names.includes(name)) ? [] : [message];
+}
+
+function lintBodyBudgets(body) {
+	const errors = [];
+	const blocks = markdownTokens(body);
+	const tally = tallyTokens(
+		blocks.map(({ token }) => token),
+		{ chars: 0, code: [] },
+	);
+	if (tally.chars > VISIBLE_BODY_MAX_CHARS)
+		errors.push(
+			`PR body is ${tally.chars} visible characters, over the ${VISIBLE_BODY_MAX_CHARS} cap. Cut narrative and tables; see ${TEMPLATE_PATH}.`,
+		);
+	const longest = Math.max(0, ...tally.code.map(({ lines }) => lines));
+	if (longest > CODE_MAX_LINES)
+		errors.push(
+			`PR body has a ${longest}-line code fence or block, over the ${CODE_MAX_LINES} cap. Quote only the failing lines; see ${TEMPLATE_PATH}.`,
+		);
+	const widest = Math.max(0, ...tally.code.map(({ width }) => width));
+	if (widest > CODE_MAX_WIDTH)
+		errors.push(
+			`PR body has a code line of ${widest} characters, over the ${CODE_MAX_WIDTH} cap. Cut it to the failing part; see ${TEMPLATE_PATH}.`,
+		);
+	const total = tally.code.reduce((sum, { lines }) => sum + lines, 0);
+	if (total > CODE_TOTAL_MAX_LINES)
+		errors.push(
+			`PR body has ${total} code lines in all, over the ${CODE_TOTAL_MAX_LINES} cap. Give each changed test file its failing lines only; see ${TEMPLATE_PATH}.`,
+		);
+	const headings = bodyHeadings(body);
+	const tokensOf = (heading) => {
+		const end =
+			headings.find(
+				(candidate) =>
+					candidate.index > heading.index && candidate.level <= heading.level,
+			)?.index ?? Number.POSITIVE_INFINITY;
+		return blocks
+			.filter(({ line }) => line >= heading.contentIndex && line < end)
+			.map(({ token }) => token);
+	};
+	for (const heading of headings)
+		if (hasSection(heading, "summary")) {
+			const refusal = summaryRefusal(tokensOf(heading), heading.name);
+			if (refusal) errors.push(refusal);
+		}
+	for (const heading of headings)
+		if (
+			hasSection(heading, "notes for the reviewer") &&
+			!notesAdmitted(tokensOf(heading))
+		)
+			errors.push(
+				`PR body "## Notes for the reviewer" allows at most ${REVIEWER_NOTES_MAX_BULLETS} bullets in one flat list and nothing else. Move proof under "## Proof and checks"; see ${TEMPLATE_PATH}.`,
+			);
+	return errors;
+}
+
 export function lintPrBody(body = "", options = {}) {
 	// The same lexer headings and section text `sectionContent` reads (#4717):
 	// a section GitHub hides in a comment or a raw-HTML block is a missing
@@ -4144,24 +4761,23 @@ export function lintPrBody(body = "", options = {}) {
 	const placeholders = templatePlaceholderLines();
 	const structure = headingLines(body, headings).name;
 	const errors = options.diff ? lintDiffCompliance(body, options) : [];
-	const summary = headings.find((heading) => hasSection(heading, "summary"));
+	const lead = headings.find((heading) => hasSection(heading, "summary"));
 	const firstHeading = headings[0]?.index ?? lines.length;
 	const nextSectionHeading = (heading) =>
 		headings.find(
 			(candidate) =>
 				candidate.index > heading.index && candidate.level <= heading.level,
 		);
-	const summaryEnd = summary
-		? (nextSectionHeading(summary)?.index ?? lines.length)
-		: 0;
+	const leadEnd = lead ? (nextSectionHeading(lead)?.index ?? lines.length) : 0;
 	if (
-		(!summary ||
+		!options.workingTree &&
+		(!lead ||
 			!hasRealContent(
-				lines.slice(summary.contentIndex, summaryEnd),
+				lines.slice(lead.contentIndex, leadEnd),
 				"summary",
 				placeholders,
 				structure,
-				summary.contentIndex,
+				lead.contentIndex,
 			)) &&
 		!hasRealContent(
 			lines.slice(0, firstHeading),
@@ -4173,18 +4789,13 @@ export function lintPrBody(body = "", options = {}) {
 		errors.push(`PR body is missing a Summary section. See ${TEMPLATE_PATH}.`);
 	}
 
-	// Value discipline (HISTORY.md "Test assessment and removal (value discipline)"): a PR that
-	// touches tests/ must say, per touched file, what it uniquely pins and
-	// what became redundant. Conditional because docs/production-only PRs owe
-	// nothing here.
 	// The exported structural linter is also used by focused tests and historical
 	// repair fixtures. The repository-facing local gate is the contract that
-	// requires the new header trio; keeping that switch explicit avoids changing
-	// the meaning of lower-level parser tests.
+	// requires the header sections and the caps; keeping that switch explicit
+	// avoids changing the meaning of lower-level parser tests.
 	const requiredSections = options.workingTree
 		? [...REQUIRED_SECTIONS]
-		: ["Tests", "Blast radius", "Class sweep", "Observability"];
-	if (options.requireTestAssessment) requiredSections.push("Test assessment");
+		: ["Tests", "Class sweep", "Observability"];
 	// #4288: only a bug-closing PR owes the detection retrospective. The
 	// tri-state resolution lives at the callers; `true` is the only value that
 	// requires the section, so an unreadable label never blocks.
@@ -4216,18 +4827,20 @@ export function lintPrBody(body = "", options = {}) {
 				sectionMessage(name, "has no content before the next heading"),
 			);
 	}
-	const why = headings.find((heading) => hasSection(heading, "why"));
-	if (why) {
-		const nextHeading = nextSectionHeading(why);
-		const whyLines = rawLines.slice(
-			why.contentIndex,
-			nextHeading?.index ?? lines.length,
+	if (options.workingTree) {
+		errors.push(...lintBodyBudgets(body));
+		errors.push(...lintTableShape(body));
+		const sweep = headings.find((heading) =>
+			hasSection(heading, "class sweep"),
 		);
-		if (countSentenceTerminators(whyLines) !== 1)
+		if (sweep)
 			errors.push(
-				'PR body "## Why" must contain exactly one sentence. See ' +
-					TEMPLATE_PATH +
-					".",
+				...lintAlignmentLine(
+					lines.slice(
+						sweep.contentIndex,
+						nextSectionHeading(sweep)?.index ?? lines.length,
+					),
+				),
 			);
 	}
 	if (options.bugClosing)
@@ -4303,48 +4916,15 @@ export async function resolveLivePrBody(
 	}
 }
 
-/**
- * True when the PR touches any file under tests/. Advisory best-effort: one
- * page of 100 files covers this repo's PR sizes; on any failure (including a
- * PR larger than the page, detected via the Link header) return null so the
- * caller SKIPS the conditional check rather than guessing — a lint that can
- * misfire on fetch trouble teaches people to ignore it.
- */
-export async function resolveTouchesTests(
-	payloadPr,
-	fetchImpl = globalThis.fetch,
-) {
-	try {
-		const response = await githubGet(
-			`/pulls/${payloadPr.number}/files?per_page=100`,
-			fetchImpl,
-		);
-		if (!response.ok) throw new Error(`GitHub API returned ${response.status}`);
-		if (/rel="next"/.test(response.headers.get("link") ?? ""))
-			throw new Error(
-				"PR exceeds one file page; skipping the conditional check",
-			);
-		const files = await response.json();
-		if (!Array.isArray(files))
-			throw new Error("GitHub API returned no file list");
-		return files.some(
-			(file) =>
-				(file.filename ?? "").startsWith("tests/") ||
-				// A rename OUT of tests/ reports only the new path in filename; a
-				// removal PR is exactly what the assessment exists to catch.
-				(file.previous_filename ?? "").startsWith("tests/"),
-		);
-	} catch (error) {
-		console.warn(
-			`::warning::Could not resolve the PR file list; skipping the Test assessment check (${error instanceof Error ? error.message : error}).`,
-		);
-		return null;
-	}
-}
+// #4968: the labels that make an issue owe the detection lesson, for a PR that
+// closes it and for one that references it. One list: 17 of 20 nightly-drift
+// issues carry no `bug` label, and the issue names both for Closes and Refs.
+const DETECTION_BUG_LABELS = ["bug", "nightly-drift"];
 
 /**
- * #4288: does the PR close an issue carrying the `bug` label? Returns `true`
- * (some closed issue is bug-labelled), `false` (no closed issue is), or `null`
+ * #4288: does the PR close an issue carrying the `bug` or `nightly-drift` label
+ * (#4968)? Returns `true`
+ * (some closed issue is so labelled), `false` (no closed issue is), or `null`
  * when the label cannot be read (no API credentials, a non-2xx, or a malformed
  * body). A `null` never blocks the lint: the callers warn and skip the
  * `## Detection` requirement rather than demanding a section they cannot
@@ -4353,12 +4933,13 @@ export async function resolveTouchesTests(
 export async function resolveBugClosing(body, fetchImpl = globalThis.fetch) {
 	const issues = closedIssues(body);
 	if (issues.length === 0) return false;
-	// A missing env makes githubGet reject, which anyIssueLabelledBug reads as
+	// A missing env makes githubGet reject, which anyIssueLabelled reads as
 	// "cannot read the label" (null), as the old early return did.
-	return anyIssueLabelledBug(issues, async (number) => {
-		const response = await githubGet(`/issues/${number}`, fetchImpl);
-		return response.ok ? await response.json() : null;
-	});
+	return anyIssueLabelled(
+		issues,
+		apiIssueReader(fetchImpl),
+		DETECTION_BUG_LABELS,
+	);
 }
 
 /**
@@ -4372,7 +4953,91 @@ export async function resolveBugClosingViaGh(
 	cwd = process.cwd(),
 	exec = execFileSync,
 ) {
-	return anyIssueLabelledBug(closedIssues(body), (number) => {
+	return anyIssueLabelled(
+		closedIssues(body),
+		ghIssueReader(cwd, exec),
+		DETECTION_BUG_LABELS,
+	);
+}
+
+/**
+ * #4968: does the body REFERENCE (Refs, or any close keyword the closing route
+ * does not already own) an issue labelled `bug` or `nightly-drift`? `true`,
+ * `false`, or `null`. Unlike `resolveBugClosing`, `null` is a refusal at the
+ * callers (`lintReferencedBugLabels`): a reference the rule cannot read is not
+ * a pass. A reference token it cannot turn into `#N` is `null` without a read.
+ * `fullBody` is the whole body; the author's text is cut inside. `title` is the
+ * PR title, whose every `#N` is a reference too (`titleIssues`).
+ */
+export function resolveBugReferenced(
+	fullBody,
+	fetchImpl = globalThis.fetch,
+	title = "",
+) {
+	return anyReferencedBug(fullBody, apiIssueReader(fetchImpl), title);
+}
+
+/** The `gh api` reader of `resolveBugReferenced`, as `resolveBugClosingViaGh`. */
+export function resolveBugReferencedViaGh(
+	fullBody,
+	cwd = process.cwd(),
+	exec = execFileSync,
+	title = "",
+) {
+	return anyReferencedBug(fullBody, ghIssueReader(cwd, exec), title);
+}
+
+async function anyReferencedBug(fullBody, readIssue, title) {
+	const { issues, unrecognised } = referencedOnly(fullBody, title);
+	if (unrecognised.length) return null;
+	if (issues.length === 0) return false;
+	return anyIssueLabelled(issues, readIssue, DETECTION_BUG_LABELS);
+}
+
+/**
+ * #4968: the refusal for a reference whose label could not be read. `[]` when
+ * the read succeeded (`resolved` is true or false) or nothing is referenced.
+ * A reference the reader cannot turn into `#N` needs no network and always
+ * refuses. An API error refuses in CI, which has the token; the local
+ * preflight passes `skipUnreadableLabels` and warns and skips instead, as the
+ * closing route does, so an offline sandbox is not reddened (#4968 F2).
+ */
+export function lintReferencedBugLabels(
+	fullBody,
+	resolved,
+	title = "",
+	{ skipUnreadableLabels = false } = {},
+) {
+	if (resolved !== null) return [];
+	const { issues, unrecognised } = referencedOnly(fullBody, title);
+	if (unrecognised.length)
+		return [
+			`PR body "## Detection" cannot be judged: the reference ${unrecognised.join(", ")} is not an issue of this repository written as "#N", so its label cannot be read and the check refuses (#4968). Write each reference as "Refs #N".`,
+		];
+	if (issues.length === 0) return [];
+	const named = issues.map((number) => `#${number}`).join(", ");
+	if (skipUnreadableLabels) {
+		console.warn(
+			`::warning::PR body check could not read the label of ${named} (gh missing, unauthenticated, or failed), so the "## Detection" requirement for a referenced bug was skipped; CI reads it (#4968).`,
+		);
+		return [];
+	}
+	return [
+		`PR body "## Detection" cannot be judged: the label of ${named} could not be read (an API error), so the check cannot tell whether a detection lesson is owed and refuses (#4968). Retry once the label read works.`,
+	];
+}
+
+// The label readers the two transports share: `(number) => issue JSON`, or
+// null / a throw when the issue cannot be read.
+function apiIssueReader(fetchImpl) {
+	return async (number) => {
+		const response = await githubGet(`/issues/${number}`, fetchImpl);
+		return response.ok ? await response.json() : null;
+	};
+}
+
+function ghIssueReader(cwd, exec) {
+	return (number) => {
 		const raw = exec("gh", ["api", `repos/{owner}/{repo}/issues/${number}`], {
 			cwd,
 			encoding: "utf8",
@@ -4381,18 +5046,19 @@ export async function resolveBugClosingViaGh(
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		// gh output that is not JSON is unreadable label evidence, the same
-		// verdict a thrown exec already gets from anyIssueLabelledBug.
+		// verdict a thrown exec already gets from anyIssueLabelled.
 		try {
 			return JSON.parse(raw);
 		} catch {
 			return null;
 		}
-	});
+	};
 }
 
 // The one label reader both transports share: `readIssue(number)` returns the
-// issue JSON, or null / throws when it cannot be read.
-async function anyIssueLabelledBug(issues, readIssue) {
+// issue JSON, or null / throws when it cannot be read. `names` are the labels
+// that count (`DETECTION_BUG_LABELS`).
+async function anyIssueLabelled(issues, readIssue, names) {
 	for (const number of issues) {
 		let data;
 		try {
@@ -4403,8 +5069,8 @@ async function anyIssueLabelledBug(issues, readIssue) {
 		if (data === null) return null;
 		const labels = Array.isArray(data?.labels) ? data.labels : [];
 		if (
-			labels.some(
-				(label) => (typeof label === "string" ? label : label?.name) === "bug",
+			labels.some((label) =>
+				names.includes(typeof label === "string" ? label : label?.name),
 			)
 		)
 			return true;
@@ -4432,13 +5098,7 @@ function eventPayload() {
 	}
 }
 
-/**
- * The full live lint: resolve body and file list, then lint. The tri-state
- * from resolveTouchesTests is consumed HERE: only an affirmative true
- * requires the Test assessment section — null (fetch trouble) and false
- * (no tests/ files) both skip it, so a flaky fetch can never misfire the
- * check (#2124 review F2 pinned this consumption).
- */
+/** The full live lint: resolve the body and the diff, then lint. */
 export async function lintPullRequestEvent(
 	fetchImpl = globalThis.fetch,
 	event = eventPayload(),
@@ -4452,9 +5112,11 @@ export async function lintPullRequestEvent(
 	// Section readers get the cut text; the close-keyword and bug-label readers
 	// keep `fullBody`, because GitHub closes what the whole body names (#4778).
 	const fullBody = live.body;
+	// The title comes from the same live fetch as the body (#2083's seam), so a
+	// title edited after a replayed event is judged as it stands; the payload
+	// title stands in only when the live fetch fell back (#4976).
+	const title = live.title ?? pullRequest.title;
 	const body = authorText(fullBody);
-	const requireTestAssessment =
-		(await resolveTouchesTests(pullRequest, fetchImpl)) === true;
 	// #4288: a bug-closing PR owes a detection retrospective. The label read is
 	// best-effort; an unreadable label warns and skips the requirement.
 	let bugClosing = null;
@@ -4467,6 +5129,15 @@ export async function lintPullRequestEvent(
 		console.warn(
 			'::warning::PR body check could not read the closed issue label(s), so the "## Detection" section is not required (#4288).',
 		);
+	// #4968: a reference to a bug owes the same lesson. Unlike the closing
+	// read above, an unreadable reference refuses (`lintReferencedBugLabels`).
+	let bugReferenced = false;
+	if (bugClosing !== true)
+		try {
+			bugReferenced = await resolveBugReferenced(fullBody, fetchImpl, title);
+		} catch {
+			bugReferenced = null;
+		}
 	let diff = "";
 	try {
 		diff = diffImpl();
@@ -4475,8 +5146,7 @@ export async function lintPullRequestEvent(
 		throw new Error(`diff unavailable: ${reason}`);
 	}
 	const result = lintPrBody(body, {
-		requireTestAssessment,
-		bugClosing: bugClosing === true,
+		bugClosing: bugClosing === true || bugReferenced === true,
 		existsOnBase: baseFileReader(),
 		shapeCatalog: shapeCatalogReader(),
 		diff,
@@ -4484,8 +5154,13 @@ export async function lintPullRequestEvent(
 		// Existing open bodies were authored before #4280. Set PI_LENS_PROSE_GRACE=1
 		// for the transition job; local preflight remains blocking by default.
 		proseMode: process.env.PI_LENS_PROSE_GRACE === "1" ? "warn" : "block",
-		title: pullRequest.title,
+		title,
 	});
+	const unreadable = lintReferencedBugLabels(fullBody, bugReferenced, title);
+	if (unreadable.length) {
+		result.valid = false;
+		result.errors.push(...unreadable);
+	}
 	const classSweep = lintClassSweep(body, { diff });
 	if (classSweep.length) {
 		result.valid = false;
@@ -4607,11 +5282,11 @@ function hookAnchorsFromDiff(diff, map, options) {
 
 // `owner/repo` of the checkout's `origin`, or `undefined` when it has none or
 // it is not a GitHub URL. The local twin of GITHUB_REPOSITORY on the event path.
-function originRepository(cwd) {
+function originRepository(cwd, git) {
 	try {
 		return (
 			parseOwnerRepoFromGitRemote(
-				gitExecFileSync(["remote", "get-url", "origin"], {
+				git(["remote", "get-url", "origin"], {
 					cwd,
 					encoding: "utf8",
 					stdio: ["ignore", "pipe", "ignore"],
@@ -4634,7 +5309,7 @@ function originRepository(cwd) {
  */
 export function lintWorkflowRunEvidence(
 	body,
-	{ diff, cwd = process.cwd(), repository } = {},
+	{ diff, cwd = process.cwd(), repository, git = gitExecFileSync } = {},
 ) {
 	if (!diff) return [];
 	const unreadable = [];
@@ -4643,17 +5318,17 @@ export function lintWorkflowRunEvidence(
 	// the run-evidence rule; a base that cannot be resolved or read (a shallow
 	// checkout) answers "" instead, which fails closed: not added, and not a
 	// comment-only edit.
-	const mergeBase = resolvePrBase(cwd);
-	const existsOnBase = baseFileReader(cwd);
+	const mergeBase = resolvePrBase(cwd, git);
+	const existsOnBase = baseFileReader(cwd, git);
 	const errors = evaluateWorkflowRunEvidence({
 		changedFiles: parseChangedFiles(diff),
 		body,
-		repository: repository ?? originRepository(cwd),
+		repository: repository ?? originRepository(cwd, git),
 		readBaseWorkflow: (file) => {
 			if (!mergeBase) return "";
 			if (existsOnBase(file) === false) return null;
 			try {
-				return gitExecFileSync(["show", `${mergeBase}:${file}`], {
+				return git(["show", `${mergeBase}:${file}`], {
 					cwd,
 					encoding: "utf8",
 				});
@@ -4674,29 +5349,6 @@ export function lintWorkflowRunEvidence(
 		},
 	});
 	return [...errors, ...unreadable];
-}
-
-export function localTouchesTests(cwd = process.cwd(), git = gitExecFileSync) {
-	let names;
-	try {
-		names = git(["diff", "--name-only", "origin/master...HEAD"], {
-			cwd,
-			encoding: "utf8",
-		});
-	} catch {
-		try {
-			names = git(["diff", "--name-only", "HEAD~1"], {
-				cwd,
-				encoding: "utf8",
-			});
-		} catch {
-			// #2904 round 2 recurrence: shallow or single-commit repositories may
-			// have neither range; require assessment because assuming no test changes
-			// would weaken the lint.
-			return true;
-		}
-	}
-	return names.split(/\r?\n/).some((name) => name.startsWith("tests/"));
 }
 
 /**
@@ -4751,11 +5403,21 @@ export function lintLocalPrBody(
 		console.warn(
 			'::warning::PR body check could not read the closed issue label (gh missing, unauthenticated, or failed), so the "## Detection" requirement check was skipped (#4288).',
 		);
+	// #4968: a reference to a bug owes the lesson too, and an unreadable
+	// reference refuses. A closing bug already owes it, so nothing is read.
+	let bugReferenced = false;
+	if (bugClosing !== true) {
+		bugReferenced = options.bugReferenced;
+		if (bugReferenced === undefined)
+			bugReferenced =
+				typeof options.resolveBugReferenced === "function"
+					? options.resolveBugReferenced(fullBody, options.title)
+					: null;
+	}
 	const existsOnBase = baseFileReader(cwd, git);
 	const shapeCatalog = shapeCatalogReader(cwd, git);
 	const result = lintPrBody(body, {
-		requireTestAssessment: localTouchesTests(cwd, git),
-		bugClosing: bugClosing === true,
+		bugClosing: bugClosing === true || bugReferenced === true,
 		existsOnBase,
 		shapeCatalog,
 		diff,
@@ -4763,13 +5425,14 @@ export function lintLocalPrBody(
 		workingTree: true,
 		ref: options.ref,
 		headFiles: options.headFiles,
+		git,
 		proseMode: options.proseMode,
 		title: options.title,
 	});
 	// #4288: a present section is validated whatever the label, so a prose-form
 	// answer reds here instead of at CI. `lintPrBody` already did it for a
 	// resolved bug.
-	if (bugClosing !== true) {
+	if (bugClosing !== true && bugReferenced !== true) {
 		const detection = lintDetectionSection(body, {
 			ignoreUnfilled: true,
 			existsOnBase,
@@ -4777,6 +5440,16 @@ export function lintLocalPrBody(
 		});
 		result.errors.push(...detection);
 		if (detection.length) result.valid = false;
+	}
+	const unreadable = lintReferencedBugLabels(
+		fullBody,
+		bugReferenced,
+		options.title,
+		{ skipUnreadableLabels: true },
+	);
+	if (unreadable.length) {
+		result.valid = false;
+		result.errors.push(...unreadable);
 	}
 	const classSweep = lintClassSweep(body, { diff });
 	if (classSweep.length) {
@@ -4797,7 +5470,7 @@ export function lintLocalPrBody(
 	result.errors.push(...coverage.errors);
 	if (coverage.errors.length) result.valid = false;
 	for (const advisory of coverage.advisories) console.warn(advisory);
-	const workflowEvidence = lintWorkflowRunEvidence(body, { diff, cwd });
+	const workflowEvidence = lintWorkflowRunEvidence(body, { diff, cwd, git });
 	result.errors.push(...workflowEvidence);
 	if (workflowEvidence.length) result.valid = false;
 	const closeSyntax = lintCloseKeywords(fullBody);
@@ -4821,7 +5494,7 @@ export function lintLocalPrBody(
 	return result;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+if (isMainModule(import.meta.url)) {
 	// Local contract: --lint-local <body-file> remains the preflight form from
 	// #2796. Optional --title text and --ref revision add the CI close-keyword
 	// and head-tree citation checks to that same local entry point.
@@ -4870,11 +5543,22 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
 		// --title is accepted for preflight parity. Title validation belongs to
 		// check-pr-title.mjs, but preflight passes both local input files.
 		const localBody = readFileSync(localBodyPath, "utf8");
+		const bugClosing = await resolveBugClosingViaGh(localBody);
 		const result = lintLocalPrBody(localBody, process.cwd(), gitExecFileSync, {
 			title,
 			ref,
 			proseMode,
-			bugClosing: await resolveBugClosingViaGh(localBody),
+			bugClosing,
+			// #4968: a closing bug already owes the section; skip the extra reads.
+			bugReferenced:
+				bugClosing === true
+					? false
+					: await resolveBugReferencedViaGh(
+							localBody,
+							process.cwd(),
+							execFileSync,
+							title,
+						),
 		});
 		for (const error of result.errors) console.error(error);
 		process.exitCode = result.valid ? 0 : 1;

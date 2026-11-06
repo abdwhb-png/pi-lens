@@ -6,7 +6,11 @@
  */
 
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import * as path from "node:path";
+import { stripSource } from "../support/sweep-kit.js";
 import { FactStore } from "../../clients/dispatch/fact-store.js";
+import { toPosix } from "../../clients/path-utils.js";
 import {
 	PROJECT_SNAPSHOT_VERSION,
 	loadProjectSnapshot,
@@ -20,13 +24,59 @@ import {
 } from "../../clients/review-graph/builder.js";
 import {
 	buildWordIndex,
+	collectWordIndexDocs,
 	getWordIndexBuildStatus,
 	serializeWordIndex,
 	triggerBackgroundWordIndexBuild,
 	_resetWordIndexBuildGuardForTests,
 } from "../../clients/word-index.js";
-import { createSymbolSearchTool } from "../../tools/symbol-search.js";
+import {
+	renderCompactSymbolSearch,
+	symbolSearch,
+	type SymbolSearchResult,
+} from "../../clients/lens-engine.js";
+import {
+	SYMBOL_SEARCH_DESCRIPTION,
+	createSymbolSearchTool,
+} from "../../tools/symbol-search.js";
 import { createTempFile, setupTestEnvironment } from "../clients/test-utils.js";
+
+/** One rendered ranked row: `  1. <path>[ <line>] (score ...)`. */
+const ROW = /^ {2}\d+\. (.*) \((score .*)\)$/;
+
+function rows(
+	text: string,
+): Array<{ file: string; line?: number; detail: string }> {
+	return text.split("\n").flatMap((line) => {
+		const match = ROW.exec(line);
+		if (match === null) return [];
+		// The line number sits before the detail parenthetical; a path that ends
+		// in digits is not a row number (the repo's fixtures never end that way).
+		const pre = match[1];
+		const cut = pre.lastIndexOf(" ");
+		const tail = cut === -1 ? "" : pre.slice(cut + 1);
+		const numbered = /^\d+$/.test(tail);
+		return [
+			{
+				file: toPosix(numbered ? pre.slice(0, cut) : pre),
+				...(numbered ? { line: Number(tail) } : {}),
+				detail: match[2],
+			},
+		];
+	});
+}
+
+function rankedFiles(text: string): string[] {
+	return rows(text).map((row) => row.file);
+}
+
+/** #5104: the ranked table is the whole answer on both surfaces — no JSON tail
+ * on pi, no fenced block on MCP. A brace or a fence means a duplicate came
+ * back, and a reader that stops at the table silently accepts it. */
+function expectOneTable(text: string): void {
+	expect(text).not.toContain("{");
+	expect(text).not.toContain("```");
+}
 
 afterEach(() => {
 	_resetWordIndexBuildGuardForTests();
@@ -54,6 +104,37 @@ function warmWordIndexSnapshot(
 }
 
 describe("symbol_search tool", () => {
+	it("describes the compound-suffix ext: contract, and the tool owns the sentence (#5136)", () => {
+		const tool = createSymbolSearchTool(() => "/tmp");
+		expect(tool.description).toBe(SYMBOL_SEARCH_DESCRIPTION);
+		expect(tool.description).toContain("ext:test.ts");
+		expect(tool.description).toMatch(/path suffix/i);
+	});
+
+	it("the MCP pilens_symbol_search description is the imported pi constant (#5136)", () => {
+		const serverSource = readFileSync(
+			new URL("../../mcp/server.ts", import.meta.url),
+			"utf8",
+		);
+		// Comment-blanked code, string contents kept: the specifier is itself a
+		// string literal. A commented-out import or call must not pass (Greptile,
+		// #5282: the raw-source regex accepted `// import { ... }`).
+		const serverCode = stripSource(serverSource, { strings: "keep" });
+		expect(serverCode).toMatch(
+			/import \{[^}]*SYMBOL_SEARCH_DESCRIPTION[^}]*\} from "\.\.\/tools\/symbol-search\.js";/,
+		);
+		// The MCP description is the pi constant routed through the MCP name
+		// translator, so it names pilens_* tools (#5136 F1).
+		expect(serverCode).toMatch(
+			/translateGuidanceToolNames\(\s*SYMBOL_SEARCH_DESCRIPTION\s*,\s*"mcp"\s*\)/,
+		);
+		// No second literal of the sentence: the MCP surface resolves to the same
+		// exported constant the pi tool uses, so the two cannot drift.
+		expect(serverSource).not.toContain(
+			"Find relevant files by ranked identifier search.",
+		);
+	});
+
 	it("zero-hit output warns when the index is capped and exposes coverage (#928)", async () => {
 		const env = setupTestEnvironment("pi-lens-symbolsearch-capped-");
 		try {
@@ -73,6 +154,7 @@ describe("symbol_search tool", () => {
 			expect(String(result.content[0]?.text)).toContain(
 				"Index covers 1 files (capped — results may be incomplete).",
 			);
+			expectOneTable(String(result.content[0]?.text));
 			expect(result.details).toMatchObject({
 				available: true,
 				count: 0,
@@ -166,6 +248,56 @@ describe("symbol_search tool", () => {
 		}
 	}, 10_000);
 
+	it("an index built by the real walk holds named files, so lang:groovy returns a Jenkinsfile and build.gradle (#5273)", async () => {
+		// Recurrence: the source walk admitted by extension only, so a file whose
+		// kind comes from its name never entered the index and #5238's lang:groovy
+		// filter had nothing to return for it.
+		const env = setupTestEnvironment("pi-lens-symbolsearch-named-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"Jenkinsfile",
+				"def deployStage() { echo 'deploy' }\n",
+			);
+			createTempFile(
+				env.tmpDir,
+				"build.gradle",
+				"task packageArtifacts { doLast { println 'pack' } }\n",
+			);
+			createTempFile(
+				env.tmpDir,
+				"src/deploy.ts",
+				"export function deployStage() { return 1; }\n",
+			);
+			// The index comes from the real walk (collectWordIndexDocs), then the
+			// real tool answers from it; no build to wait on.
+			warmWordIndexSnapshot(env.tmpDir, await collectWordIndexDocs(env.tmpDir));
+			const tool = createSymbolSearchTool(() => env.tmpDir);
+			const inline = await tool.execute(
+				"2",
+				{ query: "lang:groovy deploy stage" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(rankedFiles(String(inline.content[0]?.text))).toEqual([
+				"Jenkinsfile",
+			]);
+			const param = await tool.execute(
+				"3",
+				{ query: "package artifacts", lang: "groovy" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(rankedFiles(String(param.content[0]?.text))).toEqual([
+				"build.gradle",
+			]);
+		} finally {
+			env.cleanup();
+		}
+	}, 10_000);
+
 	it("cold path exposes the last build failure instead of claiming only that it is building (#926)", async () => {
 		const env = setupTestEnvironment("pi-lens-symbolsearch-failed-");
 		const previousDataDir = process.env.PILENS_DATA_DIR;
@@ -207,7 +339,7 @@ describe("symbol_search tool", () => {
 		}
 	}, 10_000);
 
-	it("warm path: returns ranked results with startLine/endLine, no per-hit read block, path relative to cwd", async () => {
+	it("warm path: renders one ranked row per hit, line number included, path relative to cwd", async () => {
 		const env = setupTestEnvironment("pi-lens-symbolsearch-warm-");
 		try {
 			const authFile = createTempFile(
@@ -245,29 +377,12 @@ describe("symbol_search tool", () => {
 			expect(result.details).toMatchObject({ available: true, count: 1 });
 
 			const text = String(result.content[0]?.text);
-			const jsonStart = text.indexOf("{");
-			const payload = JSON.parse(text.slice(jsonStart)) as {
-				available: boolean;
-				query: string;
-				results: Array<{
-					file: string;
-					score: number;
-					hits: number;
-					startLine: number;
-					endLine: number;
-					read?: unknown;
-					lines?: unknown;
-				}>;
-			};
-			expect(payload.available).toBe(true);
-			expect(payload.results).toHaveLength(1);
-			const hit = payload.results[0];
-			expect(hit.file.replace(/\\/g, "/")).toBe("src/auth.ts"); // relative to cwd, not repeated/absolute
-			expect(hit.startLine).toBeGreaterThan(0);
-			expect(hit.endLine).toBe(hit.startLine); // single-line span (no fabricated full-file range)
-			// #517 conformity: no per-hit `read` block, no raw `lines[]` array on the wire.
-			expect(hit.read).toBeUndefined();
-			expect(hit.lines).toBeUndefined();
+			expectOneTable(text);
+			const ranked = rows(text);
+			expect(ranked).toHaveLength(1);
+			expect(ranked[0]?.file).toBe("src/auth.ts"); // relative to cwd, not repeated/absolute
+			expect(ranked[0]?.detail).toMatch(/^score \d+\.\d{2}, \d+ hit\(s\)/);
+			expect(ranked[0]?.line).toBeGreaterThan(0);
 		} finally {
 			env.cleanup();
 		}
@@ -301,6 +416,9 @@ describe("symbol_search tool", () => {
 			);
 			expect(result.isError).toBeFalsy();
 			expect(result.details).toMatchObject({ available: true, count: 0 });
+			expect(String(result.content[0]?.text)).toContain(
+				'No files matched "kubernetes helm chart".',
+			);
 		} finally {
 			env.cleanup();
 		}
@@ -346,12 +464,10 @@ describe("symbol_search tool", () => {
 					{ cwd: env.tmpDir },
 				);
 				const text = String(result.content[0]?.text);
-				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
-					results: Array<{ file: string }>;
-				};
-				expect(
-					payload.results.map((r) => r.file.replace(/\\/g, "/")).sort(),
-				).toEqual(["scripts/authenticate.py", "src/auth/login.ts"].sort());
+				expectOneTable(text);
+				expect(rankedFiles(text).sort()).toEqual(
+					["scripts/authenticate.py", "src/auth/login.ts"].sort(),
+				);
 			} finally {
 				env.cleanup();
 			}
@@ -370,13 +486,8 @@ describe("symbol_search tool", () => {
 					{ cwd: env.tmpDir },
 				);
 				const text = String(result.content[0]?.text);
-				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
-					results: Array<{ file: string }>;
-				};
-				expect(payload.results).toHaveLength(1);
-				expect(payload.results[0].file.replace(/\\/g, "/")).toBe(
-					"scripts/authenticate.py",
-				);
+				expectOneTable(text);
+				expect(rankedFiles(text)).toEqual(["scripts/authenticate.py"]);
 			} finally {
 				env.cleanup();
 			}
@@ -395,23 +506,31 @@ describe("symbol_search tool", () => {
 					{ cwd: env.tmpDir },
 				);
 				const text = String(result.content[0]?.text);
-				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
-					results: Array<{ file: string }>;
-				};
-				expect(payload.results).toHaveLength(1);
-				expect(payload.results[0].file.replace(/\\/g, "/")).toBe(
-					"src/auth/login.ts",
+				expectOneTable(text);
+				expect(rankedFiles(text)).toEqual(["src/auth/login.ts"]);
+				// #5013 F3: the same glob spelled with a backslash scopes to the same
+				// files, because the pattern is folded through `toPosix` before
+				// minimatch sees it. An unfolded `src\auth` matches nothing, and the
+				// tool then reports no results at all (no payload to parse).
+				const backslash = await tool.execute(
+					"1",
+					{ query: "authenticate user", paths: ["src\\auth"] },
+					undefined,
+					null,
+					{ cwd: env.tmpDir },
 				);
+				expect(rankedFiles(String(backslash.content[0]?.text))).toEqual([
+					"src/auth/login.ts",
+				]);
 			} finally {
 				env.cleanup();
 			}
 		});
 
-		it("attaches a suggestedNext module_report hint per hit", async () => {
-			const env = setupTestEnvironment("pi-lens-symbolsearch-suggestednext-");
+		it("renders one table with no per-hit JSON hint (#5104)", async () => {
+			const env = setupTestEnvironment("pi-lens-symbolsearch-onetable-");
 			try {
-				const { tsFile } = makeFixture(env);
-				void tsFile;
+				makeFixture(env);
 				const tool = createSymbolSearchTool(() => env.tmpDir);
 				const result = await tool.execute(
 					"1",
@@ -421,28 +540,155 @@ describe("symbol_search tool", () => {
 					{ cwd: env.tmpDir },
 				);
 				const text = String(result.content[0]?.text);
-				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
-					results: Array<{
-						file: string;
-						suggestedNext?: { tool: string; path: string };
-					}>;
+				expectOneTable(text);
+				expect(rankedFiles(text).sort()).toEqual(
+					["scripts/authenticate.py", "src/auth/login.ts"].sort(),
+				);
+				// The footer names the TOP-ranked hit, through the pi tool spelling.
+				expect(text).toContain(`Next: module_report ${rankedFiles(text)[0]}`);
+				expect(text).not.toContain("pilens_module_report");
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// #5038: the parameter says "same shape/semantics as ast_grep_search's
+		// `paths`", but the matcher only ever saw the root-relative spelling, so
+		// `./src` and an absolute directory returned no hits — a zero-hit answer
+		// that reads as "no match". `limit` had the sibling problem against
+		// `project_report`'s `max(1, floor)`.
+		it("scopes `src`, `./src` and the absolute directory to the same hits (#5038)", async () => {
+			const env = setupTestEnvironment("pi-lens-symbolsearch-5038-");
+			try {
+				makeFixture(env);
+				const tool = createSymbolSearchTool(() => env.tmpDir);
+				const hitsFor = async (paths: string[]) => {
+					const result = await tool.execute(
+						"1",
+						{ query: "authenticate user", paths },
+						undefined,
+						null,
+						{ cwd: env.tmpDir },
+					);
+					return rankedFiles(String(result.content[0]?.text));
 				};
-				expect(payload.results.length).toBeGreaterThan(0);
-				for (const hit of payload.results) {
-					expect(hit.suggestedNext).toEqual({
-						tool: "module_report",
-						path: hit.file,
-					});
+				const expected = ["src/auth/login.ts"];
+				expect(await hitsFor(["src"]), "src").toEqual(expected);
+				expect(await hitsFor(["./src"]), "./src").toEqual(expected);
+				expect(
+					await hitsFor([path.join(env.tmpDir, "src")]),
+					"absolute",
+				).toEqual(expected);
+				// #771 asked for globs, so the resolved spelling stays a pattern.
+				expect(await hitsFor(["src/**/*.ts"]), "glob").toEqual(expected);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		// RECURRENCE GUARDED (#5047 r1 F1): the reader hands the engine an ABSOLUTE
+		// entry, and the engine matched it as a glob pattern, so a workspace whose
+		// own directory name holds glob syntax (`app[1]`, `app{a,b}`) lost every
+		// scope: `paths: ["src"]` answered "No files matched" while the same tree
+		// under a plain name answered one hit. The workspace prefix is a literal;
+		// only what the caller wrote after it is a pattern.
+		for (const workspaceName of [
+			"app[1]",
+			"app{a,b}",
+			"plain",
+			"proj\u00A0a",
+		]) {
+			it(`scopes \`paths\` the same in a workspace named ${workspaceName} (#5047 F1)`, async () => {
+				const env = setupTestEnvironment("pi-lens-symbolsearch-globmeta-");
+				try {
+					const workspace = path.join(env.tmpDir, workspaceName);
+					makeFixture({ tmpDir: workspace });
+					const tool = createSymbolSearchTool(() => workspace);
+					const hitsFor = async (paths: string[]) => {
+						const result = await tool.execute(
+							"1",
+							{ query: "authenticate user", paths },
+							undefined,
+							null,
+							{ cwd: workspace },
+						);
+						const text = String(result.content[0]?.text);
+						return rankedFiles(text);
+					};
+					const expected = ["src/auth/login.ts"];
+					expect(await hitsFor(["src"]), "src").toEqual(expected);
+					expect(await hitsFor(["./src"]), "./src").toEqual(expected);
+					// An absolute entry the CALLER spells with a no-break space is folded
+					// by the host resolver on purpose (host parity, #4576), so only the
+					// other names carry this cell.
+					if (!workspaceName.includes("\u00A0"))
+						expect(
+							await hitsFor([path.join(workspace, "src")]),
+							"absolute",
+						).toEqual(expected);
+					// The caller's own glob after the literal prefix is still a glob.
+					expect(await hitsFor(["src/**/*.ts"]), "glob").toEqual(expected);
+					expect(await hitsFor(["scripts"]), "other dir").toEqual([
+						"scripts/authenticate.py",
+					]);
+					// The workspace itself scopes to every hit, not to none: the entry
+					// relativizes to "" and must read as the whole workspace.
+					expect((await hitsFor(["."])).sort(), "cwd").toEqual(
+						["scripts/authenticate.py", "src/auth/login.ts"].sort(),
+					);
+					// A directory that holds no hit still scopes everything out: the
+					// fix must not turn the literal prefix into "match everything".
+					expect(await hitsFor(["docs"]), "empty dir").toEqual([]);
+				} finally {
+					env.cleanup();
 				}
+			});
+		}
+
+		// RECURRENCE GUARDED (#5047 r1 F5): the engine kept a fifth copy of the
+		// blank-entry rule, so a blank entry reaching `symbolSearch` directly was
+		// dropped and the call widened to the whole index. The reader owns the rule;
+		// the engine takes its entries as admitted, so a blank one matches nothing.
+		it("does not widen to the whole index on a blank entry at the engine seam (#5047 F5)", async () => {
+			const env = setupTestEnvironment("pi-lens-symbolsearch-blank-engine-");
+			try {
+				makeFixture(env);
+				const hitsFor = async (paths: string[]) =>
+					(
+						await symbolSearch("authenticate user", env.tmpDir, undefined, {
+							paths,
+						})
+					).results.map((hit) => toPosix(path.relative(env.tmpDir, hit.file)));
+				expect(await hitsFor(["src"])).toEqual(["src/auth/login.ts"]);
+				expect(await hitsFor(["  "])).toEqual([]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("clamps `limit` to max(1, floor) like project_report (#5038)", async () => {
+			const env = setupTestEnvironment("pi-lens-symbolsearch-5038-limit-");
+			try {
+				makeFixture(env);
+				const tool = createSymbolSearchTool(() => env.tmpDir);
+				const countFor = async (limit: number) => {
+					const result = await tool.execute(
+						"1",
+						{ query: "authenticate user", limit },
+						undefined,
+						null,
+						{ cwd: env.tmpDir },
+					);
+					return (result.details as { count?: number } | undefined)?.count;
+				};
+				expect(await countFor(0), "limit 0").toBe(1);
+				expect(await countFor(-2), "limit -2").toBe(1);
+				expect(await countFor(1.8), "limit 1.8").toBe(1);
 			} finally {
 				env.cleanup();
 			}
 		});
 	});
-
-	// #1450: lang:/file:/ext: prefix filters (+ `-` negation) embedded in the
-	// query STRING itself — distinct from the structured `paths`/`lang` params
-	// tested above (#771), and exercised through the same tool entry point.
 	describe("inline query prefix filters (#1450)", () => {
 		function makeFixture(env: { tmpDir: string }) {
 			const tsFile = createTempFile(
@@ -481,13 +727,8 @@ describe("symbol_search tool", () => {
 					{ cwd: env.tmpDir },
 				);
 				const text = String(result.content[0]?.text);
-				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
-					results: Array<{ file: string }>;
-				};
-				expect(payload.results).toHaveLength(1);
-				expect(payload.results[0].file.replace(/\\/g, "/")).toBe(
-					"scripts/authenticate.py",
-				);
+				expectOneTable(text);
+				expect(rankedFiles(text)).toEqual(["scripts/authenticate.py"]);
 			} finally {
 				env.cleanup();
 			}
@@ -506,13 +747,52 @@ describe("symbol_search tool", () => {
 					{ cwd: env.tmpDir },
 				);
 				const text = String(result.content[0]?.text);
-				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
-					results: Array<{ file: string }>;
-				};
-				expect(payload.results).toHaveLength(1);
-				expect(payload.results[0].file.replace(/\\/g, "/")).toBe(
-					"src/auth/login.ts",
+				expectOneTable(text);
+				expect(rankedFiles(text)).toEqual(["src/auth/login.ts"]);
+			} finally {
+				env.cleanup();
+			}
+		});
+
+		it("ext: matches a compound suffix end to end, and -ext: subtracts it (#5136)", async () => {
+			const env = setupTestEnvironment("pi-lens-symbolsearch-queryext-");
+			try {
+				const content = "export function authenticateUser(id) { return id; }";
+				const testFile = createTempFile(
+					env.tmpDir,
+					"src/auth/login.test.ts",
+					content,
 				);
+				const sourceFile = createTempFile(
+					env.tmpDir,
+					"src/auth/login.ts",
+					content,
+				);
+				warmWordIndexSnapshot(env.tmpDir, [
+					{ path: testFile, content },
+					{ path: sourceFile, content },
+				]);
+				const tool = createSymbolSearchTool(() => env.tmpDir);
+				const positive = await tool.execute(
+					"1",
+					{ query: "ext:test.ts authenticate user" },
+					undefined,
+					null,
+					{ cwd: env.tmpDir },
+				);
+				expect(rankedFiles(String(positive.content[0]?.text))).toEqual([
+					"src/auth/login.test.ts",
+				]);
+				const negative = await tool.execute(
+					"1",
+					{ query: "-ext:test.ts authenticate user" },
+					undefined,
+					null,
+					{ cwd: env.tmpDir },
+				);
+				expect(rankedFiles(String(negative.content[0]?.text))).toEqual([
+					"src/auth/login.ts",
+				]);
 			} finally {
 				env.cleanup();
 			}
@@ -560,12 +840,10 @@ describe("symbol_search tool", () => {
 					{ cwd: env.tmpDir },
 				);
 				const text = String(result.content[0]?.text);
-				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
-					results: Array<{ file: string }>;
-				};
-				expect(
-					payload.results.map((r) => r.file.replace(/\\/g, "/")).sort(),
-				).toEqual(["scripts/authenticate.py", "src/auth/login.ts"].sort());
+				expectOneTable(text);
+				expect(rankedFiles(text).sort()).toEqual(
+					["scripts/authenticate.py", "src/auth/login.ts"].sort(),
+				);
 			} finally {
 				env.cleanup();
 			}
@@ -601,12 +879,11 @@ describe("symbol_search tool", () => {
 					{ cwd: env.tmpDir },
 				);
 				const text = String(result.content[0]?.text);
-				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
-					results: Array<{ annotations?: unknown }>;
-				};
-				expect(payload.results.length).toBeGreaterThan(0);
-				for (const hit of payload.results) {
-					expect(hit.annotations).toBeUndefined();
+				expectOneTable(text);
+				const ranked = rows(text);
+				expect(ranked.length).toBeGreaterThan(0);
+				for (const hit of ranked) {
+					expect(hit.detail).not.toMatch(/fanIn|complexity/);
 				}
 				// The read-only accessor must not have built/cached a graph as a
 				// side effect of this call.
@@ -656,18 +933,116 @@ describe("symbol_search tool", () => {
 					{ cwd: env.tmpDir },
 				);
 				const text = String(result.content[0]?.text);
-				const payload = JSON.parse(text.slice(text.indexOf("{"))) as {
-					results: Array<{
-						annotations?: { fanIn: number; complexity?: number };
-					}>;
-				};
-				expect(payload.results.length).toBeGreaterThan(0);
-				const hit = payload.results[0];
-				expect(hit.annotations).toBeDefined();
-				expect(typeof hit.annotations?.fanIn).toBe("number");
+				expectOneTable(text);
+				const ranked = rows(text);
+				expect(ranked.length).toBeGreaterThan(0);
+				expect(ranked[0]?.detail).toMatch(/, fanIn \d+/);
 			} finally {
 				env.cleanup();
 			}
+		});
+	});
+
+	// #5104 commit 2: one row shape, and a footer that names the top-ranked hit.
+	// The renderer is driven directly so the annotations are exact — the review
+	// graph annotates every hit it sees, so a tool-level fixture cannot produce
+	// "one annotated hit".
+	describe("renderCompactSymbolSearch row and footer shape (#5104)", () => {
+		const cwd = path.resolve("pi-lens-symbolsearch-golden");
+		const hit = (
+			relPath: string,
+			line: number,
+			score: number,
+			hits: number,
+			annotations?: { fanIn: number; complexity?: number },
+		) => ({
+			file: path.join(cwd, ...relPath.split("/")),
+			score,
+			hits,
+			startLine: line,
+			endLine: line,
+			...(annotations ? { annotations } : {}),
+		});
+		const result = (
+			results: ReturnType<typeof hit>[],
+			truncated = false,
+		): SymbolSearchResult => ({
+			available: true,
+			query: "authenticate user",
+			results,
+			coverage: { files: 12, truncated },
+		});
+		const first = path.relative(
+			cwd,
+			hit("src/auth/login.ts", 12, 0.82, 3).file,
+		);
+		const second = path.relative(
+			cwd,
+			hit("scripts/authenticate.py", 3, 0.51, 2).file,
+		);
+
+		it("renders the exact 2-hit golden with one annotated hit", () => {
+			const text = renderCompactSymbolSearch(
+				result([
+					hit("src/auth/login.ts", 12, 0.82, 3, { fanIn: 4, complexity: 7 }),
+					hit("scripts/authenticate.py", 3, 0.51, 2),
+				]),
+				{ cwd },
+			);
+			expect(text).toBe(
+				[
+					'Top 2 file(s) for "authenticate user":',
+					`  1. ${first} 12 (score 0.82, 3 hit(s), fanIn 4, complexity 7)`,
+					`  2. ${second} 3 (score 0.51, 2 hit(s))`,
+					"",
+					"Index covers 12 files.",
+					`Next: module_report ${first}`,
+				].join("\n"),
+			);
+		});
+
+		it("names the adapter's own outline tool in the next-step line", () => {
+			const results = [
+				hit("src/auth/login.ts", 12, 0.82, 3),
+				hit("scripts/authenticate.py", 3, 0.51, 2),
+			];
+			const pi = renderCompactSymbolSearch(result(results), { cwd });
+			const mcp = renderCompactSymbolSearch(result(results), {
+				cwd,
+				reportTool: "pilens_module_report",
+			});
+			expect(pi).toContain(`Next: module_report ${first}`);
+			expect(mcp).toContain(`Next: pilens_module_report ${first}`);
+			expect(mcp).not.toMatch(/^Next: module_report /m);
+		});
+
+		it("renders fanIn 0, which means no known importers", () => {
+			const text = renderCompactSymbolSearch(
+				result([hit("src/auth/login.ts", 12, 0.5, 1, { fanIn: 0 })]),
+				{ cwd },
+			);
+			expect(text).toContain("(score 0.50, 1 hit(s), fanIn 0)");
+		});
+
+		it("renders a complexity of 0 rather than dropping a present annotation", () => {
+			const text = renderCompactSymbolSearch(
+				result([
+					hit("src/auth/login.ts", 12, 0.5, 1, { fanIn: 2, complexity: 0 }),
+				]),
+				{ cwd },
+			);
+			expect(text).toContain("(score 0.50, 1 hit(s), fanIn 2, complexity 0)");
+		});
+
+		it("prints coverage before the next step, and no next step on an empty answer", () => {
+			const capped = renderCompactSymbolSearch(result([], true), { cwd });
+			expect(capped).toBe(
+				[
+					'No files matched "authenticate user".',
+					"",
+					"Index covers 12 files (capped — results may be incomplete).",
+				].join("\n"),
+			);
 		});
 	});
 });

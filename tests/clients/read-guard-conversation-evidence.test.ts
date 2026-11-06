@@ -10,6 +10,7 @@
  * sleeps. Every write gets a fresh, strictly increasing mtime so FileTime sees
  * it; fixtures start with an mtime older than any guard.
  */
+import { CHECKED_BY_FIXTURE } from "../support/dispatch-verdict.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createReadToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -29,6 +30,7 @@ import {
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
 import { computeHashlineAnchors } from "../../clients/hashline-anchor.js";
+import { createFileTime } from "../../clients/file-time.js";
 import { lineContentHash } from "../../clients/read-guard.js";
 import { recordIOEntry } from "../../clients/io-bridge.js";
 import {
@@ -95,6 +97,7 @@ const CLEAN_DISPATCH = {
 	resolvedCount: 0,
 	output: "",
 	blockerOutput: "",
+	verdict: CHECKED_BY_FIXTURE,
 	hasBlockers: false,
 };
 
@@ -167,7 +170,6 @@ function resultDeps(
 			isPythonFile: () => false,
 			ensureAvailable: async () => false,
 		},
-		metricsClient: {},
 		resetLSPService: () => {},
 		readGuard: runtime.readGuard,
 		agentBehaviorRecord: () => (extra.afterPipeline ? ["warning"] : []),
@@ -2886,8 +2888,9 @@ describe("#3525: FileTime moves only over bytes the conversation accounts for", 
 	});
 
 	/**
-	 * An oldText batch whose second edit does not resolve: pi-lens applies the
-	 * first itself and refuses the batch (#2402's partial apply).
+	 * An oldText batch whose second edit does not resolve (#2402's partial
+	 * apply): tool_call rewrites it to the first edit (#5120), the host applies
+	 * the executed input, and the edit's tool_result reports the partial apply.
 	 */
 	const partialApply = async (
 		runtime: RuntimeCoordinator,
@@ -2896,7 +2899,10 @@ describe("#3525: FileTime moves only over bytes the conversation accounts for", 
 		newText: string,
 	) => {
 		const toolCallId = `partial-${++seq}`;
-		const input = {
+		const input: {
+			path: string;
+			edits: Array<{ oldText: string; newText: string }>;
+		} = {
 			path: file,
 			edits: [
 				{ oldText, newText },
@@ -2908,8 +2914,19 @@ describe("#3525: FileTime moves only over bytes the conversation accounts for", 
 				callDeps(runtime, { toolName: "edit", toolCallId, input }),
 			),
 		)) as { block?: boolean; reason?: string } | undefined;
-		expect(verdict?.reason).toContain("PARTIAL APPLY — 1 edit committed");
-		expect(verdict?.reason).not.toContain("Post-edit analysis failed");
+		expect(verdict).toBeUndefined();
+		let text = fs.readFileSync(file, "utf8");
+		for (const edit of input.edits)
+			text = text.replace(edit.oldText, edit.newText);
+		writeNow(file, text);
+		const result = await handleToolResult(
+			resultDeps(runtime, { toolName: "edit", toolCallId, input, content: [] }),
+		);
+		const reported = (result?.content ?? [])
+			.map((part) => part.text)
+			.join("\n");
+		expect(reported).toContain("PARTIAL APPLY — 1 edit committed");
+		expect(reported).not.toContain("Post-edit analysis failed");
 	};
 
 	// #3785 review r1 F2: the partial apply reached tool_result with no
@@ -3254,6 +3271,83 @@ describe("#3962: a native re-read supersedes a stale bridge binding", () => {
 			expect(edit.blocked).toBe(true);
 			expect(edit.reason).toContain("content no longer matches");
 		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+describe("#4942 r7: a primary reset keeps a live secondary's in-flight read stamp", () => {
+	it("blocks an edit on a line another writer changed while the secondary's read was in flight across the primary's reset", async () => {
+		// RECURRENCE GUARDED: #4955 review F13 (CodeRabbit PRRT_kwDORt8rec6xWL2f,
+		// AGENTS shape 46: a bound must not drop state a live reader still
+		// needs). resetForSession released every dropped secondary guard's
+		// FileTime bucket. A secondary's read whose tool_call stamped the file
+		// before the reset and whose tool_result came after it then found no
+		// stamp, so diskMovedSinceStamp read false after an external write and
+		// the result recorded the racer's bytes as read.
+		const env = setupTestEnvironment("rg-4942-r7-reset-inflight-");
+		try {
+			const file = fixture(env.tmpDir, "a.ts", `${lines(6).join("\n")}\n`);
+			const runtime = newRuntime(env.tmpDir);
+			runtime.setSessionLifecycle({ sessionId: "primary-r7" });
+			const sub = "sub-r7";
+			const toolCallId = `read-${++seq}`;
+			const args = { path: file, offset: 1, limit: 6 };
+			await runHandlerExpectingNoThrow(() =>
+				handleToolCall({
+					...(callDeps(runtime, {
+						toolName: "read",
+						toolCallId,
+						input: args,
+					}) as object),
+					sessionId: sub,
+				} as never),
+			);
+			const result = await createReadToolDefinition(
+				runtime.projectRoot,
+			).execute(toolCallId, args, undefined, undefined, {
+				cwd: runtime.projectRoot,
+			} as never);
+			// The primary resets while the secondary's read is in flight, and
+			// another writer changes line 3 before the tool_result.
+			runtime.resetForSession();
+			const changed = lines(6);
+			changed[2] = "EXTERNAL3";
+			writeNow(file, `${changed.join("\n")}\n`);
+			await handleToolResult({
+				...(resultDeps(runtime, {
+					toolName: "read",
+					toolCallId,
+					input: args,
+					content: result.content,
+					details: result.details,
+				}) as object),
+				sessionId: sub,
+				readGuard: runtime.readGuardFor(sub),
+			} as never);
+
+			const editId = `edit-${++seq}`;
+			const verdict = (await runHandlerExpectingNoThrow(() =>
+				handleToolCall({
+					...(callDeps(runtime, {
+						toolName: "edit",
+						toolCallId: editId,
+						input: {
+							path: file,
+							edits: [
+								{
+									range: { start: { line: 3 }, end: { line: 3 } },
+									newText: "agent3",
+								},
+							],
+						},
+					}) as object),
+					sessionId: sub,
+				} as never),
+			)) as { block?: boolean } | undefined;
+			expect(verdict?.block).toBe(true);
+		} finally {
+			createFileTime("sub-r7").clear();
 			env.cleanup();
 		}
 	});

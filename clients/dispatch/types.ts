@@ -161,6 +161,13 @@ export interface Diagnostic {
 	 * Never part of identity.
 	 */
 	positionStale?: true;
+	/**
+	 * #4130: the diagnostic reports the runner's own failure (`faultResult`), not
+	 * a finding about the code. Turn end delivers that fault once, as the
+	 * failure note, so the deferred verdict drops this row. Never part of
+	 * identity.
+	 */
+	runnerFault?: true;
 }
 
 /**
@@ -236,33 +243,141 @@ export interface DispatchResult {
 	/** #4484 round 2: the runners and servers that reached no verdict. */
 	inconclusiveSources?: InconclusiveSources;
 	/**
-	 * #4403: why the file's primary group did not check it. Set whenever the
-	 * coverage notice's rule finds no coverage, whether or not the once-only
-	 * latch shows the notice, so a write the latch silences still does not
-	 * read as clean: the write-time all-clear line gives this instead.
+	 * #5258: whether a check of this file's kind completed. REQUIRED, so every
+	 * producer of a `DispatchResult` states it and the compiler finds one that
+	 * does not; the write-time all-clear line, `PipelineResult.checkedClean`
+	 * and the widget footer's `✓ clean` all read this and nothing else. It
+	 * replaces #4403's `unconfirmedStatus` and #4734's `primaryLspChecked`,
+	 * whose absence was read as clean.
 	 */
-	unconfirmedStatus?: string;
+	verdict: CoverageVerdict;
 	/**
-	 * #4733 r2 (from #4734's review): the coverage rule's positive answer for
-	 * these bytes, set only where it found the file checked: `primary` (a
-	 * runner of the primary group reached a verdict), `in_flight` (a
-	 * collect-later primary whose answer reaches this session's blocker map at
-	 * turn end), `fallback` (a fallback linter the rule accepts in its place),
-	 * or `unconfigured` (this mode defines no primary group for the file, as in
-	 * a `--no-lsp` TypeScript write). Unset otherwise, including where an unset
-	 * `unconfirmedStatus` hides that no runner of a defined primary group ran.
+	 * #4733 r2 (from #4734's review): the commit gate's answer to "did the rule
+	 * find the file covered", read only by {@link checkedWholeFile}. It is a
+	 * wider question than {@link verdict}: `in_flight` (a collect-later primary
+	 * whose answer reaches this session's blocker map at turn end) and
+	 * `unconfigured` (this mode defines no primary group for the file, as in a
+	 * `--no-lsp` TypeScript write) count as covered there and as unchecked in
+	 * `verdict`. Unset where the rule found no coverage.
 	 */
 	coverage?: "primary" | "in_flight" | "fallback" | "unconfigured";
-	/**
-	 * #4734 r3: the primary group's language server (its `lsp` runner) reached
-	 * a usable result for these bytes, with no server left unconfirmed. Absent
-	 * otherwise: no kind or primary group, `--no-lsp`, a CLI primary or a
-	 * fallback linter standing in, a primary deferred or still in flight, and a
-	 * partial notice the session latch withheld. The clean advisory's evidence
-	 * that a language server answered (`PipelineResult.checkedClean`).
-	 */
-	primaryLspChecked?: true;
 }
+
+/**
+ * #5258: the one positive answer to "did a check of this file's kind
+ * complete". `checked` carries the ids of the runners that completed
+ * ({@link hasUsableResult}); a non-empty list is the only way to build it, so
+ * a missing field, a skipped runner, a timeout, a thrown error, unparseable
+ * output and an absent binary can never produce it. Everything else is
+ * `unchecked` with the sentence the write-time line gives instead of "clean".
+ * `tier` says what stood in: `primary` (a runner of the primary group reached
+ * a verdict) or `fallback` (a fallback linter the coverage rule accepts in its
+ * place). A language server answered exactly when `runnerIds` holds `lsp`
+ * (`PipelineResult.checkedClean`).
+ */
+export type CoverageVerdict =
+	| {
+			checked: true;
+			tier: "primary" | "fallback";
+			runnerIds: readonly [string, ...string[]];
+	  }
+	| { checked: false; reason: string; inapplicable?: true; repeat?: true };
+
+/**
+ * Surface policy the `unchecked` arm carries (#5258 r2). `inapplicable`: no
+ * check can ever cover this file (no file kind, a generated file), so only the
+ * write's own line says so; the widget footer count and the persisted reason
+ * cover files a check could have covered but did not. `repeat`: the line for
+ * this reason was already printed for this file this session, so the write
+ * prints none until a result replaces it.
+ */
+export type UncheckedSurface = { inapplicable?: true; repeat?: true };
+
+/** The `unchecked` arm; the single constructor, so the shape has one spelling. */
+export const unchecked = (
+	reason: string,
+	surface: UncheckedSurface = {},
+): CoverageVerdict => ({
+	checked: false,
+	reason,
+	...surface,
+});
+
+/**
+ * The reason the widget footer records for a run, or `undefined` when it
+ * records none: a checked run, and a file no check can ever cover.
+ */
+export const widgetUncheckedReason = (
+	verdict: CoverageVerdict,
+): string | undefined =>
+	verdict.checked || verdict.inapplicable ? undefined : verdict.reason;
+
+/**
+ * The `checked` arm from the runner rows that completed, or `undefined` when
+ * none did. The only place the arm is built, and it takes rows, not a
+ * boolean, so a `checked` verdict names the runners that earned it. A row
+ * flagged `inconclusive` read part of the file, whatever its status, so it
+ * earns nothing (#5285 r3).
+ */
+export function checkedVerdict(
+	tier: "primary" | "fallback",
+	rows: readonly {
+		runnerId: string;
+		status: string;
+		failureKind?: string;
+		inconclusive?: true;
+	}[],
+): CoverageVerdict | undefined {
+	const [first, ...rest] = rows
+		.filter((row) => row.inconclusive !== true && hasUsableResult(row))
+		.map((row) => row.runnerId);
+	if (first === undefined) return undefined;
+	// A variable, not a literal: this is a verdict's runner list, not a
+	// `RunnerGroup`, and the group-id census reads `runnerIds: [...]` literals.
+	const completed: [string, ...string[]] = [first, ...rest];
+	return { checked: true, tier, runnerIds: completed };
+}
+
+/**
+ * A dispatch that ran nothing: no findings, the given verdict. The one
+ * literal for the five early returns (#5258: no kind, no runner group, an
+ * adopted root that admits none, a generated file, `dispatchLintDetailed`'s
+ * empty result), each of which used to spell the shape out with the verdict
+ * left to be read as clean.
+ */
+export function emptyDispatchResult(verdict: CoverageVerdict): DispatchResult {
+	return {
+		diagnostics: [],
+		blockers: [],
+		warnings: [],
+		baselineWarningCount: 0,
+		fixed: [],
+		resolvedCount: 0,
+		output: "",
+		blockerOutput: "",
+		hasBlockers: false,
+		verdict,
+	};
+}
+
+/**
+ * The reason of a collect-later primary that has not answered yet. Like every
+ * unchecked reason, a later write whose check completed or a scan that
+ * confirms the file retires it in the widget store (#5285 r3).
+ */
+export const IN_FLIGHT_REASON =
+	"the primary check is still running (findings arrive at turn end if it lands)";
+
+/** No file kind: nothing in pi-lens analyses this file type. */
+export const NO_ANALYZER_REASON = "no analyzer handles this file type";
+
+/**
+ * A kind with no primary checker in this mode (`--no-lsp` removes the language
+ * server, the only primary of eleven kinds). Other runners may have run, but
+ * none of them is the check the kind relies on (#5258).
+ */
+export const noPrimaryCheckerReason = (lspEnabled: boolean): string =>
+	`no primary checker is enabled for this kind${lspEnabled ? "" : " (--no-lsp turns off its language server)"}`;
 
 // --- Runner Definition ---
 
@@ -286,14 +401,56 @@ export interface RunnerDefinition {
  * ownership reasons: a runner may skip because its capability is policy-
  * deferred to a lane that owns it, or because its tool categorically cannot
  * serve the file's dialect — both are policy decisions named at the delivery
- * surface, never an empty output read as clean). */
+ * surface, never an empty output read as clean). `disabled-by-config` is the
+ * operator's own decision (`dispatch.disabledRunners`): the runner never ran,
+ * which is neither a failure nor a verdict on the file. `not-enabled` is the
+ * same for an opt-in runner left off (#5042): nothing failed, and nothing was
+ * checked either. */
 export const RUNNER_SKIP_REASONS = [
 	"no-files-matched",
 	"configured-non-biome-linter",
 	"dialect-unsupported",
 	"covered-by-primary",
+	"disabled-by-config",
+	"not-enabled",
 ] as const;
 export type RunnerSkipReason = (typeof RUNNER_SKIP_REASONS)[number];
+
+/**
+ * The skip reasons that say a runner had nothing to check, so beside a
+ * `dispatch.disabledRunners` denial the coverage notice does not read them as
+ * a tool that failed. A closed admission list over {@link RUNNER_SKIP_REASONS}:
+ * a reason added to the taxonomy reads as a failure until it is listed here.
+ * `covered-by-primary` is left out on purpose: it defers to a lane whose answer
+ * is what the denial may have removed. `disabled-by-config` is the denial
+ * itself and the caller handles it. {@link reachedNoVerdict} admits the
+ * taxonomy as a verdict except `not-enabled`; this is the narrower "not a tool
+ * failure" subset, and `not-enabled` is in it (#5042): an opt-in runner left
+ * off failed at nothing.
+ */
+export const NOT_APPLICABLE_SKIP_REASONS: readonly RunnerSkipReason[] = [
+	"no-files-matched",
+	"configured-non-biome-linter",
+	"dialect-unsupported",
+	"not-enabled",
+];
+
+/** Whether a skip reason states the runner had nothing to check. */
+export function isNotApplicableSkipReason(
+	value: RunnerSkipReason | undefined,
+): boolean {
+	return NOT_APPLICABLE_SKIP_REASONS.some((reason) => reason === value);
+}
+
+/**
+ * #4130: why an invoked tool produced no result. The non-`ran` kinds of
+ * `classifyRunOutcome` (`runners/utils/spawn-outcome.ts`), so a new outcome
+ * kind fails to compile at `skipUnlessToolRan` until it is named here.
+ */
+export type RunnerSkipFault =
+	| "did-not-run"
+	| "rejected-invocation"
+	| "report-missing";
 
 /** Runtime guard for untyped/plugin-provided runner results. */
 export function isRunnerSkipReason(value: unknown): value is RunnerSkipReason {
@@ -349,6 +506,15 @@ export interface RunnerResult {
 	failureMessage?: string;
 	/** Bounded machine-readable reason when status is an expected skip. */
 	skipReason?: RunnerSkipReason;
+	/**
+	 * #4130: a skip that is a runner fault, not an absent tool. The tool was
+	 * invoked and broke (killed, timed out, rejected its invocation, wrote no
+	 * report), so the run reached no verdict for a reason the user cannot act
+	 * on by installing something. Set only through {@link faultSkip}; a skip
+	 * with no tool to invoke leaves it unset. Smoke classification reads it so
+	 * "absent" and "broken" stop rendering alike.
+	 */
+	skipFault?: RunnerSkipFault;
 	/**
 	 * When the skip is `covered-by-primary`: which fact source supplied the
 	 * claim (`declared` — the row's own `covers`; `builtin-fact` — the facts
@@ -446,6 +612,50 @@ export function findingsResult(
 }
 
 /**
+ * The result of a run that BROKE and says so (#4130): `failed` with its own
+ * fault kind, never `blocking_diagnostics`. The synthetic diagnostic keeps the
+ * inline path from reading the run as clean. It is a warning by construction:
+ * a tool that could not read its own output says nothing about the code, so it
+ * must not enter the blocker map (#3814). `runnerFault` marks it, so turn end
+ * delivers the fault once, as the failure note. A runner with real partial
+ * findings beside a fault kind (rust-clippy) builds its own result instead.
+ */
+export function faultResult(
+	fault: { kind: string; failureMessage: string },
+	diagnostic: Pick<Diagnostic, "id" | "message" | "filePath" | "tool"> &
+		Partial<Pick<Diagnostic, "line" | "column" | "rule" | "fixable">>,
+): RunnerResult {
+	return {
+		status: "failed",
+		diagnostics: [
+			{
+				...diagnostic,
+				severity: "warning",
+				semantic: "warning",
+				runnerFault: true,
+			},
+		],
+		semantic: "warning",
+		failureKind: fault.kind,
+		failureMessage: fault.failureMessage.slice(0, 200),
+	};
+}
+
+/**
+ * The one skip a runner returns after it invoked its tool and the tool broke
+ * (#4130). An absent tool returns a bare skip instead: there is nothing to
+ * blame, and nothing was invoked.
+ */
+export function faultSkip(fault: RunnerSkipFault): RunnerResult {
+	return {
+		status: "skipped",
+		diagnostics: [],
+		semantic: "none",
+		skipFault: fault,
+	};
+}
+
+/**
  * Whether a runner result is usable coverage of the bytes it ran on (#3867).
  *
  * A `succeeded` run reached a verdict about the file. A `failed` run reached
@@ -477,8 +687,8 @@ export function hasUsableResult(result: {
  * the file and finished (R1 in PR #4491's round-3 table). That is a
  * `succeeded` run not flagged `inconclusive`, a `failed` run with its own
  * findings, or a skip that states a not-applicable reason from
- * {@link RUNNER_SKIP_REASONS}. Every other outcome has none: a `failed` run
- * without findings (timeout, spawn or server failure), a `deferred` one, a
+ * {@link RUNNER_SKIP_REASONS} (`not-enabled` excepted, below). Every other
+ * outcome has none: a `failed` run without findings (timeout, spawn or server failure), a `deferred` one, a
  * run flagged `inconclusive`, and any skip without a stated reason, since a
  * skip that never read the file (a size or line cap, an aborted WASM runtime,
  * a grammar or server that is unavailable) says nothing about it. Unknown
@@ -499,7 +709,15 @@ export function reachedNoVerdict(
 		case "deferred":
 			return true;
 		case "skipped":
-			return !isRunnerSkipReason(result.skipReason);
+			// #5042: an opt-in runner left off states why it did not run, which
+			// changes the notice's wording and nothing else. It still read nothing
+			// of the file, so it stays out of the verdicts exactly as its bare skip
+			// was: a recorded blocker of that runner is kept and its edited lines
+			// stay owed, not retired by a run that never happened.
+			return (
+				!isRunnerSkipReason(result.skipReason) ||
+				result.skipReason === "not-enabled"
+			);
 		default:
 			return false;
 	}
@@ -512,9 +730,8 @@ export function reachedNoVerdict(
  * session's section names no runner a per-runner carry could judge it by.
  *
  * Admitted: no language server went unanswered (`serverIds`), the coverage
- * rule found the file checked (`coverage`; #4733 r2: an unset
- * `unconfirmedStatus` also holds when a defined primary group never ran),
- * no verdict covers only the
+ * rule found the file checked (`coverage`; #4733 r2: it is unset when a
+ * defined primary group never ran), no verdict covers only the
  * edit (`editScopedRunnerIds`), at least one runner ran and answered, and
  * every runner that reached no verdict either skipped or is a collect-later
  * run still in flight (its answer joins this session's own blocker map when
@@ -547,6 +764,42 @@ export function checkedWholeFile(
 		[...noVerdict].every((runnerId) =>
 			skippedOrInFlight.has(outcomeOf.get(runnerId)),
 		)
+	);
+}
+
+/**
+ * #5020: the runners that reached a verdict on this run's bytes: a row of the
+ * latency report with a usable result ({@link hasUsableResult}: it succeeded,
+ * or it completed and failed on findings) that is not in
+ * `inconclusiveSources`. A runner that skipped, broke, is still in flight or
+ * answered for part of the file speaks for nothing, which is why this is the
+ * evidence a retire of another file's row asks for
+ * (`RuntimeCoordinator.retireForeignRows`). A run that failed on findings
+ * speaks only through the caller's own guard: the retire also needs the run to
+ * hold no blocker of its own on the file (`stillReported` in
+ * `publishInlineVerdict`), so mypy answering `b.py` while reporting `c.py`
+ * retires the row about `b.py` and keeps every row about `c.py` (PR #5033
+ * round 3).
+ *
+ * An edit-scoped runner (`editScopedRunnerIds`) is refused here for the reason
+ * `checkedWholeFile` refuses the whole run for it: its verdict covers the
+ * edited ranges, so "no blocker reported" says nothing about the rest of the
+ * file a cross-file row would be judged against.
+ */
+export function verdictRunnerIds(
+	result: Pick<
+		DispatchResult,
+		"inconclusiveSources" | "editScopedRunnerIds" | "latencyReport"
+	>,
+): string[] {
+	const noWholeFileVerdict = new Set([
+		...(result.inconclusiveSources?.runnerIds ?? []),
+		...(result.editScopedRunnerIds ?? []),
+	]);
+	return (result.latencyReport?.runners ?? []).flatMap((runner) =>
+		hasUsableResult(runner) && !noWholeFileVerdict.has(runner.runnerId)
+			? [runner.runnerId]
+			: [],
 	);
 }
 
@@ -601,8 +854,19 @@ export interface DispatchContext {
 	readonly facts: import("./fact-store.js").FactStore;
 	/** Project-local .pi-lens.json config captured for this dispatch. */
 	readonly projectConfig?: PiLensProjectConfig;
-	/** Shared global+project rule policy, including path-scoped denials. */
+	/**
+	 * The EDITED file's config owner's rule policy, including path-scoped
+	 * denials: runners read it to skip a rule on this file, and the output filter
+	 * reuses it for findings under the same owner (every other owner's finding
+	 * reads its own, #5011 r8 F24).
+	 */
 	readonly rulePolicy?: RulePolicyMap;
+	/**
+	 * Runner ids the operator denied through `dispatch.disabledRunners`
+	 * (union of every config tier). Absent when nothing is denied. The
+	 * dispatcher skips these before their `when`/`run`, so the tool never spawns.
+	 */
+	readonly disabledRunnerIds?: ReadonlySet<string>;
 	/** Only run blocking rules (severity: error) - used for fast feedback on file write */
 	readonly blockingOnly?: boolean;
 	readonly modifiedRanges?: ModifiedRange[];

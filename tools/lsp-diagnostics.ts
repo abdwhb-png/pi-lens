@@ -41,18 +41,23 @@ import {
 import { mapWithConcurrency } from "../clients/map-with-concurrency.js";
 import {
 	combineAbortSignals,
+	untilAborted,
 	withDeadline,
 } from "../clients/deadline-utils.js";
 import {
 	applyAuxiliarySuppressions,
 	configDisabledAuxiliaryLspServerIds,
+	enabledOptInAuxiliaryLspServerIds,
+	isOptInAuxiliaryServerId,
+	dropExcludedServers,
 	retagAuxiliaryDiagnostics,
 } from "../clients/dispatch/auxiliary-lsp.js";
 import {
 	applyLspFindingPolicy,
-	loadProjectRulePolicyMap,
+	loadProjectRulePolicy,
 } from "../clients/dispatch/finding-policy.js";
 import { readFileContent } from "../clients/dispatch/runners/utils.js";
+import { lookForOutOfBandChanges } from "../clients/out-of-band-changes.js";
 import { hasStrictDispositionMarks } from "../clients/diagnostic-dispositions.js";
 import { dispositionSuppressedLine } from "../clients/finding-delivery-gate.js";
 import { recordDegradationOnce } from "../clients/degradation-ledger.js";
@@ -66,6 +71,7 @@ import {
 	primaryUnavailableCause,
 	touchCompletedConfirmationPolicy,
 	touchCoverageGap,
+	warmAnswerBinding,
 	type DiagnosticBinding,
 	type PrimaryUnavailableCause,
 	type TouchFileResult,
@@ -95,6 +101,7 @@ import {
 import { exceedsLspSyncLimits } from "../clients/lsp/content-limits.js";
 import {
 	goPackageFilesToAnnounce,
+	type ImportScope,
 	importTargetsToAnnounce,
 } from "../clients/lsp/created-import-targets.js";
 
@@ -160,6 +167,7 @@ type BatchOptions = {
 	// left without it would be the very defect this fixes, one call site over.
 	onConfirmedNoBlockers?: (info: ConfirmedNoBlockersInfo) => void;
 	// #4323: auxiliaries the operator's configuration turns off; never acquired.
+	// #4956: and an enabled opt-in one, which the all-server door never starts.
 	excludeServerIds?: ReadonlySet<string>;
 };
 
@@ -301,7 +309,6 @@ type FileDiagnosticResult = {
 	 * type checker/compiler confirmed the file clean.
 	 */
 	primaryServerId?: string;
-	diagnosticsUnsupported?: boolean;
 	/**
 	 * #3088: how many of this file's findings the probe lane's own filter stack
 	 * dropped (stored disposition, `.pi-lens.json` rule policy, inline
@@ -555,6 +562,21 @@ export function createLspDiagnosticsTool(
 				pathAlreadyResolved?: boolean;
 			};
 			const severity = (typedParams.severity ?? "all") as string;
+			// #5138 D9: an unknown tier used to fall through `applySeverityFilter`'s
+			// `?? 0` and return EVERY diagnostic, as if the requested tier had
+			// matched. Refuse before any finding is rendered.
+			if (!(LSP_SEVERITY_FILTERS as readonly string[]).includes(severity)) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Unknown severity "${severity}". Accepted tiers: ${LSP_SEVERITY_FILTERS.join(", ")}.`,
+						},
+					],
+					isError: true,
+					details: {},
+				};
+			}
 			const cwd = ctx.cwd ?? process.cwd();
 			const concurrency = boundedPositiveInt(
 				typedParams.concurrency,
@@ -568,8 +590,16 @@ export function createLspDiagnosticsTool(
 					: undefined;
 			const serverScope: "primary" | "all" =
 				typedParams.serverScope === "primary" ? "primary" : "all";
+			// #4956 F2: the servers this check leaves unstarted: an auxiliary the
+			// operator switched off, and an opt-in one they turned on (the all-server
+			// door never starts it), so the report names both as not run.
 			const excludeServerIds = getFlag
-				? configDisabledAuxiliaryLspServerIds((name) => getFlag(name, cwd))
+				? new Set([
+						...configDisabledAuxiliaryLspServerIds((name) =>
+							getFlag(name, cwd),
+						),
+						...enabledOptInAuxiliaryLspServerIds((name) => getFlag(name, cwd)),
+					])
 				: undefined;
 
 			const lspService = getService();
@@ -582,6 +612,32 @@ export function createLspDiagnosticsTool(
 					details: {},
 				};
 			}
+
+			// #4532 gap 5: the `tool_call` look walks at most once per
+			// `PI_LENS_DECLARATION_LOOK_MS` (2 s), so a declaration file created
+			// inside that window reached no server before this answer: the importer
+			// kept `Cannot find name` on call 1 and cleared only after a later bash
+			// result's walk. This is the extension route's half of the gap-13 rule,
+			// and it rides the same pre-answer seam as the sweep below. `"always"`
+			// walks on this look whatever the interval says; the walk is bounded per
+			// root (`DECLARATION_WALK_MAX_DIRS`/`_FILES`), and it runs before the
+			// sweep so a client a publish restarts receives the re-push that follows.
+			// #5005 F3: the caller's signal rides along, so an abandoned answer is
+			// neither held by this walk nor paying for it.
+			await lookForOutOfBandChanges(cwd, "tool_call", undefined, {
+				walk: "always",
+				signal,
+			});
+
+			// #4532 gap 13: a document the server already holds may have changed
+			// outside pi (a `cp`, a bash write) since pi last synced it. The touch
+			// below re-syncs only the files this call names, and its own drift
+			// sweep is rate-limited and not awaited, so a held file the named file
+			// depends on answered stale on the first call and clean on the second.
+			// The full forced sweep checks every held document and re-pushes each
+			// drifted one before any answer is read; it sends nothing for a held
+			// document whose bytes are unchanged.
+			await lspService.sweepDocumentDrift({ force: true, full: true });
 
 			if (Array.isArray(typedParams.paths) && typedParams.paths.length > 0) {
 				if (typedParams.paths.length > MAX_BATCH_FILES) {
@@ -776,7 +832,7 @@ type DiagnosticsCollectionResult = {
 	 * honest.
 	 */
 	unconfirmedServerIds: readonly string[];
-	/** Custom navigation-only servers that supplied no diagnostic evidence. */
+	/** Custom push-only servers that have not published (unconfirmed, #5128). */
 	diagnosticsUnsupportedServerIds: readonly string[];
 	/**
 	 * #4322: the file has a language server, but the touch acquired only
@@ -806,8 +862,9 @@ type DiagnosticsCollectionResult = {
 	 * were computed against current disk. `boundToCurrentDisk === false` means the
 	 * server's view diverged from disk; the caller demotes such a result to
 	 * "unconfirmed" so a stale-but-fresh-looking result never re-cements the
-	 * widget (#1092). Undefined when no touch produced one (warm-attach /
-	 * getDiagnostics fallback) → treated as "unknown" (no demotion).
+	 * widget (#1092). Undefined when no touch produced one (the getDiagnostics
+	 * fallback) → treated as "unknown" (no demotion). A warm-attach answer always
+	 * carries one (#5030).
 	 */
 	binding?: DiagnosticBinding;
 	/**
@@ -885,12 +942,15 @@ async function collectDiagnosticsForFile(
 				"sweep",
 			);
 			if (attached?.available) {
+				// #4944: the incumbent answers every auxiliary; a switched-off one's
+				// rows and coverage-gap name are not this check's answer.
+				const answer = dropExcludedServers(attached.response, excludeServerIds);
 				const scopedDiagnostics =
 					serverScope === "primary"
-						? attached.response.diagnostics.filter(
+						? answer.diagnostics.filter(
 								(item) => item.serverId === primaryServerId(absPath),
 							)
-						: attached.response.diagnostics;
+						: answer.diagnostics;
 				const filtered = applyAuxiliarySuppressions(
 					scopedDiagnostics,
 					content,
@@ -921,12 +981,16 @@ async function collectDiagnosticsForFile(
 					// #1470: the incumbent's narrowed verdict, carried as an explicit DTO
 					// field across the socket. An older incumbent omits it → empty → the
 					// pre-#1470 handling, unchanged.
-					unconfirmedServerIds: attached.response.unconfirmedServerIds ?? [],
+					unconfirmedServerIds: answer.unconfirmedServerIds ?? [],
 					diagnosticsUnsupportedServerIds: [],
 					content,
 					...(attached.response.projectIdentity !== undefined && {
 						projectIdentity: attached.response.projectIdentity,
 					}),
+					// #5030: the incumbent's content binding, so a stale-bound answer
+					// is demoted to unconfirmed (`boundMismatch`) like a local one. An
+					// incumbent that sends none reads as not current.
+					binding: warmAnswerBinding(answer),
 				};
 			}
 		}
@@ -1068,8 +1132,8 @@ export function describePrimaryUnavailable(
 		carriedCause ?? primaryUnavailableCause(serverIds, disabledServerIds);
 	return {
 		text:
-			`Primary LSP (${serverIds.join(", ")}): not available — no language ` +
-			`server answered for this file (${PRIMARY_UNAVAILABLE_CAUSE[cause]}). ` +
+			`Primary LSP (${serverIds.join(", ")}): not available — no primary ` +
+			`language server answered for this file (${PRIMARY_UNAVAILABLE_CAUSE[cause]}). ` +
 			"NOT the same as 0 diagnostics; auxiliary scanners do not check the " +
 			"language itself.",
 		cause,
@@ -1283,6 +1347,9 @@ function coveredSourcesForCheck(
 		if (auxiliary && serverScope === "primary") continue;
 		if (unconfirmed.has(server.id)) continue;
 		if (excludeServerIds?.has(server.id)) continue;
+		// #4956 F2: the all-server door never starts an opt-in auxiliary, whether
+		// or not the operator enabled it, so this check never consulted it.
+		if (isOptInAuxiliaryServerId(server.id)) continue;
 		// The dispatch runner tags the primary language server's findings `lsp`;
 		// auxiliaries keep their own tool id.
 		covered.add(auxiliary ? server.id : "lsp");
@@ -1351,7 +1418,7 @@ export function applyProbeFindingPolicy(
 			cwd,
 			filePath: file,
 			content,
-			policyMap: loadProjectRulePolicyMap(cwd),
+			policyMap: loadProjectRulePolicy(cwd),
 			fileRole: detectFileRole(file, content),
 		});
 		// #4638: jedi compiles with the interpreter it launched, so under a
@@ -1667,11 +1734,14 @@ async function collectFileDiagnosticResult(
 	// be merged in rather than discarded.
 	let effectiveRawDiags = rawDiags;
 	let confirmation: "clean" | "unconfirmed" | undefined;
-	if (diagnosticsUnsupportedServerIds.length > 0) {
-		// No diagnostic provider and no push evidence is a capability boundary,
-		// not a clean result and not a timeout.
-		confirmation = undefined;
-	} else if (skipReason !== undefined || primaryUnavailable !== undefined) {
+	if (
+		diagnosticsUnsupportedServerIds.length > 0 ||
+		skipReason !== undefined ||
+		primaryUnavailable !== undefined
+	) {
+		// #5128: a custom server with no pull provider that has not published is
+		// unconfirmed (it may publish later), never "unsupported". Not a clean
+		// result and not a timeout either.
 		confirmation = "unconfirmed";
 	} else if (timedOut) {
 		if (applySeverityFilter(rawDiags, severity).length === 0) {
@@ -1826,7 +1896,6 @@ async function collectFileDiagnosticResult(
 		}),
 		...(noClientAnswered && { noClientAnswered }),
 		primaryServerId: primaryServerId(file),
-		diagnosticsUnsupported: diagnosticsUnsupportedServerIds.length > 0,
 		...(policy.suppressed > 0 && {
 			dispositionSuppressed: policy.suppressed,
 		}),
@@ -1859,10 +1928,10 @@ async function runFileDiagnostics(
 	// #4346: a module this file imports, created outside pi-lens, reaches its
 	// servers before the touch (the batch path gates this on cached findings;
 	// one file needs no gate), and so do a Go file's package files.
-	lspService.announceCreatedFiles([
-		...goPackageFilesToAnnounce([absPath]),
-		...(await importTargetsToAnnounce(cwd, [absPath])),
-	]);
+	lspService.announceCreatedFiles(
+		goPackageFilesToAnnounce([absPath]),
+		await importTargetsToAnnounce(cwd, [absPath]),
+	);
 	// #3505 r2: the widget row is observed at the read, not after the touch.
 	const observedAt = Date.now();
 	const {
@@ -1915,9 +1984,11 @@ async function runFileDiagnostics(
 	// diagnostics it surfaces are merged in, not discarded.
 	let effectiveRawDiags = rawDiags;
 	let confirmation: "clean" | "unconfirmed" | undefined;
-	if (diagnosticsUnsupportedServerIds.length > 0) {
-		confirmation = undefined;
-	} else if (skipReason !== undefined || primaryUnavailable !== undefined) {
+	if (
+		diagnosticsUnsupportedServerIds.length > 0 ||
+		skipReason !== undefined ||
+		primaryUnavailable !== undefined
+	) {
 		confirmation = "unconfirmed";
 	} else if (timedOut) {
 		if (applySeverityFilter(rawDiags, severity).length === 0) {
@@ -2036,7 +2107,7 @@ async function runFileDiagnostics(
 				: primaryUnavailable;
 		}
 		if (diagnosticsUnsupportedServerIds.length > 0) {
-			return `Primary LSP${primaryId ? ` (${primaryId})` : ""}: navigation-only — diagnostics unsupported (no pull provider or publish evidence).`;
+			return `Primary LSP${primaryId ? ` (${primaryId})` : ""}: unconfirmed — a custom server with no pull provider has not published diagnostics yet. NOT the same as 0 diagnostics; it is checked again once the server publishes.`;
 		}
 		if (timedOut) {
 			return (
@@ -2091,16 +2162,29 @@ async function runFileDiagnostics(
 	// #4323 (#4391 F8): an auxiliary the operator turned off never ran, so a bare
 	// "No auxiliary findings." would read like a scanner result. Name it. A
 	// primary-only check never asks an auxiliary, so it keeps the plain line.
-	const switchedOffServerIds =
+	const notRunServerIds =
 		serverScope === "all" && excludeServerIds && excludeServerIds.size > 0
 			? getServersForFileWithConfig(absPath).flatMap((server) =>
 					excludeServerIds.has(server.id) ? [server.id] : [],
 				)
 			: [];
-	const noAuxiliaryLine =
-		switchedOffServerIds.length > 0
-			? `No auxiliary findings. Switched off, not run: ${switchedOffServerIds.join(", ")}.`
-			: "No auxiliary findings.";
+	// #4956 F2: an enabled opt-in server is not "switched off"; the all-server
+	// door simply does not start it (its findings arrive with edits).
+	const switchedOffServerIds = notRunServerIds.flatMap((id) =>
+		isOptInAuxiliaryServerId(id) ? [] : [id],
+	);
+	const optInNotRunServerIds = notRunServerIds.flatMap((id) =>
+		isOptInAuxiliaryServerId(id) ? [id] : [],
+	);
+	const noAuxiliaryLine = [
+		"No auxiliary findings.",
+		...(switchedOffServerIds.length > 0
+			? [`Switched off, not run: ${switchedOffServerIds.join(", ")}.`]
+			: []),
+		...(optInNotRunServerIds.length > 0
+			? [`Opt-in, not run by this check: ${optInNotRunServerIds.join(", ")}.`]
+			: []),
+	].join(" ");
 
 	let text: string;
 	if (total === 0) {
@@ -2163,8 +2247,6 @@ async function runFileDiagnostics(
 			truncated,
 			unconfirmed,
 			timedOut: unconfirmed ? timedOut : undefined,
-			navigationOnlyFiles:
-				diagnosticsUnsupportedServerIds.length > 0 ? 1 : undefined,
 			...(skipReason !== undefined && { skipReason }),
 			...(primaryUnavailable !== undefined && { primaryUnavailable }),
 			...(rootFallback && {
@@ -2198,7 +2280,6 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 	timedOut: number;
 	primaryUnavailable: PrimaryUnavailableTally;
 	rootFallbackReasons: string[];
-	navigationOnly: number;
 	tooLarge: number;
 } {
 	let clean = 0;
@@ -2208,15 +2289,10 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 	const primaryUnavailableCauses: PrimaryUnavailableCause[] = [];
 	const primaryUnavailableRootReasons = new Set<string>();
 	const rootFallbackReasons = new Set<string>();
-	let navigationOnly = 0;
 	let tooLarge = 0;
 	for (const result of results) {
 		if (result.tooLargeReason) {
 			tooLarge += 1;
-			continue;
-		}
-		if (result.diagnosticsUnsupported) {
-			navigationOnly += 1;
 			continue;
 		}
 		if (result.diagnostics.length > 0) continue;
@@ -2257,7 +2333,6 @@ function tallyConfirmation(results: FileDiagnosticResult[]): {
 			rootFallbackReasons: [...primaryUnavailableRootReasons],
 		},
 		rootFallbackReasons: [...rootFallbackReasons],
-		navigationOnly,
 		tooLarge,
 	};
 }
@@ -2267,7 +2342,6 @@ function classifyBatchFileOutcome(
 ): BatchFileOutcome {
 	if (result.error) return "failed";
 	if (result.tooLargeReason) return "too_large";
-	if (result.diagnosticsUnsupported) return "unsupported";
 	// #4322: this read acquired no client at all, and a primary resolved a root
 	// for the file. The result is unconfirmed, but "unavailable" names why.
 	if (result.noClientAnswered && result.primaryUnavailable !== undefined) {
@@ -2337,9 +2411,9 @@ function auxiliaryOnlyFindingsLine(
 			auxiliaryOnly.flatMap((result) => result.primaryUnavailableCause ?? []),
 		) ?? "unstarted";
 	return (
-		`${count} file${count === 1 ? "" : "s"} with auxiliary findings only: no ` +
-		`language server answered (${PRIMARY_UNAVAILABLE_CAUSE[cause]}), so the ` +
-		"language itself was not checked."
+		`${count} file${count === 1 ? "" : "s"} with auxiliary or fallback findings only: ` +
+		`no primary language server answered (${PRIMARY_UNAVAILABLE_CAUSE[cause]}), ` +
+		"so the language itself was not confirmed."
 	);
 }
 
@@ -2364,7 +2438,7 @@ function unconfirmedReasonClause(
 	// The rest of the unconfirmed files keep their own explanation.
 	if (primaryUnavailable.count > 0) {
 		const head =
-			`${primaryUnavailable.count} with no language server answer ` +
+			`${primaryUnavailable.count} with no primary language server answer ` +
 			`(${PRIMARY_UNAVAILABLE_CAUSE[primaryUnavailable.cause ?? "unstarted"]})` +
 			(primaryUnavailable.rootFallbackReasons.length > 0
 				? `: ${primaryUnavailable.rootFallbackReasons.join("; ")}`
@@ -2460,20 +2534,26 @@ async function collectBatchDiagnostics(
 	// #4320: a module created since a file was cached must reach its servers
 	// before any lookup below, whatever the order of `files`. #4346: so must a
 	// module named only by a file's imports, which nothing reports when it was
-	// created outside pi-lens: for every file a fresh clean entry will not
-	// answer (#4368 r1 F1; a write-hook touch records no entry). So must a Go
-	// file's package files, which no import names; and each resolved file's
-	// imports go to the cache, which refuses an entry only for a creation in
-	// its dependency scope.
-	lspService.announceCreatedFiles([
-		...files,
-		...goPackageFilesToAnnounce(files),
-		...(await importTargetsToAnnounce(
-			resolvedCwd,
-			files.filter((file) => !cacheCtx.servesClean(file, scopeKey)),
-			(file, scope) => cacheCtx.noteImportScope(file, scope),
-		)),
-	]);
+	// created outside pi-lens. So must a Go file's package files, which no
+	// import names; and each resolved file's imports go to the cache. #4532
+	// gap 13: a file a fresh clean entry answers (#4368 r1 F1) is resolved
+	// too, in its own capped call so it displaces none of the others, and an
+	// import of it changed outside pi then refuses the entry it would replay.
+	const servedClean: string[] = [];
+	const unanswered = files.filter((file) => {
+		if (!cacheCtx.servesClean(file, scopeKey)) return true;
+		servedClean.push(file);
+		return false;
+	});
+	const noteScope = (file: string, scope: ImportScope) =>
+		cacheCtx.noteImportScope(file, scope);
+	lspService.announceCreatedFiles(
+		[...files, ...goPackageFilesToAnnounce(files)],
+		[
+			...(await importTargetsToAnnounce(resolvedCwd, unanswered, noteScope)),
+			...(await importTargetsToAnnounce(resolvedCwd, servedClean, noteScope)),
+		],
+	);
 	const groups = groupFilesByPrimaryServer(files);
 	await runPerServerGroups(
 		groups,
@@ -2516,24 +2596,7 @@ async function collectBatchDiagnostics(
 						onTimeout: "undefined",
 						onReject: "undefined",
 					});
-					const result = options.signal
-						? await Promise.race([
-								bounded,
-								new Promise<FileDiagnosticResult | undefined>((resolve) => {
-									if (options.signal?.aborted) {
-										resolve(undefined);
-										return;
-									}
-									options.signal?.addEventListener(
-										"abort",
-										() => resolve(undefined),
-										{
-											once: true,
-										},
-									);
-								}),
-							])
-						: await bounded;
+					const result = await untilAborted(bounded, options.signal);
 					resultsByIndex.set(
 						index,
 						result ??
@@ -2750,9 +2813,6 @@ async function runBatchFileDiagnostics(
 		outcomeCounts,
 		incompleteFiles,
 	} = await collectBatchDiagnostics(absPaths, severity, lspService, options);
-	const navigationOnly = results.filter(
-		(result) => result.diagnosticsUnsupported,
-	).length;
 	// #3088: the batch's own suppressed bucket — one summed line, never one per
 	// file or per finding.
 	const dispositionSuppressed = results.reduce(
@@ -2886,7 +2946,6 @@ async function runBatchFileDiagnostics(
 			truncated,
 			cleanFiles: clean,
 			unconfirmedFiles: unconfirmed,
-			navigationOnlyFiles: navigationOnly > 0 ? navigationOnly : undefined,
 			timedOutFiles: timedOut > 0 ? timedOut : undefined,
 			outcomes: results.map((result) => ({
 				file: result.file,
@@ -3048,9 +3107,6 @@ async function runDirectoryDiagnostics(
 		lspService,
 		options,
 	);
-	const navigationOnly = results.filter(
-		(result) => result.diagnosticsUnsupported,
-	).length;
 	// #3088: the directory scan's own suppressed bucket — one summed line.
 	const dispositionSuppressed = results.reduce(
 		(sum, result) => sum + (result.dispositionSuppressed ?? 0),
@@ -3192,7 +3248,6 @@ async function runDirectoryDiagnostics(
 			unconfirmedFiles: unconfirmed,
 			outcomes: outcomeDetails,
 			outcomeCounts,
-			navigationOnlyFiles: navigationOnly > 0 ? navigationOnly : undefined,
 			timedOutFiles: timedOut > 0 ? timedOut : undefined,
 			fileErrors: fileErrors.length > 0 ? fileErrors : undefined,
 			lspHealthWarnings:

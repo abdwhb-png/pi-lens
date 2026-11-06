@@ -46,6 +46,7 @@ import {
 	realpathOrResolve,
 	splitPathSegments,
 	toPosix,
+	createProjectRelativePathResolver,
 	toProjectRelativePath,
 	uriToPath,
 	walkUpDirs,
@@ -912,6 +913,45 @@ describe("toProjectRelativePath: root spelled differently from the canonical key
 	});
 });
 
+describe("createProjectRelativePathResolver answers what toProjectRelativePath does (#1449)", () => {
+	// One resolver per project root caches that root's canonical form; the rule
+	// itself is `toProjectRelativePath`'s, so every shape it distinguishes has to
+	// come back identical through the resolver.
+	it.skipIf(process.platform === "win32")(
+		"agrees on an in-root file, an aliased root, an outside file and a relative spelling",
+		(ctx) => {
+			const env = setupTestEnvironment("pi-lens-relresolver-");
+			try {
+				const fx = createCaseAliasFixture(env.tmpDir, { dirName: "proj" });
+				if (fx.skipReason) return ctx.skip(fx.skipReason);
+				const root = path.dirname(fx.rawMisCased);
+				const outside = path.join(env.tmpDir, "elsewhere.ts");
+				fs.writeFileSync(outside, "x\n");
+				const resolve = createProjectRelativePathResolver(root);
+				for (const file of [
+					fx.rawMisCased,
+					normalizeMapKey(fx.rawMisCased),
+					outside,
+					"src/relative.ts",
+				]) {
+					expect(resolve(file)).toBe(toProjectRelativePath(file, root));
+				}
+				// The inside answer is the project-relative one, not the absolute spelling.
+				expect(resolve(fx.rawMisCased)).toBe("a.ts");
+			} finally {
+				env.cleanup();
+			}
+		},
+	);
+
+	it("answers the same on repeated calls and for win32-shaped input", () => {
+		const resolve = createProjectRelativePathResolver("C:\\repo");
+		expect(resolve("C:\\repo\\src\\x.ts")).toBe("src/x.ts");
+		expect(resolve("C:\\other\\y.ts")).toBe("C:/other/y.ts");
+		expect(resolve("C:\\repo\\src\\x.ts")).toBe("src/x.ts");
+	});
+});
+
 describe("normalizeEphemeralMapKey (refs #191)", () => {
 	it("folds backslash and forward-slash forms to the same key", () => {
 		const forward = "C:/Users/foo/src/plan.js";
@@ -1413,6 +1453,34 @@ describe("Git ownership certainty preserves the legacy marker API", () => {
 					homeDir: env.tmpDir,
 				}),
 			).toEqual({ kind: "not-found", reason: "home-ceiling" });
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("reports home-ceiling when a climb of fewer than 64 directories stops at the home ceiling", () => {
+		const env = setupTestEnvironment("pi-lens-marker-detailed-below-home-");
+		try {
+			// Recurrence (#4966 review F1): the walkUpDirs fold rebuilt the
+			// `home-ceiling` reason after the loop from `climbed >= 64`. Every older
+			// cell started AT the ceiling, so a walk that climbed two directories and
+			// then stopped at home was never driven and the predicate was unpinned.
+			const nested = path.join(env.tmpDir, "proj", "src");
+			fs.mkdirSync(nested, { recursive: true });
+			const probed: string[] = [];
+			expect(
+				findNearestMarkerRootDetailed(nested, [".git"], {
+					homeDir: env.tmpDir,
+					markerPredicate: (file) => {
+						probed.push(file);
+						return { kind: "absent" };
+					},
+				}),
+			).toEqual({ kind: "not-found", reason: "home-ceiling" });
+			expect(probed).toEqual([
+				path.join(realpathOrResolve(nested), ".git"),
+				path.join(realpathOrResolve(path.join(env.tmpDir, "proj")), ".git"),
+			]);
 		} finally {
 			env.cleanup();
 		}

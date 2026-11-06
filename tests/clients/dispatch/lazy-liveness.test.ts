@@ -1,9 +1,19 @@
+import { CHECKED_BY_FIXTURE } from "../../support/dispatch-verdict.js";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createPiMock, makeCtx } from "../../support/pi-mock.js";
 import { installLspServiceDouble } from "../../support/lsp-service-seam.js";
+import {
+	endTurn,
+	readTarget,
+	step,
+	toolResults,
+} from "../../support/pi-session-commit-gate.js";
+import {
+	fauxToolCall,
+	piSessionFixture,
+	startPiSession,
+} from "../../support/pi-session.js";
 
 const dispatchResult = {
 	diagnostics: [{ tool: "dispatch", message: "dispatch fired" }],
@@ -14,8 +24,11 @@ const dispatchResult = {
 	resolvedCount: 0,
 	output: "dispatch output",
 	blockerOutput: "",
+	verdict: CHECKED_BY_FIXTURE,
 	hasBlockers: false,
 };
+
+const fixture = piSessionFixture();
 
 describe("dispatch session warm/first-use liveness (#1394)", () => {
 	afterEach(() => vi.resetModules());
@@ -35,7 +48,6 @@ describe("dispatch session warm/first-use liveness (#1394)", () => {
 			const { bootstrapSeamMock } =
 				await import("../../support/bootstrap-mock.js");
 			return bootstrapSeamMock(async () => ({
-				metricsClient: { reset: () => {} },
 				todoScanner: {},
 				biomeClient: { isAvailable: () => false, isSupportedFile: () => false },
 				ruffClient: { isAvailable: () => false, isSupportedFile: () => false },
@@ -45,6 +57,7 @@ describe("dispatch session warm/first-use liveness (#1394)", () => {
 				},
 				jscpdClient: { isAvailable: () => false },
 				depChecker: { isAvailable: () => false },
+				deadCodeClients: [],
 				testRunnerClient: { detectRunner: () => null },
 				goClient: { isGoAvailableAsync: async () => false },
 				rustClient: { isAvailableAsync: async () => false },
@@ -67,32 +80,41 @@ describe("dispatch session warm/first-use liveness (#1394)", () => {
 			getStatus: () => [],
 			getAliveServerIds: () => [],
 		});
-		const { default: registerExtension } = await import("../../../index.js");
-		const pi = createPiMock({ "no-lsp": true, "no-autoformat": true });
-		registerExtension(pi.asExtensionAPI());
-		const cwd = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-dispatch-live-"),
-		);
+		// Tier 2 (#4937 L6): a real pi session over the factory this test imported
+		// after the doMocks above, so the mocked dispatch seam is the one the
+		// extension calls. The model reads, then edits: pi's own tool result is
+		// what the dispatch output rides.
+		const cwd = path.join(fixture.root, "proj");
 		const filePath = path.join(cwd, "src", "live.ts");
 		fs.mkdirSync(path.dirname(filePath), { recursive: true });
 		fs.writeFileSync(filePath, "export const live = 1;\n");
-		try {
-			await pi.emit("session_start", {}, makeCtx({ cwd }));
-			await pi.emit("turn_start", {}, makeCtx({ cwd }));
-			const result = await pi.emit(
-				"tool_result",
-				{
-					toolName: "edit",
-					input: { path: filePath },
-					details: { diff: "+ 1 export const live = 2;" },
-					content: [{ type: "text", text: "ok" }],
-				},
-				makeCtx({ cwd }),
-			);
+		const handle = await startPiSession({
+			root: fixture.root,
+			cwd,
+			inlineFactory: async () => (await import("../../../index.js")).default,
+			responses: [
+				step(readTarget(filePath)),
+				step(
+					fauxToolCall("edit", {
+						path: filePath,
+						edits: [
+							{
+								oldText: "export const live = 1;",
+								newText: "export const live = 2;",
+							},
+						],
+					}),
+				),
+				endTurn(),
+			],
+		});
+		await handle.prompt("edit it");
 
-			expect(JSON.stringify(result)).toContain("dispatch output");
-		} finally {
-			fs.rmSync(cwd, { recursive: true, force: true });
-		}
+		// A handler that threw on pi's real turn_end would reach pi's error
+		// channel and leave the tool result looking healthy.
+		expect(handle.errors).toEqual([]);
+		const edits = toolResults(handle.requests.at(-1) ?? [], "edit");
+		expect(edits).toHaveLength(1);
+		expect(edits[0]?.text).toContain("dispatch output");
 	}, 30_000);
 });

@@ -72,8 +72,10 @@ verdict (a trust check, a lint, a census, a body check), it admits a short list
 of known-good forms and refuses everything else. It never enumerates known-bad
 spellings. Each review of an enumerated gate finds the next spelling it missed;
 one gate took sixteen rounds that way. Once a second round finds a new
-spelling, stop patching and redesign. Screen: can an input nobody planned for
-pass the gate?
+spelling, stop patching and redesign. A value the gate cannot resolve to a
+known-good literal (computed, concatenated, aliased, templated, reached through
+an indirection) is unrecognized: it counts as a hit, never a pass. Screen: can
+an input nobody planned for pass the gate?
 
 **Blast radius as a call-tree diff.** For any change to a shared seam, list the
 changed symbol, its callers above, its callees below, with plus and minus on the
@@ -115,6 +117,13 @@ it, and paste the red. A checked box with no transcript is treated as false. A
 mutation that fails to compile proves nothing about the test; redo it as a
 compile-valid change. A guard that cannot be made to red does not need to exist.
 
+**A precision figure names its judgement and an outside sample.** A claim that
+a rule, check or heuristic is N% precise states what counts as a true positive,
+and someone other than its author judges a random sample. "The pattern matched"
+is not "the finding is worth acting on": one rule reported 611 of 611 hits real
+on a type check, and an independent sample of 58 found none worth the rewrite.
+Below the stated bar, the rule ships disabled with the count recorded.
+
 **Tautological tests are harmful.** A test observes behaviour through the real
 seam and asserts an independent effect. It never restates the implementation,
 never asserts a value its own setup supplied, and never swaps a real in-process
@@ -137,6 +146,13 @@ timer, or wall-clock assertion is admitted with a header stating why the real
 thing is required, a registry entry, a baseline row and lane membership. A
 mocked seam is not a real spawn and gets an exemption with its reason, never an
 admission.
+
+**A gate judges the actor's delta, not inherited state.** A check run on an
+artifact someone edits (a tracker body, a shared file, a long-lived record)
+judges only what that edit adds or changes. Inherited violations belong in a
+baseline that shrinks on purpose. Refusing an honest edit for debt it did not
+create blocks the work or invites routing around the gate. If the gate cannot
+compute the delta, it checks the whole artifact, failing closed.
 
 **A new ratchet sweeps the open changes before it lands.** A governance test
 that rejects a new pattern fails every open change that already adds one, and
@@ -218,6 +234,15 @@ someone consumes.
 cleanup, triage and status upkeep. The script surfaces unfinished work and
 never hides it: stalled work is restarted, not unassigned, archived or deleted.
 Screen: is this the second time this step was done by hand?
+
+**Process carries the net-count rule too.** A new guard, hook, script, lint
+rule, ratchet or scheduled routine retires one of the same kind in the same
+change, or it cites fire data showing what the existing ones miss. Each rule
+must also earn its keep: count how often it fired, and what each fire led to
+(a real fix, a wording edit, or a route-around). One that never fired in its
+window and names no recurrence is demoted or deleted. Process cost is paid on
+every change, while the bug a rule prevents may never arrive. Screen: what
+does this rule retire, and when did the last one like it fire?
 
 ## 4. Honesty and records
 

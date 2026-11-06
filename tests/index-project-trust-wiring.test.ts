@@ -9,6 +9,7 @@ import {
 	resetProjectTrust,
 	setProjectTrustState,
 } from "../clients/project-trust.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 import { removeTempDirSync } from "./clients/test-utils.js";
 
@@ -17,7 +18,6 @@ import { removeTempDirSync } from "./clients/test-utils.js";
 vi.mock("../clients/bootstrap.js", async () => {
 	const { bootstrapSeamMock } = await import("./support/bootstrap-mock.js");
 	return bootstrapSeamMock(async () => ({
-		metricsClient: { reset: () => {} },
 		todoScanner: {},
 		biomeClient: { isAvailable: () => false },
 		ruffClient: { isAvailable: () => false },
@@ -60,7 +60,9 @@ beforeEach(() => {
 	resetProjectTrust();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	// #5146: end the sessions the case started before the trust state resets.
+	await endMockSessions();
 	resetProjectTrust();
 	for (const dir of tmpDirs.splice(0)) removeTempDirSync(dir);
 });

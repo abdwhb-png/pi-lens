@@ -41,6 +41,23 @@
  * - a comparison between axes: a key (path identity) tested against a root
  *   held as a spelling, or the reverse. No needle sees which axis a value is
  *   on; `isUnderDir` answers containment on either axis instead (#4689 r2).
+ * - an upward climb written without a parent call the third needle
+ *   (`hand-rolled-upward-walk`, #4966) reads: a `reduce`, a regex or
+ *   `slice`/`lastIndexOf` strip of the last segment, a split on the separator,
+ *   a climb through `new URL("..", base)`, or a parent call hidden inside a
+ *   helper arrow bound to a name (`const up = (p) => path.dirname(p)`, called
+ *   in the loop; the loop calls `up`, and the `dirname` sits in another
+ *   function), a recursive climb whose parent call is bound before the
+ *   recursion (`const parent = path.dirname(dir); return climb(parent)`), a
+ *   `dirname` reached through `.bind` or an in-file re-export
+ *   (`export { dirname as up }`). Live population 0 for each (#5037 r3 F9).
+ *   Each review round closed one spelling and found the next, so the redesign
+ *   (a call-graph population instead of named parents) stays on #4966. The twin suite
+ *   (`tests/clients/walker-symlink-twin-4966.test.ts`) runs the registered
+ *   walkers from a symlink twin instead of reading their spelling.
+ * - a `walkUpDirs(…, { spelling: true })` call. The option is the seam's own
+ *   named escape; the census of files that climb is the twin suite's, whose
+ *   exemptions name each spelled-by-design file and the suite pinning it.
  *
  * Scope: the shipped runtime, `clients/`, `tools/`, `mcp/` and `index.ts`,
  * without tests; `clients/path-utils.ts` is the seam and is not scanned.
@@ -90,17 +107,32 @@ const LOCAL_DEDUPE =
 const LSP_FREEZE =
 	"clients/lsp/ is frozen during the LSP split (freeze.json) and is a #4689 non-goal; its identity sites move with the LSP slice that owns them";
 
+const RENAME_EXPECTED_CONTENT =
+	"the rename flows' expected-content keys (`captureRenameExpectedContent`): a file link and its target must key one entry, and the two sites move with the rename/apply slice (#4689 batch 15), not with the async seam batch 10 that shrank this row from five sites to three";
+
 const HELM_CONTAINMENT =
 	"chart containment: a template's kernel-real path is checked against the chart's kernel-real root, and a realpath that throws refuses the template (catch -> null), which realpathOrResolve's fallback would turn into a spelling compare; `canonicalChartRoot` is the realpathOrResolve shape, named in the #4689 class sweep";
 
 const BIN_CONTAINMENT =
 	"project-local bin containment (#2556): a PATH shim's kernel-real target is checked against the kernel-real roots and a realpath that throws refuses the binary, which realpathOrResolve's fallback would turn into a spelling compare";
 
-const MUTATION_QUEUE =
-	"the per-file mutation queue keys by the async kernel realpath (fs/promises), which the seam has no async form for; a file not created yet under a directory link keys by its spelling here and by identity in normalizeMapKey, a later #4689 slice";
+const FOREIGN_CHECKOUT_FAIL_CLOSED =
+	"foreignGitRoot's two realpaths fail closed by errno: ENOENT/ENOTDIR on either side is no proof of a foreign checkout (null, silent), and any other refusal (EACCES, ELOOP) records one `test-checkout-identity-unavailable` gap and also returns null. realpathOrResolve's sync fallback returns an ancestor-plus-tail guess instead, so a missing target would be walked for a foreign `.git` and the gap record would never fire; the sync seam has no `kernelConfirmed` (only the async one does). #4689 batch 8 tried the swap and the worktree-isolation cells went red";
 
 const INSTALL_SELF_CONTAINED =
 	"clients/install-diagnostics.ts is the paste-able report for an install whose runtime dependencies did not resolve (#285/#335) and imports nothing from clients/: clients/path-utils.ts imports minimatch, so routing its one realpath (the symlinked-install probe, which compares the kernel-real package dir with the spelled one on purpose) through realpathOrResolve would stop the report loading exactly when it is needed; the import census in tests/clients/install-diagnostics.test.ts refuses any relative or bare specifier there, so that swap reds it";
+
+const INSTALL_ANCHOR_WALK =
+	"clients/install-diagnostics.ts walks up from its own module to the package.json that holds its version, six levels at most, to describe an install whose dependencies did not resolve (#285/#335); it imports nothing from clients/ (INSTALL_SELF_CONTAINED), so walkUpDirs is out of reach, and the walk is compared with the spelled package dir on purpose to report a symlinked install";
+
+const URI_KEY_INDEX_WALK =
+	"clients/lsp/edits.ts addIndex climbs the segments of a normalized URI index KEY (the descendants index of a workspace edit), not a directory on disk: the key's own separator and root semantics decide the ancestors, and walkUpDirs would resolve each one through the host filesystem and change the keys the index is read back by";
+
+const PYTHON_RELATIVE_LEVELS =
+	"a Python relative import climbs a COUNTED number of package levels (the leading dots), not to a marker: `from ..x import y` is `dots - 1` parents of the importing file's directory by package nesting, which the language defines on the spelled module path, so there is no ceiling or root to compare and no identity to take";
+
+const ANCHOR_PREFIX_COUNTED_CLIMB =
+	"clients/dispatch/rule-policy.ts anchorPrefix climbs a COUNTED number of segments: one dirname per segment of the config location's relativePath (its spelling below the directory that owns the file, such as `.pi-lens.json`), so the owning directory is a count fixed by that location, not a walk to a marker or a root; walkUpDirs stops on a marker or a root and cannot express the count, and the result is a spelled prefix for ignorePaths anchoring, with no identity taken";
 
 interface Pin {
 	sites: number;
@@ -131,9 +163,9 @@ const PINS: Readonly<Record<string, Pin>> = {
 	}, // :225, :228, :229, :231
 	"clients/dispatch/runners/helm-render.ts#raw-realpath": {
 		sites: 3,
-		identities: "ef1b14076168e8a6",
+		identities: "cf011114b0d18c1c",
 		reason: HELM_CONTAINMENT,
-	}, // :224, :225, :239
+	}, // :216, :217, :231
 	"clients/dispatch/runners/helm-render.ts#path-resolve-keyed": {
 		sites: 5,
 		identities: "6842ad1422412589",
@@ -149,31 +181,16 @@ const PINS: Readonly<Record<string, Pin>> = {
 		identities: "f640b5350df01957",
 		reason: SPELLING_MEMO,
 	}, // :1182, :1193, :1290, :1447, :1449, :1452, :1617, :1691, :1693, :1696
-	"clients/file-mutation-queue.ts#raw-realpath": {
-		sites: 2,
-		identities: "4d19f5c76da2f6ec",
-		reason: MUTATION_QUEUE,
-	}, // :27, :141
 	"clients/file-time.ts#path-resolve-keyed": {
-		sites: 9,
-		identities: "62c789065f4e9d86",
+		sites: 5,
+		identities: "90196aeba76b2323",
 		reason: PRE_4689,
-	}, // :58, :68, :78, :112, :132, :133, :139, :147, :169
-	"clients/file-utils.ts#raw-realpath": {
-		sites: 1,
-		identities: "394522becca2b539",
-		reason: PRE_4689,
-	}, // :433 (r6: keyed by its function, renamed to dataDirCanonicalRoot)
+	}, // :56, :66, :76, :110, :135 (9 -> 5, #5120: withLock's four lock-map keys went with it)
 	"clients/file-utils.ts#path-resolve-keyed": {
 		sites: 2,
 		identities: "7e723fe52bc1e91e",
 		reason: SPELLING_MEMO,
-	}, // :1518, :1529
-	"clients/inline-blocker-dispositions.ts#path-resolve-keyed": {
-		sites: 2,
-		identities: "22f213e6ea043ad8",
-		reason: LOCAL_DEDUPE,
-	}, // :147, :149
+	}, // :1524, :1535 (#4689 batch 7 moved them; count and identity unchanged)
 	"clients/install-diagnostics.ts#raw-realpath": {
 		sites: 1,
 		identities: "1e68f8fa901aa8c4",
@@ -195,10 +212,10 @@ const PINS: Readonly<Record<string, Pin>> = {
 		reason: LSP_FREEZE,
 	}, // :254
 	"clients/lsp/edits.ts#raw-realpath": {
-		sites: 5,
-		identities: "720e2ad3409465fb",
-		reason: LSP_FREEZE,
-	}, // :6, :848, :860, :1263, :1415
+		sites: 3,
+		identities: "96237f55c50b2878",
+		reason: RENAME_EXPECTED_CONTENT,
+	}, // :6, :879, :891
 	"clients/lsp/index.ts#path-resolve-keyed": {
 		sites: 1,
 		identities: "3d0caf4f32bd7a68",
@@ -229,11 +246,6 @@ const PINS: Readonly<Record<string, Pin>> = {
 		identities: "b261f1cff7bd1a5f",
 		reason: SPELLING_MEMO,
 	}, // :174, :187, :201, :226
-	"clients/metrics-client.ts#path-resolve-keyed": {
-		sites: 3,
-		identities: "bcca1f8df46f4cf5",
-		reason: PRE_4689,
-	}, // :51, :55, :67
 	"clients/ndjson-logger.ts#path-resolve-keyed": {
 		sites: 2,
 		identities: "6ecd966532221c9e",
@@ -244,11 +256,6 @@ const PINS: Readonly<Record<string, Pin>> = {
 		identities: "1f35334f3e60fd48",
 		reason: LOCAL_DEDUPE,
 	}, // :435, :436
-	"clients/partial-edit-apply.ts#raw-realpath": {
-		sites: 1,
-		identities: "c80630266fdf1779",
-		reason: PRE_4689,
-	}, // :444
 	"clients/pipeline.ts#path-resolve-keyed": {
 		sites: 2,
 		identities: "f25de8a73a269e45",
@@ -304,16 +311,11 @@ const PINS: Readonly<Record<string, Pin>> = {
 		identities: "ff517a7d1b40a92e",
 		reason: PRE_4689,
 	}, // :3811
-	"clients/sgconfig.ts#raw-realpath": {
-		sites: 1,
-		identities: "63bbad78cd8d1284",
-		reason: PRE_4689,
-	}, // :60
 	"clients/test-runner-client.ts#raw-realpath": {
 		sites: 4,
 		identities: "c1a06e8a6462ff6b",
-		reason: PRE_4689,
-	}, // :306, :327, :328, :343
+		reason: FOREIGN_CHECKOUT_FAIL_CLOSED,
+	}, // :306, :327, :328, :343 (:327 and :328 are the calls; :306 and :343 are the gap record's `realpath` label)
 	"clients/test-runner-client.ts#path-resolve-keyed": {
 		sites: 2,
 		identities: "3aedefc29eced70b",
@@ -344,6 +346,26 @@ const PINS: Readonly<Record<string, Pin>> = {
 		identities: "66db1fe5f84f9efe",
 		reason: SPELLING_MEMO,
 	}, // :696
+	"clients/install-diagnostics.ts#hand-rolled-upward-walk": {
+		sites: 1,
+		identities: "04674fe2776e3519",
+		reason: INSTALL_ANCHOR_WALK,
+	}, // :135
+	"clients/lsp/edits.ts#hand-rolled-upward-walk": {
+		sites: 1,
+		identities: "6bf01490cf649768",
+		reason: URI_KEY_INDEX_WALK,
+	},
+	"clients/review-graph/import-resolvers.ts#hand-rolled-upward-walk": {
+		sites: 1,
+		identities: "06064201b76ebaf1",
+		reason: PYTHON_RELATIVE_LEVELS,
+	}, // :415
+	"clients/dispatch/rule-policy.ts#hand-rolled-upward-walk": {
+		sites: 1,
+		identities: "70c171ce33765a1f",
+		reason: ANCHOR_PREFIX_COUNTED_CLIMB,
+	}, // :176
 };
 
 interface Occurrence {
@@ -448,19 +470,24 @@ describe("path identity sweep (#4689)", () => {
 		// Calibration on the authoring head: 530 runtime files under clients/,
 		// tools/ and mcp/ plus index.ts (seam excluded); half is 265. The live
 		// populations are 31 raw-realpath and 158 path-resolve-keyed sites,
-		// floored at 5.
+		// floored at 5; the hand-rolled upward walks (#4966) are floored at 1.
 		assertNonEmptyScan(
 			"path identity sweep: runtime files scanned",
 			scanned,
 			265,
 		);
-		for (const needle of ["raw-realpath", "path-resolve-keyed"] as const)
+		for (const [needle, floor] of [
+			["raw-realpath", 5],
+			["path-resolve-keyed", 5],
+			// The folds of #4966 left the few climbs that stay, each with a reason.
+			["hand-rolled-upward-walk", 1],
+		] as const)
 			assertNonEmptyScan(
 				`path identity sweep: ${needle} sites`,
 				occurrences.filter((occurrence) =>
 					occurrence.row.endsWith(`#${needle}`),
 				).length,
-				5,
+				floor,
 			);
 		expect(
 			auditPins(occurrences, PINS),

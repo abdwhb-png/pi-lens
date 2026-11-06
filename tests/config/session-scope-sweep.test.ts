@@ -152,12 +152,10 @@ const ACTIVATION_STATE: Readonly<Record<string, string>> = {
  * that stops being reset (or starts) reds too. `kept` fields carry a reason.
  */
 const COORDINATOR_FIELDS: Readonly<Record<string, "reset" | string>> = {
-	_actionableWarningsThisTurn: "reset",
 	_autofixDemotedThisTurn: "reset",
 	_cachedExports: "reset",
 	_cascadeRuns: "reset",
 	_cascadeSessionStats: "reset",
-	_codeQualityWarningsThisTurn: "reset",
 	_complexityBaselines: "reset",
 	_coordinatorId:
 		"kept: the construction scope's ticket names this coordinator on every session_scope_transition row (#3611)",
@@ -168,13 +166,13 @@ const COORDINATOR_FIELDS: Readonly<Record<string, "reset" | string>> = {
 	_fileLastProjectSeq: "reset",
 	_fileSeq: "reset",
 	_fixedThisTurn: "reset",
+	_foreignReadGuards: "reset",
 	_foreignTurnKeys:
 		"kept: a live concurrent session's turn key outlives the primary's replacement; its own shutdown removes it (forgetTurnSession, #3613)",
 	_foreignTurns:
 		"kept: a count that only orders concurrent sessions' turn keys, which stay distinct across a reset (#3613)",
-	_gitGuardCacheUnknownReason: "reset",
-	_gitGuardHasBlockers: "reset",
-	_gitGuardSummary: "reset",
+	_gitGuardCacheUnknown: "reset",
+	_gitGuardMemo: "reset",
 	_gitGuardUnansweredDispatches: "reset",
 	_hasStableSessionId: "reset",
 	_inlineBlockerWriteOrder: "reset",
@@ -186,6 +184,8 @@ const COORDINATOR_FIELDS: Readonly<Record<string, "reset" | string>> = {
 		"kept: a monotonic token source; restarting it would let an old settle's token match a new one",
 	_owedAnchors: "reset",
 	_owedRunners: "reset",
+	_partialApplies:
+		"kept: keyed by one call's own input object, so an entry dies with that call and no session can read another's; a call in flight across a reset still reports what its host edit wrote (#5120)",
 	_pendingCascadeRuns: "reset",
 	_pendingDeferredMutations: "reset",
 	_pendingInlineBlockers: "reset",

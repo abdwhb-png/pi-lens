@@ -7,8 +7,8 @@
 // the two cannot disagree on what counts as a guard.
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import yaml from "../clients/deps/js-yaml.js";
+import { isMainModule } from "./lib/is-main-module.mjs";
 
 // The one permission source not in workflow YAML is the repository setting
 // Actions > Workflow permissions. This repository holds "Read repository
@@ -234,11 +234,15 @@ function isEquality(expr, context, value) {
 
 const isSchedule = (e) => isEquality(e, "github.event_name", "schedule");
 const isMaster = (e) => isEquality(e, "github.ref", "refs/heads/master");
+// A job that runs only on `pull_request` never runs on a dispatch, whose
+// `github.event_name` is `workflow_dispatch` (#5062: it was ci.yml's CodeQL job).
+const isPullRequest = (e) => isEquality(e, "github.event_name", "pull_request");
 
 // `schedule || master`, or either half alone: a stricter guard that a branch
-// dispatch cannot satisfy either.
+// dispatch cannot satisfy either. `pull_request` alone is a guard too; it never
+// joins an `||`, which a dispatch could satisfy through the other operand.
 function isGuardConjunct(expr) {
-	if (isSchedule(expr) || isMaster(expr)) return true;
+	if (isSchedule(expr) || isMaster(expr) || isPullRequest(expr)) return true;
 	const ors = operands(expr, "or");
 	return ors.length === 2 && ors.some(isSchedule) && ors.some(isMaster);
 }
@@ -272,9 +276,11 @@ export function guardOf(...conditions) {
 	return { guarded: false, reason: "lacks ref guard" };
 }
 
-// A guard conjunct is only ever `schedule`, `master` or `schedule || master`,
-// so its truth under a dispatch context needs no general evaluator.
+// A guard conjunct is only ever `schedule`, `master`, `schedule || master` or
+// `pull_request`, so its truth under a dispatch context needs no general
+// evaluator.
 function holds(conjunct, context) {
+	if (isPullRequest(conjunct)) return context.event === "pull_request";
 	if (isSchedule(conjunct)) return context.event === "schedule";
 	if (isMaster(conjunct)) return context.ref === "refs/heads/master";
 	return (
@@ -360,10 +366,7 @@ export function runCli(argv, cwd = process.cwd()) {
 	};
 }
 
-if (
-	process.argv[1] &&
-	import.meta.url === pathToFileURL(process.argv[1]).href
-) {
+if (isMainModule(import.meta.url)) {
 	const { code, stdout, stderr } = runCli(process.argv.slice(2));
 	for (const line of stdout) console.log(line);
 	for (const line of stderr) console.error(line);

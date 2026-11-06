@@ -30,7 +30,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../clients/bootstrap.js", async () => {
 	const { bootstrapSeamMock } = await import("./support/bootstrap-mock.js");
 	return bootstrapSeamMock(async () => ({
-		metricsClient: { reset: () => {} },
 		todoScanner: {},
 		biomeClient: { isAvailable: () => false },
 		ruffClient: { isAvailable: () => false },
@@ -118,6 +117,7 @@ import {
 	cleanupTestEnvironmentsDrained,
 	setupTestEnvironment,
 } from "./clients/test-utils.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx } from "./support/pi-mock.js";
 
 const TMP_PREFIX = "pi-lens-3917-scope-";
@@ -139,6 +139,8 @@ describe("#3917 the default scope keeps the orphan sweep off the host process ta
 	});
 
 	afterEach(async () => {
+		// #5146: end the session before the lifecycle state and the root go.
+		await endMockSessions();
 		if (previousHome === undefined) delete process.env.PI_LENS_HOME;
 		else process.env.PI_LENS_HOME = previousHome;
 		if (previousDataDir === undefined) delete process.env.PILENS_DATA_DIR;
@@ -149,7 +151,7 @@ describe("#3917 the default scope keeps the orphan sweep off the host process ta
 	});
 
 	it("a real session_start's sweep runs to its end without reaching the process table", async () => {
-		const pi = createPiMock({ "no-lsp": true });
+		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
 		await pi.emit(
 			"session_start",

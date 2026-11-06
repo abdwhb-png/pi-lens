@@ -11,6 +11,36 @@ updates:
       # pi's own floor reaches 22.22.2 (maintainer decision 2026-09-09, #2714).
       - dependency-name: typescript-language-server
         update-types: ["version-update:semver-major"]
+    groups:
+      # @stryker-mutator/vitest-runner pins an exact peer on
+      # @stryker-mutator/core, so a bump of one alone fails `npm ci` with
+      # ERESOLVE (#5183 and #5191 each bumped one to 10.1.1).
+      stryker:
+        patterns:
+          - "@stryker-mutator/*"
+      # Minor and patch bumps share one PR per dependency type (#5275); a major
+      # stays its own PR. Dependabot assigns a dependency to the first group it
+      # matches, and `stryker` is listed first; `exclude-patterns` keeps the
+      # stryker pair out of `dev-minor` even if that order rule ever changed,
+      # because their exact peer pin must move in one PR.
+      dev-minor:
+        dependency-type: development
+        update-types:
+          - minor
+          - patch
+        exclude-patterns:
+          - "@stryker-mutator/*"
+      prod-minor:
+        dependency-type: production
+        update-types:
+          - minor
+          - patch
+      # Security updates (not the weekly version updates) of every dependency
+      # share one PR (#5275).
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: github-actions
     # The composite action under .github/actions pins the same actions/cache SHA
@@ -22,3 +52,9 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      # One PR for every action bump, so a bump of an action pinned in both
+      # directories above lands in both files at once (#5275, #4358).
+      actions:
+        patterns:
+          - "*"

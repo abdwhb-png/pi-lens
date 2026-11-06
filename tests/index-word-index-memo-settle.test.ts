@@ -27,9 +27,7 @@ const seen = vi.hoisted(() => ({
 
 vi.mock("../clients/bootstrap.js", async () => {
 	const { bootstrapSeamMock } = await import("./support/bootstrap-mock.js");
-	return bootstrapSeamMock(async () => ({
-		metricsClient: { reset: () => {} },
-	}));
+	return bootstrapSeamMock(async () => ({}));
 });
 vi.mock("../clients/runtime-session.js", () => ({
 	handleSessionStart: async (deps: {
@@ -116,7 +114,7 @@ describe("#4124: agent_settled releases the word index memo for its own session"
 	}> = [];
 
 	async function start(sessionId: string) {
-		const pi = createPiMock({ "no-lsp": true });
+		const pi = createPiMock();
 		extension(pi.asExtensionAPI());
 		const ctx = makeCtx({ cwd: tmp, sessionId });
 		await pi.emit("session_start", { reason: "startup" }, ctx);

@@ -212,9 +212,9 @@ describe("ci.yml APFS floor step, executed (#4518)", () => {
 		expect(leg(report).status).toBe(1);
 	});
 
-	it("passes at the floor, and counts failed tests as executed (the results stay advisory)", () => {
+	it("passes at the floor, but reds when the report records failures", () => {
 		expect(leg(tests(floor)).status).toBe(0);
-		expect(leg(tests(floor - 10, 10)).status).toBe(0);
+		expect(leg(tests(floor - 10, 10)).status).toBe(1);
 	});
 });
 
@@ -290,16 +290,20 @@ describe("lint.yml advisory report pipes, executed (#4518)", () => {
 		["strictness", "Generate strictness report"],
 	])(
 		"%s: a failing report script fails the step, a passing one does not",
-		(job, name) => {
-			const step = stepNamed(wf, job, name);
+		(tool, name) => {
+			const step = stepNamed(wf, "lint-advisory", name);
 			for (const [code, expected] of [
 				[1, 1],
 				[0, 0],
 			] as const) {
 				const dir = scratch();
-				fakeNode(dir, `scripts/${job}-report.mjs`, `echo report; exit ${code}`);
+				fakeNode(
+					dir,
+					`scripts/${tool}-report.mjs`,
+					`echo report; exit ${code}`,
+				);
 				const result = runStep(step, dir, {}, dir);
-				expect(result.status, `${job} child ${code}: ${result.stderr}`).toBe(
+				expect(result.status, `${tool} child ${code}: ${result.stderr}`).toBe(
 					expected,
 				);
 			}

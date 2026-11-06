@@ -29,6 +29,7 @@ import {
 	releasePrimarySession,
 } from "../../clients/session-lifecycle.js";
 import { resetSessionScopedState } from "../../clients/runtime-session.js";
+import { beginScope, retireScope } from "../../clients/session-scope.js";
 import {
 	getDegradationSummary,
 	resetDegradationLedger,
@@ -53,7 +54,7 @@ import {
 	normalizeMapKey,
 	resolveHostToolPath,
 } from "../../clients/path-utils.js";
-import { pinFixtureHome } from "./test-utils.js";
+import { pinFixtureHome, writeLinkedWorktree } from "./test-utils.js";
 import {
 	captureFileStats,
 	getOpaqueBaselineStore,
@@ -225,30 +226,6 @@ it("keeps intended vendor skips silent (#4218)", async () => {
 });
 
 /**
- * A checkout with one linked worktree, written as git writes it: `<repo>/.git`
- * is a directory (the shared commondir), `<worktree>/.git` is a file holding
- * `gitdir: <repo>/.git/worktrees/<name>`, that gitdir's `commondir` points
- * back at the shared `.git`, and each gitdir holds a `HEAD`. `resolveGitCheckout`/`resolveLinkedWorktreeOwner`
- * read exactly these files, so no `git` child is needed to classify the file.
- */
-function writeLinkedWorktree(root: string): { repo: string; worktree: string } {
-	const repo = path.join(root, "repo");
-	const worktree = path.join(root, "repo-wt");
-	const gitDir = path.join(repo, ".git");
-	const linkedGitDir = path.join(gitDir, "worktrees", "repo-wt");
-	fs.mkdirSync(linkedGitDir, { recursive: true });
-	fs.mkdirSync(worktree, { recursive: true });
-	fs.writeFileSync(path.join(repo, "package.json"), "{}\n");
-	fs.writeFileSync(path.join(worktree, ".git"), `gitdir: ${linkedGitDir}\n`);
-	fs.writeFileSync(path.join(linkedGitDir, "commondir"), "../..\n");
-	// git writes a HEAD in both gitdirs, and a `.git` directory without one is
-	// not a repository to `resolveGitCheckout` (#4508).
-	fs.writeFileSync(path.join(gitDir, "HEAD"), "ref: refs/heads/main\n");
-	fs.writeFileSync(path.join(linkedGitDir, "HEAD"), "ref: refs/heads/wt\n");
-	return { repo, worktree };
-}
-
-/**
  * What `runPipeline` returns for a linked-worktree edit, by verdict: the
  * shapes `tests/clients/pipeline.test.ts` pins on the real pipeline (its
  * "All-clear output" cells). A clean run's output is the all-clear line,
@@ -311,14 +288,12 @@ function linkedWorktreeEdit(checkoutRoot: string) {
 			readGuard: runtime.readGuard,
 			agentBehaviorRecord: () => [],
 			formatBehaviorWarnings: () => "",
-			// The pipeline is doubled, so these three only satisfy
-			// `ensureToolResultClients` (`deps.biomeClient && deps.ruffClient &&
-			// deps.metricsClient`): the dispatch itself must be REACHED for the
-			// delivery rung to be the thing under test, and a failed bootstrap
-			// demand would skip it.
+			// The pipeline is doubled, so these two only satisfy
+			// `ensureToolResultClients` (`deps.biomeClient && deps.ruffClient`):
+			// the dispatch itself must be REACHED for the delivery rung to be the
+			// thing under test, and a failed bootstrap demand would skip it.
 			biomeClient: {},
 			ruffClient: {},
-			metricsClient: {},
 		}) as never;
 	return { repo, worktree, worktreeFile, runtime, editResult };
 }
@@ -483,6 +458,78 @@ it("records the linked-worktree row for a worktree under a pi-owned temp dir", a
 // Recurrence: #4734 Sourcery thread 4. The row was written after the pipeline
 // await without the #3596 liveness check, so a replaced session's handler
 // latched its once-key in the new session's ledger.
+/**
+ * #5108 review F1, class sweep: the caller names the session an advisory
+ * belongs to (`deps.advisoryScope`), because the coordinator's own scope is
+ * the primary's and a concurrent secondary drains its own (#473). Recurrence
+ * prevented: a `queueAgentAdvisory` site here that takes `writeSession`, so a
+ * secondary's notice reaches the primary's context. The outside-root and
+ * adopted-root sites are witnessed through `index.ts` in
+ * `tests/index-3748-advisory-scope-witness.test.ts`.
+ */
+describe("tool_result advisories follow the caller's advisory scope (#5108 F1)", () => {
+	async function editUnderSecondary(
+		prefix: string,
+		pipeline: (ctx: { onFixRunLoss?: (notice: string) => void }) => unknown,
+	) {
+		resetDegradationLedger();
+		const env = setupTestEnvironment(prefix);
+		const checkoutRoot = path.join(
+			env.tmpDir,
+			"..",
+			`capture-5108-${process.pid}-${prefix}`,
+		);
+		const { runtime, editResult } = linkedWorktreeEdit(checkoutRoot);
+		const secondary = beginScope({ role: "secondary" });
+		try {
+			vi.mocked(runPipeline).mockImplementation(
+				async (ctx) => pipeline(ctx as never) as never,
+			);
+			await handleToolResult({
+				...(editResult() as object),
+				advisoryScope: secondary.capture(),
+			} as never);
+			return {
+				secondary: consumeAgentNudge(undefined, secondary)?.messages ?? [],
+				primary: consumeAgentNudge(undefined, runtime.sessionScope),
+			};
+		} finally {
+			vi.mocked(runPipeline).mockReset();
+			retireScope(secondary, "shutdown");
+			env.cleanup();
+			fs.rmSync(checkoutRoot, { recursive: true, force: true });
+		}
+	}
+
+	it("queues the linked-worktree clean notice for the advisory scope", async () => {
+		const { secondary, primary } = await editUnderSecondary("wt-clean", () =>
+			linkedWorktreeResult.clean(),
+		);
+		expect(secondary).toEqual([
+			expect.objectContaining({
+				content: expect.stringContaining("found nothing to report"),
+			}),
+		]);
+		expect(primary).toBeUndefined();
+	});
+
+	it("queues a fix-run loss notice for the advisory scope", async () => {
+		const { secondary, primary } = await editUnderSecondary(
+			"fix-loss",
+			(ctx) => {
+				ctx.onFixRunLoss?.("restore lost edit 5108-loss.ts");
+				return linkedWorktreeResult.uncheckedCleanLine();
+			},
+		);
+		expect(secondary).toEqual([
+			expect.objectContaining({
+				content: expect.stringContaining("5108-loss.ts"),
+			}),
+		]);
+		expect(primary).toBeUndefined();
+	});
+});
+
 it("a linked-worktree result settling after a replacement records nothing in the new session", async () => {
 	resetDegradationLedger();
 	const env = setupTestEnvironment("pi-lens-2657-worktree-replaced-");
@@ -1155,7 +1202,6 @@ describe("bash grep searchReads registration", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				readGuard: runtime.readGuard,
 				agentBehaviorRecord,
@@ -2015,7 +2061,6 @@ describe("bash grep searchReads registration", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2054,7 +2099,6 @@ describe("bash grep searchReads registration", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2118,7 +2162,6 @@ describe("bash grep searchReads registration", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2218,7 +2261,6 @@ describe("bash grep searchReads registration", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2245,7 +2287,6 @@ describe("bash grep searchReads registration", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2293,7 +2334,6 @@ describe("bash grep searchReads registration", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2339,7 +2379,6 @@ describe("bash grep searchReads registration", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2399,7 +2438,6 @@ describe("bash grep searchReads registration", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2466,7 +2504,6 @@ describe("bash grep searchReads registration", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2518,7 +2555,6 @@ describe("bash grep searchReads registration", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2563,7 +2599,6 @@ describe("bash external-delete detection (#1668)", () => {
 			cacheManager: new CacheManager(false),
 			biomeClient: {},
 			ruffClient: {},
-			metricsClient: {},
 			resetLSPService: () => {},
 			agentBehaviorRecord: () => [],
 			formatBehaviorWarnings: () => "",
@@ -2785,7 +2820,6 @@ describe("monorepo turn-state cwd alignment", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2869,7 +2903,6 @@ describe("monorepo turn-state cwd alignment", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -2934,7 +2967,6 @@ describe("monorepo turn-state cwd alignment", () => {
 					biomeClient: {},
 					ruffClient: {},
 					testRunnerClient: {},
-					metricsClient: {},
 					resetLSPService: () => {},
 					agentBehaviorRecord: () => [],
 					formatBehaviorWarnings: () => "",
@@ -3023,7 +3055,6 @@ describe("monorepo turn-state cwd alignment", () => {
 					biomeClient: {},
 					ruffClient: {},
 					testRunnerClient: {},
-					metricsClient: {},
 					resetLSPService: () => {},
 					agentBehaviorRecord: () => [],
 					formatBehaviorWarnings: () => "",
@@ -3099,7 +3130,7 @@ describe("monorepo turn-state cwd alignment", () => {
 		requestBootstrapClients.mockImplementationOnce(async () => {
 			entered.resolve();
 			await release.promise;
-			return { biomeClient: {}, ruffClient: {}, metricsClient: {} };
+			return { biomeClient: {}, ruffClient: {} };
 		});
 		resetDegradationLedger();
 		const env = setupTestEnvironment("pi-lens-3568-entry-cascade-");
@@ -3270,10 +3301,12 @@ describe("runtime-tool-result writers across a replacement (#3596)", () => {
 		runtime: RuntimeCoordinator;
 		cacheManager: CacheManager;
 		flags?: string[];
+		toolName?: string;
+		clientsReady?: boolean;
 	}) {
 		return {
 			event: {
-				toolName: "edit",
+				toolName: args.toolName ?? "edit",
 				input: { path: args.filePath },
 				details: { diff: "+  1 export const x = 2;" },
 				content: [{ type: "text", text: "ok" }],
@@ -3286,6 +3319,12 @@ describe("runtime-tool-result writers across a replacement (#3596)", () => {
 			resetLSPService: () => {},
 			agentBehaviorRecord: () => [],
 			formatBehaviorWarnings: () => "",
+			...(args.clientsReady
+				? {
+						biomeClient: {},
+						ruffClient: {},
+					}
+				: {}),
 		} as any;
 	}
 
@@ -3346,7 +3385,7 @@ describe("runtime-tool-result writers across a replacement (#3596)", () => {
 		requestBootstrapClients.mockImplementationOnce(async () => {
 			entered.resolve();
 			await release.promise;
-			return { biomeClient: {}, ruffClient: {}, metricsClient: {} };
+			return { biomeClient: {}, ruffClient: {} };
 		});
 		await acrossReplacement(
 			"parked",
@@ -3471,10 +3510,180 @@ describe("runtime-tool-result writers across a replacement (#3596)", () => {
 				runtime.beginTurn();
 				release.resolve();
 				await handler;
-				expect(runtime.gitGuardCacheUnknownReason).toBeUndefined();
+				expect(runtime.gitGuardCacheUnknownFor()).toBeUndefined();
 			},
 		);
 	});
+	it(
+		"a dispatch settling after the 10 s inner bound queues its withheld line for the calling scope while that session lives, and for no one after a replacement (#5108)",
+		{ timeout: 40_000 },
+		async () => {
+			// RECURRENCE GUARDED: #5108 remainder. The bound abandons the dispatch, and
+			// the continuation that hands its withheld line to the agent runs after an
+			// await against the LIVE coordinator: without the #3596 liveness check, or
+			// with the coordinator's own scope in place of the caller's (#473), the
+			// line reaches the wrong session or a session that never wrote the file; an
+			// Escape mid-check (a cancelled turn) must queue nothing at all.
+			// The 10 s is the real bound, so this case holds a live 10 s wait.
+			const { runPipeline } = await import("../../clients/pipeline.js");
+			const settle = new Map<string, ReturnType<typeof gatedPromise<void>>>();
+			const entered = new Map<string, ReturnType<typeof gatedPromise<void>>>();
+			vi.mocked(runPipeline).mockReset();
+			vi.mocked(runPipeline).mockImplementation((async (ctx: {
+				filePath: string;
+			}) => {
+				const name = path.basename(ctx.filePath);
+				entered.get(name)?.resolve();
+				await settle.get(name)?.promise;
+				return {
+					output: "",
+					hasBlockers: false,
+					isError: false,
+					fileModified: false,
+					checkedClean: false,
+					withheldBlockerLine: `\u26a0 1 blocking finding in ${name} withheld: test`,
+				};
+			}) as never);
+			// Event-driven: the row is the only observable of the continuation.
+			const lateSeen = gatedPromise<void>();
+			logLatency.mockClear();
+			logLatency.mockImplementation((row?: { phase?: string }) => {
+				if (row?.phase === "withheld_blocker_late_advisory") lateSeen.resolve();
+			});
+			const lateRows = () =>
+				logLatency.mock.calls.filter(
+					([row]) => row?.phase === "withheld_blocker_late_advisory",
+				);
+			try {
+				await acrossReplacement(
+					"late-withheld",
+					async ({ tmpDir, filePath, runtime, cacheManager }) => {
+						vi.useFakeTimers({
+							toFake: ["setTimeout", "clearTimeout"],
+						});
+						const goneFile = createTempFile(tmpDir, "gone.ts", "export {};\n");
+						const abortedFile = createTempFile(
+							tmpDir,
+							"aborted.ts",
+							"export {};\n",
+						);
+						const supersededFile = createTempFile(
+							tmpDir,
+							"superseded.ts",
+							"export {};\n",
+						);
+						for (const name of [
+							"edit.ts",
+							"gone.ts",
+							"aborted.ts",
+							"superseded.ts",
+						]) {
+							settle.set(name, gatedPromise<void>());
+							entered.set(name, gatedPromise<void>());
+						}
+						const secondary = beginScope({ role: "secondary" });
+						try {
+							const liveHandler = handleToolResult({
+								...toolResultDeps({
+									filePath,
+									runtime,
+									cacheManager,
+									clientsReady: true,
+								}),
+								advisoryScope: secondary.capture(),
+							});
+							const goneHandler = handleToolResult(
+								toolResultDeps({
+									filePath: goneFile,
+									runtime,
+									cacheManager,
+									clientsReady: true,
+								}),
+							);
+							// Escape after the bound: a cancelled turn, not a late result.
+							const escape = new AbortController();
+							const abortedHandler = handleToolResult({
+								...toolResultDeps({
+									filePath: abortedFile,
+									runtime,
+									cacheManager,
+									clientsReady: true,
+								}),
+								signal: escape.signal,
+							});
+							const supersededHandler = handleToolResult(
+								toolResultDeps({
+									filePath: supersededFile,
+									runtime,
+									cacheManager,
+									clientsReady: true,
+								}),
+							);
+							await Promise.all([
+								entered.get("edit.ts")?.promise,
+								entered.get("gone.ts")?.promise,
+								entered.get("aborted.ts")?.promise,
+								entered.get("superseded.ts")?.promise,
+							]);
+							fs.writeFileSync(
+								supersededFile,
+								"export const changed = true;\n",
+							);
+							await vi.advanceTimersByTimeAsync(10_000);
+							await abortedHandler;
+							escape.abort();
+							settle.get("aborted.ts")?.resolve();
+							await vi.advanceTimersByTimeAsync(0);
+							expect(lateRows()).toEqual([]);
+							// Both handlers return at the inner bound with nothing collected.
+							await Promise.all([liveHandler, goneHandler, supersededHandler]);
+							settle.get("superseded.ts")?.resolve();
+							await vi.advanceTimersByTimeAsync(0);
+							expect(lateRows()).toEqual([]);
+							expect(lateRows()).toEqual([]);
+
+							settle.get("edit.ts")?.resolve();
+							await lateSeen.promise;
+							expect(lateRows()[0]?.[0]).toMatchObject({
+								filePath: "edit",
+								metadata: { notices: 1, late: "inner-bound" },
+							});
+							expect(
+								consumeAgentNudge(undefined, runtime.sessionScope),
+							).toBeUndefined();
+							const delivered =
+								consumeAgentNudge(undefined, secondary)?.messages ?? [];
+							expect(delivered).toEqual([
+								expect.objectContaining({
+									content: expect.stringMatching(
+										/abandoned[^]*edit\.ts withheld/,
+									),
+								}),
+							]);
+							expect(delivered[0]?.content).toContain(
+								"this edit call was still running when the inner 10000ms analysis bound fired",
+							);
+
+							// Session 2 starts; the held dispatch of session 1 settles.
+							runtime.resetForSession();
+							runtime.beginTurn();
+							settle.get("gone.ts")?.resolve();
+							await new Promise((resolve) => setImmediate(resolve));
+							expect(lateRows()).toHaveLength(1);
+							expect(
+								consumeAgentNudge(undefined, runtime.sessionScope),
+							).toBeUndefined();
+						} finally {
+							retireScope(secondary, "shutdown");
+						}
+					},
+				);
+			} finally {
+				vi.useRealTimers();
+				logLatency.mockReset();
+			}
+		},
+	);
 	it("drops another session's git-guard section only for a write that reached a whole-file clean verdict (#4733 r1 F2)", async () => {
 		// RECURRENCE GUARDED: #4733 r1 F2 (Greptile "Unanswered checks clear
 		// blockers"). Every live write under `--lens-guard` called
@@ -4025,7 +4234,7 @@ describe("runtime-tool-result writers across a replacement (#3596)", () => {
 				await entered.promise;
 				runtime.resetForSession();
 				runtime.beginTurn();
-				runtime.markGitGuardCacheUnknown("cache_corrupt");
+				runtime.markGitGuardCacheUnknown("cache_corrupt", tmpDir);
 				release.resolve();
 				await handler;
 				expect(evaluateGitGuard(runtime, cacheManager, tmpDir).block).toBe(
@@ -4179,7 +4388,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -4265,7 +4473,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -4336,7 +4543,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -4626,7 +4832,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -4905,7 +5110,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -4952,7 +5156,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -5032,13 +5235,88 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
 			} as any);
 			expect(vi.mocked(runPipeline)).toHaveBeenCalledTimes(1);
 		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("logs deferred_format_queued only for a deferral the coordinator accepted (#4689 item 9)", async () => {
+		// Recurrence it prevents: the phase row was written after
+		// `deferFormat` whatever it answered, so an adopted project's edit
+		// (`canWriteAnalysisRoot` refuses it, nothing is queued) still logged
+		// "deferred_format_queued" and read as a queue entry in the latency log
+		// (#4689 probe row d1-obs). Observed through the production
+		// `handleToolResult` with a real coordinator; the control row proves
+		// the phase is still written for a session file.
+		const { runPipeline } = await import("../../clients/pipeline.js");
+		const env = setupTestEnvironment("pi-lens-4689-deferred-queued-");
+		// A direct child of the temp root with no `pi-lens-` prefix: a pi-owned
+		// temp path is refused as an analysis root, which is the `none` class and
+		// not the adopted one this case measures (#4560).
+		const adopted = path.join(
+			path.dirname(env.tmpDir),
+			`capture-4689-adopted-${process.pid}`,
+		);
+		try {
+			const session = env.tmpDir;
+			fs.mkdirSync(adopted, { recursive: true });
+			fs.writeFileSync(path.join(adopted, "package.json"), "{}\n");
+			const sessionFile = createTempFile(session, "in.ts", "let a = 1;\n");
+			const adoptedFile = createTempFile(adopted, "out.ts", "let b = 1;\n");
+			vi.mocked(runPipeline).mockResolvedValue({
+				output: "",
+				hasBlockers: false,
+				isError: false,
+				fileModified: false,
+				checkedClean: false,
+			});
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = session;
+			const debugLines: string[] = [];
+			const run = async (filePath: string) => {
+				logLatency.mockClear();
+				debugLines.length = 0;
+				await handleToolResult({
+					event: { toolName: "edit", input: { path: filePath }, content: [] },
+					getFlag: () => false,
+					dbg: (line: string) => debugLines.push(line),
+					runtime,
+					cacheManager: {
+						addModifiedRange: () => {},
+						readTurnState: () => ({}),
+					},
+					biomeClient: {},
+					ruffClient: {},
+					resetLSPService: () => {},
+					agentBehaviorRecord: () => [],
+					formatBehaviorWarnings: () => "",
+				} as any);
+				return logLatency.mock.calls.filter(
+					([row]) => row?.phase === "deferred_format_queued",
+				);
+			};
+
+			expect(resolveAnalysisRoot(adoptedFile, session)).toBe("adopted");
+			expect(await run(sessionFile)).toHaveLength(1);
+			expect(runtime.consumeDeferredFormatFiles()).toHaveLength(1);
+			// The control also claims both queue lines (debug record).
+			expect(
+				debugLines.filter((line) => line.includes("queued deferred")),
+			).toHaveLength(2);
+
+			expect(await run(adoptedFile)).toHaveLength(0);
+			expect(runtime.consumeDeferredFormatFiles()).toHaveLength(0);
+			// #4957 review F2: the autofix debug line claimed a refused entry too.
+			expect(
+				debugLines.filter((line) => line.includes("queued deferred")),
+			).toEqual([]);
+		} finally {
+			fs.rmSync(adopted, { recursive: true, force: true });
 			env.cleanup();
 		}
 	});
@@ -5065,7 +5343,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -5124,7 +5401,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -5137,7 +5413,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				cacheManager: { addModifiedRange: () => {}, readTurnState: () => ({}) },
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -5205,7 +5480,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -5329,7 +5603,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [
 					{
@@ -5404,7 +5677,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [
 					{
@@ -5476,7 +5748,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -5568,7 +5839,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -5661,7 +5931,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -5797,7 +6066,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -5881,7 +6149,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -5926,7 +6193,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService,
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -5971,7 +6237,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService,
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6017,7 +6282,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService,
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6088,7 +6352,6 @@ describe("runtime-tool-result inline behavior warnings", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6161,7 +6424,6 @@ describe("#484 turn-summary collection gate", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6221,7 +6483,6 @@ describe("#484 turn-summary collection gate", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6300,7 +6561,6 @@ describe("#3246 inline blocker provenance", () => {
 				biomeClient: {},
 				ruffClient: {},
 				testRunnerClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6396,7 +6656,6 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6490,7 +6749,6 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6588,7 +6846,6 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6635,7 +6892,6 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6706,7 +6962,6 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6791,7 +7046,6 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6866,7 +7120,6 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6938,7 +7191,6 @@ describe("path attribution across tool_call/tool_result (#1642)", () => {
 				cacheManager: new CacheManager(false),
 				biomeClient: {},
 				ruffClient: {},
-				metricsClient: {},
 				resetLSPService: () => {},
 				agentBehaviorRecord: () => [],
 				formatBehaviorWarnings: () => "",
@@ -6998,7 +7250,6 @@ describe("host tool path resolution on the tool_result side (#4576)", () => {
 			cacheManager: new CacheManager(false),
 			biomeClient: {},
 			ruffClient: {},
-			metricsClient: {},
 			resetLSPService: () => {},
 			readGuard: runtime.readGuard,
 			agentBehaviorRecord: () => [],
@@ -7192,7 +7443,6 @@ describe("the prescan root reaches the send and the recognized set (#4504 r1)", 
 			cacheManager: new CacheManager(false),
 			biomeClient: {},
 			ruffClient: {},
-			metricsClient: {},
 			resetLSPService: () => {},
 			readGuard: runtime.readGuard,
 			agentBehaviorRecord: () => [],
@@ -7342,6 +7592,95 @@ describe("the prescan root reaches the send and the recognized set (#4504 r1)", 
 			expect(resync).toHaveBeenCalledWith(
 				[normalizeMapKey(held)],
 				expect.any(Number),
+			);
+		} finally {
+			env.cleanup();
+		}
+	});
+});
+
+/**
+ * #1884 item 3: `tool_call` records a resolution basis only for a mutation and
+ * `read` (`attributesMutationTarget` in `clients/runtime-tool-call.ts`). A
+ * read-family tool that takes a RELATIVE path — `lsp_navigation` among them —
+ * therefore reached the `path_attribution_missing` refusal and returned before
+ * `details.searchReads` was registered, so the lines the navigation SHOWED the
+ * agent were blocked on the follow-up edit. A `searchReads` entry carries its
+ * own path, so the refusal (a rule about the call's named path) never had a
+ * reason to cost those lines.
+ */
+describe("searchReads survive the path-attribution refusal (#1884)", () => {
+	it("registers an lsp_navigation result's shown lines when its relative path has no attribution (#1884)", async () => {
+		const env = setupTestEnvironment("pi-lens-1884-nav-searchreads-");
+		try {
+			const filePath = path.join(env.tmpDir, "src", "app.ts");
+			fs.mkdirSync(path.dirname(filePath), { recursive: true });
+			fs.writeFileSync(
+				filePath,
+				Array.from({ length: 120 }, (_, i) => `line${i + 1}`).join("\n") + "\n",
+			);
+			const runtime = new RuntimeCoordinator();
+			runtime.projectRoot = env.tmpDir;
+			const cacheManager = new CacheManager(false);
+			// Production order: the call, then its result. `lsp_navigation`
+			// declares `path` (not `filePath`), and `tool_call` attributes no
+			// resolution basis for a tool that is neither a mutation nor `read`,
+			// so this result arrives with a relative path and no basis under it.
+			await runHandlerExpectingNoThrow(() =>
+				handleToolCall({
+					event: {
+						toolName: "lsp_navigation",
+						toolCallId: "1884-nav",
+						input: { operation: "references", path: "src/app.ts", line: 42 },
+					},
+					ctx: { cwd: env.tmpDir },
+					lensEnabled: true,
+					getFlag: (name: string) => name === "no-lsp",
+					dbg: () => {},
+					runtime,
+					cacheManager,
+					ensureLSPConfigInitialized: async () => {},
+					updateLspStatus: () => {},
+					resetLSPService: () => {},
+				} as never),
+			);
+
+			const dbg = vi.fn();
+			await handleToolResult({
+				event: {
+					toolName: "lsp_navigation",
+					toolCallId: "1884-nav",
+					input: { operation: "references", path: "src/app.ts", line: 42 },
+					content: [{ type: "text", text: `${filePath}:42: line42` }],
+					details: {
+						operation: "references",
+						searchReads: [{ file: filePath, startLine: 42, endLine: 42 }],
+					},
+				},
+				getFlag: () => false,
+				dbg,
+				runtime,
+				cacheManager,
+				resetLSPService: () => {},
+				readGuard: runtime.readGuard,
+				agentBehaviorRecord: () => [],
+				formatBehaviorWarnings: () => "",
+			} as never);
+
+			// The refusal still fires: nothing path-keyed ran for the call's own
+			// relative path, so turn state and dispatch stay fail-closed.
+			expect(dbg).toHaveBeenCalledWith(
+				expect.stringContaining("path_attribution_missing"),
+			);
+			// ...and the line the navigation SHOWED counts as read, so the
+			// follow-up edit to it is not blocked.
+			expect(runtime.readGuard.checkEdit(filePath, [42, 42]).action).toBe(
+				"allow",
+			);
+			// Only the shown line: a region the result never delivered is still
+			// guarded (#1904).
+			expect(runtime.readGuard.checkEdit(filePath, [100, 100]).action).toBe(
+				"block",
 			);
 		} finally {
 			env.cleanup();

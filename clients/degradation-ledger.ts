@@ -190,6 +190,14 @@ export type DegradationKind =
 	| "cascade-pending-cap"
 	/** #4487: the pending neighbour-error record reached its cap. */
 	| "cascade-pending-neighbors-evicted"
+	/**
+	 * #5040: a cascade neighbour's only answer was a cache entry published BEFORE
+	 * the run's edit (a push-only server that never republishes a dependent). The
+	 * neighbour is now unconfirmed rather than clean; the subject is
+	 * `<serverId>:<path key>` and the record counts per session, so a repeated
+	 * exporter edit does not need a new kind to be visible.
+	 */
+	| "cascade-pre-edit-answer"
 	| "cascade-tier3-backlog-evicted"
 	/**
 	 * #3511: the change-log lock stayed held past its bounded wait (or its
@@ -251,6 +259,14 @@ export type DegradationKind =
 	 */
 	| "context-injection-retain-declined"
 	/**
+	 * #5020: a row of an inline-blocker record that names ANOTHER file (a
+	 * chart-wide or import-following runner reports one against the written
+	 * file) left the record because the cited file was dispatched clean by the
+	 * runner that raised it, or no longer exists. The reason names which. One
+	 * subject per record file key, counted across the session.
+	 */
+	| "cross-file-row-retired"
+	/**
 	 * A warm-only client lookup (`getWarmClientForFile`) found no live client
 	 * for a file that HAS a language server with a resolvable root (#1934).
 	 * Subject is the candidate `serverId:root` set, so the ledger still answers
@@ -288,6 +304,8 @@ export type DegradationKind =
 	 * repeats it every turn.
 	 */
 	| "dead-code-late-scan-dropped"
+	/** A deferred autofix scope was already attempted; once per tool/scope per session. */
+	| "deferred-autofix-duplicate-scope"
 	/**
 	 * #3814: the commit gate's pre-check of settled collect-later runner answers
 	 * (`absorbSettledRunnerBlockers`) threw. The gate falls back to the blocker
@@ -445,6 +463,13 @@ export type DegradationKind =
 	 */
 	| "formatter-unavailable"
 	/**
+	 * #5086: a read or edit touched a code file whose language has no table in
+	 * `clients/metrics/function-metrics.ts`, so it gets no complexity metrics
+	 * (none, never zeros). Subject is the grammar id, or the file kind when the
+	 * language has no grammar; once per session.
+	 */
+	| "function-metrics-language-unsupported"
+	/**
 	 * The project-snapshot persist seam detected durable meta/body evidence
 	 * failing the #2008 integrity gate — the meta's recorded gz size no longer
 	 * matches the on-disk body (torn/truncated gzip under an intact meta), or a
@@ -474,6 +499,13 @@ export type DegradationKind =
 	 * session; subject is the lock directory.
 	 */
 	| "generation-lock-wait-skipped"
+	/**
+	 * #4921: a concurrent in-process session's write, with no blocker of its
+	 * own, met a commit-gate record another session owns and left it (and the
+	 * process-wide latch) untouched. Subject is the writing session; once per
+	 * session, because each of its clean writes meets the same record.
+	 */
+	| "git-guard-non-owner-write"
 	/**
 	 * Failed-first test state was retired only after ENOENT/ENOTDIR evidence,
 	 * retained when the filesystem probe was indeterminate, or evicted at the
@@ -550,6 +582,16 @@ export type DegradationKind =
 	 * (`runtime-tool-result.ts`); a row here names a producer that did not.
 	 */
 	| "inline-blocker-unstructured"
+	/**
+	 * #5231: an install the lazy installer or govulncheck would have run was
+	 * refused because `PI_LENS_DISABLE_TOOL_INSTALL=1` (`isToolInstallDisabled`).
+	 * Subject is the tool id (`rubocop`, `rustfmt`, `govulncheck`), recorded
+	 * ONCE per tool per session (`recordDegradationOnce`): both entry points
+	 * are reached per save, so a counted row would grow without adding
+	 * information. The managed installer reports the same refusal through its
+	 * own install-attempt record.
+	 */
+	| "install-disabled"
 	/**
 	 * #3515: the install lock's generation was no longer owned when
 	 * `installNpmTool` re-checked right before a second critical write (the
@@ -786,10 +828,18 @@ export type DegradationKind =
 	 */
 	| "lsp-created-import-scan-incomplete"
 	/**
-	 * #4476: the walk of a root's declaration files passed its directory or
-	 * file cap, so a declaration file created, edited or deleted outside
-	 * pi-lens under that root reaches no language server and refuses no
-	 * diagnostics-cache entry (clients/out-of-band-changes.ts). Once per root.
+	 * Two emitters, both in clients/out-of-band-changes.ts.
+	 *
+	 * #4476, the cap: the walk of a root's declaration files passed its
+	 * directory or file cap, so a declaration file created, edited or deleted
+	 * outside pi-lens under that root reaches no language server and refuses no
+	 * diagnostics-cache entry. Subject is the root. Once per root.
+	 *
+	 * #4905, the home ceiling: the root is the home folder or above it
+	 * (compared by real path), so the declaration walk is skipped and a
+	 * declaration file changed outside pi-lens under it is not looked for. The
+	 * install stamp is still read and compared, so an install still publishes.
+	 * Subject is `home-root`. Once per session.
 	 */
 	| "lsp-declaration-look-capped"
 	/**
@@ -1085,6 +1135,14 @@ export type DegradationKind =
 	 */
 	| "lsp-sibling-announcement"
 	/**
+	 * #4532 gap 13: a module a diagnostics call's target imports, open in no
+	 * server, could not be read to compare its bytes with the ones last seen
+	 * (clients/lsp/index.ts `unheldBytesMoved`). Its stat alone is compared, so
+	 * a rewrite of the same bytes is sent as a change. Subject is the path.
+	 * Once per path per session.
+	 */
+	| "lsp-unheld-dependency-unreadable"
+	/**
 	 * A language-server child process CLOSED without pi-lens having asked it to
 	 * (#1969). `clientShutdown()` sets `state.shutdownRequested`, so evictions
 	 * and ordinary teardown never reach this kind — only a mid-session death.
@@ -1103,6 +1161,14 @@ export type DegradationKind =
 	 * is a fact about the server rather than a race with the pipe.
 	 */
 	| "lsp-warm-client-missing"
+	/**
+	 * #5131: an empty version-less `publishDiagnostics` followed the client's own
+	 * first-open `workspace/didChangeWatchedFiles` for a document the server had
+	 * already reported on, and was held: the server recompiled from disk on the
+	 * notice and cleared a real finding. Subject is the server id; counted per
+	 * held publish, one latest-reason entry per server.
+	 */
+	| "lsp-watched-echo-held"
 	/**
 	 * A liveness probe (`clientPingLiveness`, `clients/lsp/client.ts`) found no
 	 * request method the server advertises that it could safely probe with, so
@@ -1149,6 +1215,13 @@ export type DegradationKind =
 	| "madge-skip-visibility-unavailable"
 	| "managed-tool-install"
 	| "managed-tool-refresh"
+	/**
+	 * #5119: the markdownlint runner could not lint through markdownlint-cli2's
+	 * exported `main` (module not found beside the command, or it did not load),
+	 * so it spawned the CLI, where a project `"fix": true` can still rewrite the
+	 * file. Subject is the resolved command; once per session.
+	 */
+	| "markdownlint-api-unavailable"
 	/** A complete MCP result exceeded the hard input budget (#2848). */
 	| "mcp-complete-result-budget-exceeded"
 	/**
@@ -1302,6 +1375,14 @@ export type DegradationKind =
 	 * the error message.
 	 */
 	| "persist-worker-message-contained"
+	/**
+	 * `realIsPidAlive` (`clients/pid-liveness.ts`) read a `process.kill(pid, 0)`
+	 * error that is neither ESRCH (dead) nor EPERM (alive, not signalable) as
+	 * alive: a pid Node refuses to signal at all, such as one above 2^31-1
+	 * (`ERR_INVALID_ARG_TYPE`). Once per code per session. Subject is the
+	 * error code.
+	 */
+	| "pid-liveness-unprobeable"
 	/**
 	 * #3311: a registry entry declares `pipConstraints`, but the constraints file
 	 * the pip ladder hands to `PIP_CONSTRAINT` could not be written. The install
@@ -1658,6 +1739,12 @@ export type DegradationKind =
 	 * root is rescanned every session and turn.
 	 */
 	| "scan-worktree-exclusion-skipped"
+	/**
+	 * A report-file security scanner (gitleaks, trivy) could not produce a result:
+	 * its CLI failed to spawn, exited non-zero without writing its report, or
+	 * the scan threw. Subject is the tool; counted, with the latest message kept.
+	 */
+	| "security-scan-report-failed"
 	/** A duplicate RPC session start was suppressed after its first full pass. */
 	/** A self-drift baseline could not be verified within its available evidence. */
 	| "self-drift-hash-budget-exhausted"
@@ -1690,6 +1777,12 @@ export type DegradationKind =
 	 * start reason.
 	 */
 	| "session-scope-handoff-missed"
+	/**
+	 * #4965: a session-state write named a session with no live scope (never
+	 * started here, or already retired), so it was dropped. Subject: the scope
+	 * cell it targeted (`turn-warnings`, `cache-attribution`). Counted.
+	 */
+	| "session-scope-lookup-missed"
 	/**
 	 * #3611 (#3609 F1, decision A + C): a read-guard write was dropped because
 	 * its session scope retired, and its entry is still on its conversation's
@@ -1844,6 +1937,13 @@ export type DegradationKind =
 	 * eligible alternatives remain discoverable in the existing order/limits.
 	 */
 	| "test-discovery-foreign-checkout"
+	/**
+	 * #5257: a turn-end test batch ended with no completed, parsed passing
+	 * result (empty, skipped-only, unreadable report, or every target gone), so
+	 * the test-failure blocker was left alone instead of cleared as a clean run.
+	 * `runtime-turn.ts`, subject `<cwd>`; once per session and cwd.
+	 */
+	| "test-run-no-completed-result"
 	/**
 	 * #3071: a deferred turn-end test target hit `TEST_RUNNER_MAX_DEFERRALS`
 	 * and was retired from turn-end selection for the rest of the session —
@@ -2008,6 +2108,14 @@ export type DegradationKind =
 	 * (`knip` | `dead-code` | `call-graph`), a fixed set.
 	 */
 	| "turn-end-advisory-carry-dropped"
+	/**
+	 * #4943 (#4961 review F4): a request found the per-project turn-end message
+	 * addressed to another session (`deliverTo`, or the owner of a gate
+	 * rewrite) and left it for that session. Once per addressee, so a skip
+	 * reads apart from an empty slot without one row per request. Subject is
+	 * the addressee's session id.
+	 */
+	| "turn-end-delivery-addressed-elsewhere"
 	/**
 	 * A turn_end knip scan did not fit the budget in a root that has linked
 	 * worktrees nested under it (#3872): knip walks them as project files
@@ -2583,6 +2691,8 @@ function isRenderableSummary(value: unknown): value is DegradationGroup[] {
  */
 const INFORMATIONAL_DEGRADATION_KINDS: ReadonlySet<string> = new Set([
 	"log-sink-rotated",
+	// Project-scoped autofix dedupe is intentional, not a failed fixer (#4862).
+	"deferred-autofix-duplicate-scope",
 	// #2504 review round 8 (S1): both fire on the ordinary re-edit cadence
 	// (a carry-forward window closing, or a session boundary) and are
 	// self-healing -- the next turn's analysis or deferral re-observes the

@@ -35,7 +35,7 @@ describe("module_report tool", () => {
 			const tool = createModuleReportTool(() => env.tmpDir);
 			const result = await tool.execute(
 				"1",
-				{ path: "sample.ts" },
+				{ path: "sample.ts", view: "full-json" },
 				undefined,
 				null,
 				{ cwd: env.tmpDir },
@@ -57,7 +57,7 @@ describe("module_report tool", () => {
 		}
 	});
 
-	it("passes through summary view", async () => {
+	it("resolves the summary-json preset with metrics off", async () => {
 		const env = setupTestEnvironment("pi-lens-modreport-tool-");
 		try {
 			createTempFile(
@@ -68,15 +68,15 @@ describe("module_report tool", () => {
 			const tool = createModuleReportTool(() => env.tmpDir);
 			const result = await tool.execute(
 				"summary",
-				{ path: "sample.ts", view: "summary" },
+				{ path: "sample.ts", view: "summary-json" },
 				undefined,
 				null,
 				{ cwd: env.tmpDir },
 			);
 			const report = JSON.parse(String(result.content[0]?.text));
-			expect(report.view).toBe("summary");
+			expect(report).not.toHaveProperty("view");
 			expect(report.provenance.symbols).toBe("syntax");
-			expect(result.details.view).toBe("summary");
+			expect(result.details.view).toBe("summary-json");
 		} finally {
 			env.cleanup();
 		}
@@ -93,7 +93,7 @@ describe("module_report tool", () => {
 			const tool = createModuleReportTool(() => env.tmpDir);
 			const result = await tool.execute(
 				"callbacks",
-				{ path: "callbacks.ts", focus: "reset ctx" },
+				{ path: "callbacks.ts", focus: "reset ctx", view: "full-json" },
 				undefined,
 				null,
 				{ cwd: env.tmpDir },
@@ -557,6 +557,97 @@ describe("read_symbol tool", () => {
 			env.cleanup();
 		}
 	});
+
+	it("refuses an unknown kind naming the candidate kinds instead of returning another kind (#5138)", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-kind-unknown-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				[
+					"export interface Foo {",
+					"  id: number;",
+					"}",
+					"",
+					"export function Foo(): void {}",
+				].join("\n"),
+			);
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				() => {},
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "Foo", kind: "nope" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBe(true);
+			const text = String(result.content[0]?.text);
+			expect(text).toContain('"nope"');
+			expect(text).toContain("function");
+			expect(text).toContain("interface");
+			// The refused call must not hand back a body as if the kind had matched.
+			expect(text).not.toContain("export interface Foo {");
+			expect(text).not.toContain("export function Foo");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("refuses a known kind that matches no candidate rather than returning a different kind (#5138)", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-kind-miss-");
+		try {
+			createTempFile(
+				env.tmpDir,
+				"sample.ts",
+				["export interface Foo {", "  id: number;", "}"].join("\n"),
+			);
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				() => {},
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "Foo", kind: "class" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBe(true);
+			const text = String(result.content[0]?.text);
+			expect(text).toContain('"class"');
+			expect(text).not.toContain("export interface Foo {");
+		} finally {
+			env.cleanup();
+		}
+	});
+
+	it("distinguishes an unreadable path from a missing symbol (#5138)", async () => {
+		const env = setupTestEnvironment("pi-lens-readsym-unreadable-");
+		try {
+			// A directory at the requested path: it exists, but no file bytes can be read.
+			fs.mkdirSync(path.join(env.tmpDir, "sample.ts"));
+			const tool = createReadSymbolTool(
+				() => env.tmpDir,
+				() => {},
+			);
+			const result = await tool.execute(
+				"1",
+				{ path: "sample.ts", symbol: "anything" },
+				undefined,
+				null,
+				{ cwd: env.tmpDir },
+			);
+			expect(result.isError).toBe(true);
+			const text = String(result.content[0]?.text);
+			expect(text).toContain("Could not inspect");
+			expect(text).not.toContain('Symbol "anything" not found');
+		} finally {
+			env.cleanup();
+		}
+	});
 });
 
 /**
@@ -581,7 +672,7 @@ describe("module_report path resolution (#4577 M2)", () => {
 			const tool = createModuleReportTool(() => env.tmpDir);
 			const result = await tool.execute(
 				"1",
-				{ path: "~/proj/sample.ts" },
+				{ path: "~/proj/sample.ts", view: "full-json" },
 				undefined,
 				null,
 				{ cwd: env.tmpDir },

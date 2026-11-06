@@ -1,19 +1,19 @@
 name: CodeQL
 
-# Advanced setup (#3801). PR-time analysis is the advisory `codeql` job in
-# ci.yml (it waits on the required jobs, and `needs:` cannot cross workflows).
-# This file keeps the default-branch baseline and the weekly re-scan.
+# Advanced setup (#3801), scanned once a day (#5275). The daily schedule is the
+# only automatic trigger: there is no pull_request run (the former advisory job
+# in ci.yml is gone) and no run per master push, so a new alert surfaces on
+# master up to a day after the change that caused it, not on that change's PR.
+# `workflow_dispatch` re-scans on demand.
 #
 # Two jobs (#4077): `analyze` holds no write scope and runs on a dispatch from
 # any ref (its SARIF is a run artifact, `upload: never`); `upload` is the only
 # job with `security-events: write`, is guarded to the schedule or master, and
 # sends that SARIF to code scanning.
 on:
-  push:
-    branches: [master]
-    paths-ignore: ["**/*.md", ".changelog/**", "docs/**"]
   schedule:
-    - cron: "17 4 * * 2"
+    # Daily, off-peak and off the top of the hour.
+    - cron: "17 4 * * *"
   workflow_dispatch:
 
 permissions:
@@ -21,8 +21,7 @@ permissions:
 
 jobs:
   analyze:
-    # The `(advisory)` suffix is what scripts/lib/ci-checks.mjs reads; the
-    # `baseline` word keeps this name distinct from ci.yml's PR-time job.
+    # The `(advisory)` suffix is what scripts/lib/ci-checks.mjs reads.
     name: CodeQL baseline (${{ matrix.language }}) (advisory)
     runs-on: ubuntu-latest
     # refs #3123: bounds a hang against GitHub's 360-min default.
@@ -43,7 +42,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+      - uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           languages: ${{ matrix.language }}
           build-mode: none
@@ -52,7 +51,7 @@ jobs:
               - cases
               - tests/fixtures
               - dist
-      - uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+      - uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           category: "/language:${{ matrix.language }}"
           upload: never
@@ -95,7 +94,7 @@ jobs:
         with:
           name: codeql-sarif-${{ matrix.language }}
           path: ${{ runner.temp }}/codeql-sarif-${{ matrix.language }}
-      - uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         with:
           sarif_file: ${{ runner.temp }}/codeql-sarif-${{ matrix.language }}
           category: "/language:${{ matrix.language }}"

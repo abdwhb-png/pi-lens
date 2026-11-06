@@ -173,7 +173,14 @@ Set to `1` to skip auto-installing language servers. Off by default.
 ### `PI_LENS_DISABLE_TOOL_INSTALL`
 
 Set to `1` to skip auto-installing managed tools (formatters, linters,
-scanners). Off by default.
+scanners). Off by default. It stops four things: the managed installer, the
+lazy installer (`gem install rubocop`, `rustup component add clippy|rustfmt`),
+govulncheck's `go install`, and any `npx` package-runner spawn, which runs
+offline (`npm_config_offline=true`): it uses npm's cache or fails, and never
+downloads. A refused lazy or govulncheck install records one `install-disabled`
+degradation row per tool per session. It does not cover `bunx` (which ignores
+that variable; pi-lens never spawns it) or language-server installs (see
+`PI_LENS_DISABLE_LSP_INSTALL`).
 
 ## Context injection
 
@@ -207,6 +214,20 @@ session reuses a live incumbent session's LSP diagnostics over local IPC.
 Unset or `0` preserves the prior local-LSP behavior exactly. Any transport,
 schema, freshness, deadline, or incumbent-liveness failure permanently falls
 back to a local LSP fleet for that session.
+
+## Variables pi-lens sets for its child processes
+
+### `GIT_OPTIONAL_LOCKS`
+
+pi-lens starts the child processes it runs through its spawn seam (its
+background `git status` reads included) with `GIT_OPTIONAL_LOCKS=0`, so a read
+does not refresh the index and cannot leave `.git/index.lock` behind after a
+timeout or a host exit. The value you export in your shell does not change this
+for those children, and your own git commands are unaffected. A caller that
+passes its own environment to a child keeps its value. Language servers are
+launched separately and inherit your environment unchanged. On a checkout whose
+index is stat-dirty, each status read re-hashes the dirty files until one of
+your own git commands refreshes the index.
 
 ## Language-specific
 
@@ -245,6 +266,16 @@ server. Lombok support is on by default when a Lombok jar is resolved.
 Explicit path to a Lombok jar for the Java language server, used when
 auto-resolution does not find one. The legacy `LOMBOK_JAR` variable is also
 honored.
+
+### `GROOVY_LANGUAGE_SERVER_JAR`
+
+Path to the `groovy-language-server-all.jar` the built-in Groovy row runs as
+`java -jar <jar>`, when no `groovy-language-server` launcher is on `PATH`.
+groovy-language-server publishes no release: build it with `./gradlew build` in
+a checkout of GroovyLanguageServer/groovy-language-server and point this at
+`build/libs/groovy-language-server-all.jar`. Java 17 or newer is found the same
+way the Java language server finds it. A path that is not a file reads as not
+installed, and the session start log says so.
 
 ## Project map
 

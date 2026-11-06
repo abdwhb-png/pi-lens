@@ -13,6 +13,7 @@ import { fitLine } from "./tui-fit.js";
 import { WriteOrderingGuard } from "./write-ordering-guard.js";
 import { collectForwardImportMtimes } from "./blocker-freshness.js";
 import { findingIdentity } from "./finding-identity.js";
+import { isCrossFileBlocker } from "./inline-blocker-fields.js";
 import { freshnessFromMtime } from "./freshness.js";
 import { PAST_EOF_STALE_MARKER } from "./diagnostic-line-freshness.js";
 import { STALE_LINE_MARKER } from "./stale-marker.js";
@@ -240,6 +241,24 @@ export interface WidgetDiagnostic {
 	 * gate / the coarse identity" rather than as a licence to keep the row.
 	 */
 	anchorSpan?: string;
+	/**
+	 * #5020: the file this row cites when that is NOT the record's own file. A
+	 * chart-wide runner (helm-lint) or an import-following one (mypy) reports a
+	 * row for `other-b.yaml` while `deploy-a.yaml` is written, and this store
+	 * keeps it in `deploy-a.yaml`'s record, like the commit gate's
+	 * `InlineBlockerRecord` does. The cited file is the only thing that can
+	 * retire it, so it is stamped here (`normalizeDiagnostics`, from the raw row's
+	 * `filePath`, through the gate's own `isCrossFileBlocker`) and read back by
+	 * {@link retireWidgetCitedRows}, which `RuntimeCoordinator.retireForeignRows`
+	 * calls beside the gate's retire.
+	 *
+	 * Absent on a row that cites no other file, and on every row persisted by an
+	 * older build: both read as "the record's own", which keeps the row (the
+	 * fail-closed direction). Additive and optional, so `WIDGET_STATE_VERSION`
+	 * does not move and a restored row keeps its cite: unlike `stale`, it is a
+	 * fact about what the row cites, not a verdict about one session's disk.
+	 */
+	citedFile?: string;
 }
 
 /**
@@ -296,6 +315,18 @@ interface FileRecord {
 		warnings: number;
 	};
 	hasFinalDiagnosticsSnapshot: boolean;
+	/**
+	 * #5258: why no check of this file's kind completed in the run that wrote
+	 * the snapshot (`DispatchResult.verdict`, unchecked arm). An empty snapshot
+	 * of such a file is not a clean result, so the footer withholds `✓ clean`
+	 * for it. Set only by {@link recordDiagnostics}, from a file a check could have
+	 * covered (never a kindless or generated file: nothing can retire that).
+	 * Cleared by a later write whose check completed, or by a scan that answers
+	 * for the file ({@link recordDiagnostics}). Every other commit keeps it: a
+	 * full scan's correlated write ({@link reconcileCorrelatedScanDiagnostics})
+	 * is handed files no server confirmed (#5285 r3).
+	 */
+	uncheckedReason?: string;
 	touchedAt: number;
 }
 
@@ -613,6 +644,8 @@ export interface PersistedWidgetState {
 		allDiagnostics: WidgetDiagnostic[];
 		diagnosticCounts: { blocking: number; errors: number; warnings: number };
 		hasFinalDiagnosticsSnapshot: boolean;
+		/** #5258: absent in a snapshot older than the field, which reads as checked. */
+		uncheckedReason?: string;
 		touchedAt: number;
 	}>;
 }
@@ -634,6 +667,9 @@ export function exportWidgetState(): PersistedWidgetState {
 			allDiagnostics: rec.allDiagnostics,
 			diagnosticCounts: rec.diagnosticCounts,
 			hasFinalDiagnosticsSnapshot: rec.hasFinalDiagnosticsSnapshot,
+			...(rec.uncheckedReason !== undefined && {
+				uncheckedReason: rec.uncheckedReason,
+			}),
 			touchedAt: rec.touchedAt,
 		})),
 	};
@@ -755,6 +791,9 @@ export function importWidgetState(
 			allDiagnostics: migratedAllDiagnostics,
 			diagnosticCounts: countDiagnostics(migratedAllDiagnostics),
 			hasFinalDiagnosticsSnapshot: f.hasFinalDiagnosticsSnapshot ?? false,
+			...(typeof f.uncheckedReason === "string" && {
+				uncheckedReason: f.uncheckedReason,
+			}),
 			touchedAt: recordTouchedAt,
 		});
 	}
@@ -894,6 +933,7 @@ export function recordDiagnostics(
 		column?: number;
 		severity?: string;
 		semantic?: string;
+		filePath?: string;
 	}>,
 	writeIndex?: number,
 	// #1093: when the truth was OBSERVED, not when it's being written. Defaults
@@ -905,6 +945,10 @@ export function recordDiagnostics(
 	// `reconcileStaleWidgetFiles`'s `mtimeMs > touchedAt` gate so a resolved
 	// finding renders forever (the #1092 touchedAt-re-arming defect).
 	observedAt?: number,
+	// #5258: the reason no check of the file's kind completed, when the run that
+	// produced `diagnostics` was unchecked (`DispatchResult.verdict`). Omitted by
+	// a scan that answers for the file (a workspace LSP reconcile).
+	unchecked?: string,
 ): boolean {
 	// Drop a write that's superseded by a later same-turn edit to this file
 	// whose pipeline finished first (same race class as #555). No cache write,
@@ -932,7 +976,23 @@ export function recordDiagnostics(
 		observedTs,
 		key,
 	);
+	if (unchecked === undefined) delete rec.uncheckedReason;
+	else rec.uncheckedReason = unchecked;
 	return true;
+}
+
+/** The raw diagnostic shape callers hand the store (a dispatch `Diagnostic` fits). */
+interface RawWidgetDiagnostic {
+	tool?: string;
+	rule?: string;
+	id?: string;
+	message?: string;
+	line?: number;
+	column?: number;
+	severity?: string;
+	semantic?: string;
+	/** The file the row cites (`Diagnostic.filePath`); see `citedFile`. */
+	filePath?: string;
 }
 
 /** Map the raw diagnostic shape callers pass into stored {@link WidgetDiagnostic}s.
@@ -941,16 +1001,7 @@ export function recordDiagnostics(
  * the entries older than the file's mtime rather than the whole record. */
 function normalizeDiagnostics(
 	filePath: string,
-	diagnostics: Array<{
-		tool?: string;
-		rule?: string;
-		id?: string;
-		message?: string;
-		line?: number;
-		column?: number;
-		severity?: string;
-		semantic?: string;
-	}>,
+	diagnostics: readonly RawWidgetDiagnostic[],
 	observedTs: number,
 ): WidgetDiagnostic[] {
 	return diagnostics.map((d) => {
@@ -965,6 +1016,9 @@ function normalizeDiagnostics(
 			tool: d.tool,
 			uri: widgetDiagnosticUri(filePath, d.line, d.column),
 			observedAt: observedTs,
+			...(d.filePath !== undefined && isCrossFileBlocker(d, filePath)
+				? { citedFile: d.filePath }
+				: {}),
 		} satisfies WidgetDiagnostic;
 	});
 }
@@ -1427,6 +1481,7 @@ export function reconcileScanDiagnostics(
 		column?: number;
 		severity?: string;
 		semantic?: string;
+		filePath?: string;
 	}>,
 	confirmed: boolean,
 	writeIndex?: number,
@@ -1461,13 +1516,11 @@ export function reconcileCorrelatedScanDiagnostics(
 		...diagnostic,
 		observedAt: diagnostic.observedAt ?? observedTs,
 	}));
-	commitDiagnostics(
-		getOrCreate(filePath, key),
-		filePath,
-		correlated,
-		observedTs,
-		key,
-	);
+	const rec = getOrCreate(filePath, key);
+	// #5285 r3: the unchecked reason stays. This commit is handed every file
+	// whether or not a server confirmed it; a confirmed file already lost its
+	// reason through `reconcileScanDiagnostics`, earlier in the same scan.
+	commitDiagnostics(rec, filePath, correlated, observedTs, key);
 }
 
 /**
@@ -1847,7 +1900,7 @@ export function incrementWidgetDependencyDriftDelivery(
  * `filePath` once its delivery cap is reached — by HIDING it from the
  * footer, not by dropping it.
  *
- * `RuntimeCoordinator.retireDemotedDependencyDriftBlocker` can delete its
+ * `RuntimeCoordinator.retireDemotedDriftBlocker` can delete its
  * whole `_pendingInlineBlockers` record because that store backs exactly one
  * surface (the turn-end advisory text). This store does not: `allDiagnostics`
  * is also what `getFileDiagnosticSummaries` serves to `lens_diagnostics
@@ -2042,6 +2095,57 @@ export function getFileDiagnostics(
 	return rec.allDiagnostics.map((d) => ({ ...d }));
 }
 
+/** What names one cited row: its cite, its line and its finding identity. */
+function citedRowKey(row: WidgetDiagnostic): string {
+	return JSON.stringify([
+		normalizeEphemeralMapKey(row.citedFile ?? ""),
+		row.line ?? null,
+		findingIdentity(row),
+	]);
+}
+
+/**
+ * #5020: drop from `filePath`'s record the rows that cite another file and
+ * that the commit gate has just retired from its own record of the same file.
+ * The two stores hold one row for one fact: the gate's by the written file
+ * (`InlineBlockerRecord`), this one by the written file too, so a retire of
+ * the gate's row that left this one would list a fixed or deleted file's
+ * blocker in `lens_diagnostics source=session` and the footer until the
+ * written file was next dispatched.
+ *
+ * `retired` is the gate's own rows, run through `normalizeDiagnostics`, so the
+ * match uses the derivation that built the stored row. A stored row with no
+ * `citedFile` (the record's own, or one an older build persisted) never
+ * matches: its key has no cite, and only rows that cite a file are looked up.
+ *
+ * Not a diagnostics write: it takes no write-order token, stamps no
+ * observation time and leaves `hasFinalDiagnosticsSnapshot` as it was, so a
+ * record still waiting for a snapshot keeps waiting. Counts and the capped
+ * display list are re-derived from what remains, as every other commit does.
+ *
+ * @returns how many rows left the record.
+ */
+export function retireWidgetCitedRows(
+	filePath: string,
+	retired: readonly RawWidgetDiagnostic[],
+): number {
+	const rec = files.get(fileMapKey(filePath));
+	if (!rec) return 0;
+	const gone = new Set(
+		normalizeDiagnostics(filePath, retired, 0).flatMap((row) =>
+			row.citedFile === undefined ? [] : [citedRowKey(row)],
+		),
+	);
+	const kept = rec.allDiagnostics.filter((row) => !gone.has(citedRowKey(row)));
+	const dropped = rec.allDiagnostics.length - kept.length;
+	if (dropped === 0) return 0;
+	rec.allDiagnostics = kept;
+	rec.diagnostics = capStoredDiagnostics(kept);
+	rec.diagnosticCounts = countDiagnostics(kept);
+	requestRender();
+	return dropped;
+}
+
 /** @internal Test-only helpers. Do not use in production code. */
 export const __testing = {
 	getWidgetStateSnapshot(): {
@@ -2144,6 +2248,7 @@ export function renderWidget(
 	const totalWarnings = countTotalIn("warning", deduped);
 	const totalSuppressed = countSuppressedIn(deduped);
 	const hasPendingAnalysis = deduped.some(isPendingAnalysis);
+	const uncheckedFiles = deduped.filter(isUncheckedClean);
 	const errorChunk =
 		totalErrors > 0
 			? (totalBlocking > 0 ? red : yellow)(`●${totalErrors}E`)
@@ -2153,9 +2258,11 @@ export function renderWidget(
 		? errorChunk + (warningChunk ? " " + warningChunk : "")
 		: warningChunk
 			? warningChunk
-			: files.size > 0 && !hasPendingAnalysis
-				? green("✓ clean")
-				: "";
+			: uncheckedFiles.length > 0
+				? yellow(`⚠ ${uncheckedFiles.length} unchecked`)
+				: files.size > 0 && !hasPendingAnalysis
+					? green("✓ clean")
+					: "";
 
 	// LSP spawning — folded into the header in horizontal mode, tail line otherwise
 	const spawning = [...lspServers.values()].filter(
@@ -2198,6 +2305,20 @@ export function renderWidget(
 		for (const rec of recencySorted) {
 			lines.push(fitLine(formatFileRowVertical(rec, theme), w));
 		}
+	}
+
+	// #5258: an empty snapshot of a file no check completed on is not clean, and
+	// the header chip alone cannot say why: name the most recent one's reason.
+	const lastUnchecked = uncheckedFiles.sort(
+		(a, b) => b.touchedAt - a.touchedAt,
+	)[0];
+	if (lastUnchecked?.uncheckedReason !== undefined) {
+		lines.push(
+			fitLine(
+				` ${yellow("⚠")} ${dim(`${path.basename(lastUnchecked.filePath)}: ${lastUnchecked.uncheckedReason}`)}`,
+				w,
+			),
+		);
 	}
 
 	// Diagnostics — blocking (or dependency-drift-demoted) only, from the most
@@ -2331,7 +2452,9 @@ function formatFileRowVertical(
 				? red("x")
 				: warnings > 0 || errors > 0
 					? yellow("!")
-					: green("✓");
+					: isUncheckedClean(rec)
+						? yellow("⚠")
+						: green("✓");
 	const runnerNames = [...rec.runners.entries()]
 		.filter(([, r]) => r.status !== "skipped")
 		.map(([id]) => id)
@@ -2343,7 +2466,9 @@ function formatFileRowVertical(
 				(warnings > 0 ? " " + yellow(`${warnings}W`) : "")
 			: warnings > 0
 				? " " + yellow(`${warnings}W`)
-				: " " + dim("clean");
+				: isUncheckedClean(rec)
+					? " " + yellow("unchecked")
+					: " " + dim("clean");
 	const changedFormatters = [...rec.formatters.entries()]
 		.filter(([, f]) => f.changed && f.success)
 		.map(([name]) => name);
@@ -2443,6 +2568,7 @@ function formatFileTokenHorizontal(
 	let dotChar: string;
 	if (blocking > 0) dotChar = red("●");
 	else if (errors > 0 || warnings > 0) dotChar = yellow("!");
+	else if (isUncheckedClean(rec)) dotChar = yellow("?");
 	else if (formatterChanged) dotChar = dim("✎");
 	else dotChar = dim("·");
 
@@ -2539,6 +2665,16 @@ function hasLiveDiagnostic(rec: FileRecord): boolean {
 	return (
 		rec.diagnostics.length > 0 &&
 		(rec.hasFinalDiagnosticsSnapshot || holdsDrawableFindings(rec))
+	);
+}
+
+// #5258: a final snapshot with no finding that no check of the file's kind
+// completed for. Findings outrank it: a file with any shows them instead.
+function isUncheckedClean(rec: FileRecord): boolean {
+	return (
+		rec.uncheckedReason !== undefined &&
+		rec.hasFinalDiagnosticsSnapshot &&
+		classifyFileTier(rec) === "clean"
 	);
 }
 

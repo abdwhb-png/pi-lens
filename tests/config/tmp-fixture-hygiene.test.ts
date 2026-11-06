@@ -13,6 +13,7 @@ import {
 } from "../support/sweep-kit.js";
 import {
 	cleanupTmpHygiene,
+	diagnoseTmpHygieneLeaks,
 	removeRunBackstopDirs,
 	unadmittedRootBackstopEntries,
 	tmpHygieneAdmissionFor,
@@ -502,36 +503,18 @@ function writeCensusSummary(
 	);
 }
 
-// #4591: the census VERDICT is declined on the Windows lane, not the file. It
-// reds there about 1 run in 10 on a root that did not exist at its file's
-// teardown (`registered=1 failed=0` in the sweep record, the leaked entry
-// observed nine seconds later), and #4518 promoted that lane to gating, so the
-// three assertions below are skipped on win32 until the producer is named. The
-// cases themselves are platform-neutral and keep running there, and the lane
-// that runs the verdict is every non-Windows run: the required `Unit tests`
-// shards and macOS. Remove this constant, its guard and the #4591 reference in
-// the change that fixes the producer.
-const WINDOWS_QUARANTINE = process.platform === "win32";
-
 // #4592 review F4: the census line states which verdict this run reached. The
-// quarantine used to leave no record at all, so the win32 lane's line was
-// identical to an asserting lane's and the declined verdict read as a pass
-// (shapes 10 and 31). Derived from the guard, not a second switch.
-const censusVerdict: TmpHygieneCensusVerdict = WINDOWS_QUARANTINE
-	? "declined"
-	: "asserted";
+// Windows quarantine (#4591) that once declined it is gone: the verdict is
+// asserted on every lane, and the line says so (shapes 10 and 31).
+const censusVerdict: TmpHygieneCensusVerdict = "asserted";
 
-// #4591 review P2 (Greptile): the sweep is not part of the verdict, and it is
-// this run's only `cleanupTmpHygiene` caller. A skipped suite runs no hooks at
-// all -- measured: with every case skipped Vitest reported `Test Files 1
-// skipped (1)` and this hook never ran, at any scope (the setup's own note at
-// `tmpHygieneWaitForOwnerDrain` says the same) -- so the quarantine declines the
-// three assertions instead of the suite, and the suite stays unskipped so the
-// hook runs on win32. The hook stays INSIDE the suite: its failure belongs to
-// this suite's hook list, not to the root list the shared setup registers on, so
-// a red census cannot abort the setup's own teardown (registry drain, checks,
-// memory report, owner-marker removal). Everything above the guard still runs,
-// because the sweep needs the foreign-run set to spare a sibling invocation's
+// The sweep is this run's only `cleanupTmpHygiene` caller, and it stays INSIDE
+// the suite: a skipped suite runs no hooks at all (measured: with every case
+// skipped Vitest reported `Test Files 1 skipped (1)` and this hook never ran,
+// at any scope), and the hook's failure belongs to this suite's hook list, not
+// to the root list the shared setup registers on, so a red census cannot abort
+// the setup's own teardown (registry drain, checks, memory report, owner-marker
+// removal). The sweep needs the foreign-run set to spare a sibling invocation's
 // roots (#3314).
 describe("tmp-fixture-hygiene", () => {
 	afterAll(async () => {
@@ -573,12 +556,12 @@ describe("tmp-fixture-hygiene", () => {
 		// removed before the run ended, and that is the shape that raced: PR
 		// #4859's shard 3 listed `.probe-language-roots/packages/css/vite.config.ts`
 		// and then ENOENTed when `tests/clients/tool-cwd.test.ts` removed the tree
-		// mid-walk. The interposer records NAMED creations at this root, so judge
-		// the creation, not the leftover. The rule is the OUTCOME (no directory
-		// named at the checkout root, whatever made it); the recorded writers are
-		// `mkdirSync`, `mkdir` and `promises.mkdir`, and the rest of the population
-		// (`mkdtemp` roots, #4867, plus `cpSync`, `renameSync` and a child
-		// process's `mkdir`) is the admitted remainder the PR body names.
+		// mid-walk. The interposer records creations at this root, so judge the
+		// creation, not the leftover. The rule is the OUTCOME (no directory created
+		// at the checkout root, whatever made it): the recorded writers are
+		// `mkdirSync`, `mkdir`, `promises.mkdir` and, since #4867, `mkdtempSync`,
+		// `mkdtemp` and `promises.mkdtemp`; `cpSync`, `renameSync` and a child
+		// process's `mkdir` are the admitted remainder the PR body names.
 		const repoRootCreated = [...tmpHygieneRepoRootCreates()].filter(
 			// This file's own cells plant a stray at the root to drive the census in
 			// `names the entries a run added`, so its plants are the subject, not a
@@ -605,42 +588,40 @@ describe("tmp-fixture-hygiene", () => {
 			creators,
 		);
 		try {
-			if (!WINDOWS_QUARANTINE) {
-				expect(
-					attributable,
-					`[tmp-hygiene] tests/${testFile} leaked ${attributable.length} top-level entries: ${described.join(",")}; live owners: ${[...liveOwners].join(",") || "none"}`,
-				).toEqual([]);
-				expect(
-					tmpRootWriteLeaks,
-					`[tmp-hygiene] tests/${testFile} left ${tmpRootWriteLeaks.length} fixture sibling(s) at the tmp root: ${tmpRootWriteLeaks
-						.map(
-							(entry) =>
-								`${entry} (created by tests/${creators.get(entry) ?? "unknown"})`,
-						)
-						.join(
-							"; ",
-						)}. Write the sibling inside the fixture, or remove it: a directory at \`path.join(<fixture>, "..")\` never belongs to the fixture that made it (#4546, #4559, #4560).`,
-				).toEqual([]);
-				expect(
-					rootCensus.leaked,
-					`[tmp-hygiene] this run left ${rootCensus.leaked.length} new untracked, unignored or build-output entries in the repo root: ${rootCensus.leaked
-						.map(
-							(entry) =>
-								`${entry} (candidate owners: ${repoRootEntryCandidates(entry).join(", ") || "unknown"})`,
-						)
-						.join(
-							"; ",
-						)}. Remove them and fix the producer: a fixture belongs under os.tmpdir() or in a directory the file removes.`,
-				).toEqual([]);
-				expect(
-					repoRootCreateLeaks,
-					`[tmp-hygiene] a test process created ${repoRootCreateLeaks === undefined ? "entries git could not classify" : `${repoRootCreateLeaks.length} directory/directories`} directly at the repository root: ${repoRootCreated
-						.map(([name, creator]) => `${name} (created by tests/${creator})`)
-						.join(
-							"; ",
-						)}. A repo-walking scan on a sibling worker lists that tree and then ENOENTs when the cell removes it mid-walk (#4864, PR #4859 shard 3). Build the fixture under a per-test temp root (setupTestEnvironment) or name it with mkdtemp, and remove it in a finally.`,
-				).toEqual([]);
-			}
+			expect(
+				attributable,
+				`[tmp-hygiene] tests/${testFile} leaked ${attributable.length} top-level entries: ${described.join(",")}; live owners: ${[...liveOwners].join(",") || "none"}; diagnosis (#4591): ${diagnoseTmpHygieneLeaks(attributable, creators)}`,
+			).toEqual([]);
+			expect(
+				tmpRootWriteLeaks,
+				`[tmp-hygiene] tests/${testFile} left ${tmpRootWriteLeaks.length} fixture sibling(s) at the tmp root: ${tmpRootWriteLeaks
+					.map(
+						(entry) =>
+							`${entry} (created by tests/${creators.get(entry) ?? "unknown"})`,
+					)
+					.join(
+						"; ",
+					)}. Write the sibling inside the fixture, or remove it: a directory at \`path.join(<fixture>, "..")\` never belongs to the fixture that made it (#4546, #4559, #4560).`,
+			).toEqual([]);
+			expect(
+				rootCensus.leaked,
+				`[tmp-hygiene] this run left ${rootCensus.leaked.length} new untracked, unignored or build-output entries in the repo root: ${rootCensus.leaked
+					.map(
+						(entry) =>
+							`${entry} (candidate owners: ${repoRootEntryCandidates(entry).join(", ") || "unknown"})`,
+					)
+					.join(
+						"; ",
+					)}. Remove them and fix the producer: a fixture belongs under os.tmpdir() or in a directory the file removes.`,
+			).toEqual([]);
+			expect(
+				repoRootCreateLeaks,
+				`[tmp-hygiene] a test process created ${repoRootCreateLeaks === undefined ? "entries git could not classify" : `${repoRootCreateLeaks.length} directory/directories`} directly at the repository root: ${repoRootCreated
+					.map(([name, creator]) => `${name} (created by tests/${creator})`)
+					.join(
+						"; ",
+					)}. A repo-walking scan on a sibling worker lists that tree and then ENOENTs when the cell removes it mid-walk (#4864, PR #4859 shard 3). Build the fixture under a per-test temp root (setupTestEnvironment, or an mkdtemp root under os.tmpdir()), and remove it in a finally.`,
+			).toEqual([]);
 		} finally {
 			const reaped = cleanupTmpHygiene(otherInvocation);
 			// Bounded observability (#3186, extended by #3314): ONE census line per
@@ -2045,17 +2026,24 @@ describe("tmp-fixture-hygiene", () => {
 		it(
 			"names the test file behind a raw mkdtemp prefix",
 			() => {
-				// F3/F5: `tests/index-wiring.test.ts` creates its roots from a
-				// `pi-lens-wiring-${reason}-` TEMPLATE, so neither a literal
-				// `setupTestEnvironment("…")` scan nor a literal-only mkdtemp scan could
-				// attribute `pi-lens-wiring-resume-…`. The index reads the static head.
-				expect(ownerForTmpEntry("pi-lens-wiring-resume-iCpHXp")).toBe(WIRING);
-				expect(ownersForTmpEntry("pi-lens-wiring-resume-iCpHXp")).toContain(
+				// F3/F5: `tests/index-wiring.test.ts` creates its roots with raw
+				// `mkdtempSync(path.join(os.tmpdir(), "pi-lens-wiring-…-"))` prefixes,
+				// so a literal `setupTestEnvironment("…")` scan could not attribute
+				// `pi-lens-wiring-fresh-file-…`. The index reads the static head. (#4913
+				// moved the case whose bare `pi-lens-wiring-` prefix this used to
+				// borrow to tier 2, so the entries named here are two prefixes the
+				// file still spells.)
+				expect(ownerForTmpEntry("pi-lens-wiring-fresh-file-iCpHXp")).toBe(
+					WIRING,
+				);
+				expect(ownersForTmpEntry("pi-lens-wiring-fresh-file-iCpHXp")).toContain(
 					WIRING,
 				);
 				// The raw-literal class in the same file, and an unrelated one
 				// elsewhere, so the needle is not a single-fixture special case.
-				expect(ownerForTmpEntry("pi-lens-wiring-new-AbCdEf")).toBe(WIRING);
+				expect(
+					ownerForTmpEntry("pi-lens-wiring-session-start-fallback-AbCdEf"),
+				).toBe(WIRING);
 				expect(ownerForTmpEntry("pi-lens-crash-surface-AbCdEf")).toBe(WIRING);
 				// A prefix no tests/ file spells still has no owner: the census must
 				// keep saying so rather than inventing one.
@@ -2082,12 +2070,12 @@ describe("tmp-fixture-hygiene", () => {
 				// index-wiring, which this manifest says never ran here.
 				expect(
 					tmpHygieneForeignRunEntries(
-						["pi-lens-wiring-resume-iCpHXp"],
+						["pi-lens-wiring-fresh-file-iCpHXp"],
 						ownersForTmpEntry,
 						manifest([OWN], "foreign"),
 						NO_CREATORS,
 					),
-				).toEqual(["pi-lens-wiring-resume-iCpHXp"]);
+				).toEqual(["pi-lens-wiring-fresh-file-iCpHXp"]);
 			},
 			TREE_WALK_TIMEOUT_MS,
 		);
@@ -2098,8 +2086,8 @@ describe("tmp-fixture-hygiene", () => {
 				// #4354: the #4347 jscpd leak. Its prefix owner (jscpd-client) never ran
 				// in the fork, so the unanimous-owner filter above excused it, yet the
 				// creators record named a file that DID run: a leak this run made.
-				const leaked = "pi-lens-wiring-resume-iCpHXp";
-				const sibling = "pi-lens-wiring-new-AbCdEf";
+				const leaked = "pi-lens-wiring-fresh-file-iCpHXp";
+				const sibling = "pi-lens-wiring-session-start-fallback-AbCdEf";
 				const record = path.join(
 					TMP_HYGIENE_HOME,
 					`tmp-hygiene-creators-foreign-4354-${process.pid}.log`,
@@ -2139,7 +2127,7 @@ describe("tmp-fixture-hygiene", () => {
 				// red (F4), and a manifest that cannot be read must never silence one.
 				expect(
 					tmpHygieneForeignRunEntries(
-						["pi-lens-wiring-resume-iCpHXp"],
+						["pi-lens-wiring-fresh-file-iCpHXp"],
 						ownersForTmpEntry,
 						manifest([OWN, WIRING], "own"),
 						NO_CREATORS,
@@ -2147,7 +2135,7 @@ describe("tmp-fixture-hygiene", () => {
 				).toEqual([]);
 				expect(
 					tmpHygieneForeignRunEntries(
-						["pi-lens-wiring-resume-iCpHXp"],
+						["pi-lens-wiring-fresh-file-iCpHXp"],
 						ownersForTmpEntry,
 						new Set<string>(),
 						NO_CREATORS,

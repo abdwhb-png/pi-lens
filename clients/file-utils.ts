@@ -25,11 +25,16 @@ import {
 	homeRelativePath,
 	isExternalOrVendorFile,
 	isUnderDir,
+	isWindowsPath,
+	isWithinForm,
 	normalizeEphemeralMapKey,
 	normalizeFilePath,
 	normalizePathSpelling,
 	realpathOrResolve,
+	relativeInside,
+	toPosix,
 	toProjectRelativePath,
+	walkUpDirs,
 } from "./path-utils.js";
 import { STAGE_TMP_PATTERN, stagePathFor } from "./atomic-write-staging.js";
 import { writeFileAtomic } from "./atomic-write.js";
@@ -416,8 +421,9 @@ function projectDataDirReadableSlug(canonicalRoot: string): string {
  * names the directory it will have once created. On win32 it stays the
  * resolved path, as in every earlier version: a win32 name has never followed
  * the realpath, and changing it would rename directories for 8.3, junction
- * and casing spellings alike. `realpathSync` is probed only to expose a
- * boundary failure. The hash is the first 8 hex chars of SHA-256 over the
+ * and casing spellings alike. `fallback` is true when the root is not on disk
+ * (yet) or cannot be reached, and the name then rests on the nearest existing
+ * ancestor. The hash is the first 8 hex chars of SHA-256 over the
  * root. A collision needs the same readable slug and the same 32-bit prefix,
  * so the practical collision population is readable-slug twin pairs.
  */
@@ -430,13 +436,10 @@ export function dataDirCanonicalRoot(
 } {
 	const resolved = path.resolve(cwd);
 	const root = platform === "win32" ? resolved : realpathOrResolve(resolved);
-	try {
-		fs.realpathSync(resolved);
-	} catch {
-		// Best-effort: the root may not exist yet.
-		return { root, fallback: true };
-	}
-	return { root, fallback: false };
+	// Best-effort: the root may not exist yet. Existence is all the old
+	// `realpathSync` probe's throw ever answered, and `existsSync` answers it
+	// without a second identity walk (#4689 batch 8).
+	return { root, fallback: !fs.existsSync(resolved) };
 }
 
 function projectDataDirRootHash(canonicalRoot: string): string {
@@ -607,7 +610,7 @@ export function displayProjectDataPath(
 	...segments: string[]
 ): string {
 	const absolute = path.resolve(getProjectDataDir(cwd), ...segments);
-	const absolutePosix = absolute.replace(/\\/g, "/");
+	const absolutePosix = toPosix(absolute);
 	const relative = toProjectRelativePath(absolute, cwd);
 	if (relative !== absolutePosix) {
 		return relative;
@@ -810,14 +813,10 @@ function resolveGitIgnoreRoot(startDir: string): string {
 	// of a project (or a link into one of its subdirectories) reaches the same
 	// `.git` and the same matcher as the real path. Every ignore verdict and
 	// cache key below is taken against this identity root.
-	const fallback = realpathOrResolve(startDir);
-	let current = fallback;
-	while (true) {
+	for (const current of walkUpDirs(startDir)) {
 		if (fs.existsSync(path.join(current, ".git"))) return current;
-		const parent = path.dirname(current);
-		if (parent === current) return fallback;
-		current = parent;
 	}
+	return realpathOrResolve(startDir);
 }
 
 function collapseSlashes(value: string): string {
@@ -925,6 +924,79 @@ function matchesGitignorePattern(
 	});
 }
 
+/**
+ * The pattern that decides `relativePath` among `patterns`: gitignore order,
+ * so the LAST match wins and a later `!` pattern lifts an earlier ignore.
+ */
+function lastMatchingPattern(
+	patterns: readonly GitignorePattern[],
+	relativePath: string,
+	isDirectory: boolean,
+	matchExpanded: (value: string, expanded: string) => boolean,
+): GitignorePattern | undefined {
+	let winner: GitignorePattern | undefined;
+	for (const pattern of patterns) {
+		if (
+			matchesGitignorePattern(pattern, relativePath, isDirectory, matchExpanded)
+		)
+			winner = pattern;
+	}
+	return winner;
+}
+
+/**
+ * Glob options and a compile-once matcher shared by every gitignore pattern
+ * match: the project ignore matcher below (one per matcher instance, so the
+ * instance lifetime bounds the cache) and {@link isIgnoredByGitignoreLines}
+ * (one per call).
+ */
+const gitignoreGlobOptions: MinimatchOptions = {
+	dot: true,
+	nocase: process.platform === "win32",
+};
+
+function createExpandedGlobMatcher(): (
+	value: string,
+	expanded: string,
+) => boolean {
+	const compiledGlobs = new Map<string, Minimatch>();
+	return (value, expanded) => {
+		let compiled = compiledGlobs.get(expanded);
+		if (compiled === undefined) {
+			compiled = new Minimatch(expanded, gitignoreGlobOptions);
+			compiledGlobs.set(expanded, compiled);
+		}
+		return compiled.match(value);
+	};
+}
+
+/**
+ * Whether `filePath` is ignored by `lines`, read as the `ignore` field reads
+ * them (#783): each line is parsed as a `.gitignore` line anchored to
+ * `baseDir` (a leading `/` roots it there, a slashless line matches below it
+ * at any depth), and the LAST line that matches decides, so `!` re-includes.
+ * A file outside `baseDir` is never ignored (a `../` escape matches nothing),
+ * and a file the lines never name is not. This is the one gitignore evaluator
+ * `rules.<id>.ignorePaths` (#5029) shares with {@link createProjectIgnoreMatcher}:
+ * both resolve a pattern list through `lastMatchingPattern`.
+ */
+export function isIgnoredByGitignoreLines(
+	lines: readonly string[],
+	baseDir: string,
+	filePath: string,
+	isDirectory = false,
+): boolean {
+	const relative = relativeInside(baseDir, filePath);
+	if (relative === undefined) return false;
+	const winner = lastMatchingPattern(
+		parseGitignoreContent(lines.join("\n"), "pilens"),
+		normalizeIgnorePath(relative),
+		isDirectory,
+		createExpandedGlobMatcher(),
+	);
+	return winner !== undefined && !winner.negated;
+}
+
 function readGitignorePatterns(
 	rootDir: string,
 	layer: GitignorePatternLayer = "gitignore",
@@ -940,9 +1012,38 @@ function readGitignorePatterns(
 	}
 }
 
+/**
+ * Fold one value onto the form {@link isWithinForm} compares on. A
+ * Windows-shaped value folds its separators AND its case, because win32
+ * compares both that way; a POSIX value is already the form the caller holds.
+ *
+ * `isWindowsPath` owns "is this value Windows-shaped", and the SHAPE selects
+ * the fold, not the host (AGENTS shapes 2 and 35): a POSIX filename may
+ * legally contain a backslash, so folding separators unconditionally turned a
+ * sibling directory literally named `<root>\outside` into the child
+ * `<root>/outside` of the root (#4876 review r2 F1). `path.win32.relative` —
+ * the predicate this batch replaced — folded exactly these two axes on win32
+ * and neither on POSIX.
+ */
+function containmentForm(value: string): string {
+	return isWindowsPath(value) ? toPosix(value).toLowerCase() : value;
+}
+
+/**
+ * `child` at or under `parent`, after folding both sides onto ONE containment
+ * form. The one form is the point: `isWithinForm` asks callers to fold both
+ * sides "the same way", and this is that way (#4876 review r2 F1/F4).
+ */
+export function isWithinPathForm(child: string, parent: string): boolean {
+	return isWithinForm(containmentForm(child), containmentForm(parent));
+}
+
 function ancestorDirsBetween(rootDir: string, targetDir: string): string[] {
+	// #4689 batch 7: containment is the owner predicate on one path form. The
+	// hand-rolled `path.relative` test read a directory named `..foo` as outside
+	// the root (its relative path begins with `..`), so its patterns never ran.
+	if (!isWithinPathForm(targetDir, rootDir)) return [];
 	const relative = path.relative(rootDir, targetDir);
-	if (relative.startsWith("..") || path.isAbsolute(relative)) return [];
 	const dirs = [rootDir];
 	if (!relative) return dirs;
 	let current = rootDir;
@@ -1090,14 +1191,13 @@ function buildProjectIgnoreMatcher(
 	 * path, where the caller knows the source changed but has not re-read it.
 	 */
 	function dropVerdictsUnder(subtree: string): void {
-		const resolvedSubtree = path.resolve(subtree);
+		// #4689 batch 7: the owner's containment predicate, on one path form. A
+		// verdict for a file under a directory named `..foo` has a relative path
+		// that begins with `..`, and the hand-rolled test kept it (#4861 F2).
+		const subtreeForm = path.resolve(subtree);
 		for (const key of patternMemo.keys()) {
 			const memoPath = key.slice(2);
-			const relative = path.relative(resolvedSubtree, memoPath);
-			if (
-				!relative ||
-				(!relative.startsWith("..") && !path.isAbsolute(relative))
-			) {
+			if (isWithinPathForm(memoPath, subtreeForm)) {
 				patternMemo.delete(key);
 			}
 		}
@@ -1119,18 +1219,57 @@ function buildProjectIgnoreMatcher(
 		}
 		return identity;
 	};
-	const rootPrefix = resolvedRoot.endsWith(path.sep)
-		? resolvedRoot
-		: resolvedRoot + path.sep;
+	/**
+	 * Does this caller spelling hold a `.` or `..` segment? Only such a spelling
+	 * has to be resolved by the KERNEL: `path.resolve` folds a dot segment
+	 * lexically, so a `..` after a directory link names a directory that never
+	 * existed (#4876 review r2 F2). The pattern reads the same separator set as
+	 * `splitPathSegments` on every platform (a `\` separates, so on POSIX a
+	 * filename containing one reads as several segments: such a name pays one
+	 * directory read, never a wrong verdict), and it is one regex rather than a
+	 * split + filter + some because this runs on EVERY `isIgnored` call: 46-49 ns
+	 * per call against the split's 230-240 ns (review r3 F3; the command and its
+	 * output are in the PR body under `## Blast radius`).
+	 */
+	const hasDotSegment = (spelling: string): boolean =>
+		/(^|[\\/])\.\.?([\\/]|$)/.test(spelling);
+	/**
+	 * The file's project path key, from the caller's own spelling. A spelling
+	 * with no dot segment keeps the one `path.resolve` and the text compare, so a
+	 * walk pays no kernel round trip per file (#703). A dot-segment spelling takes
+	 * the identity of its DIRECTORY, which this matcher caches per directory, so a
+	 * walk through one link pays one read per directory.
+	 */
+	const projectPathKey = (spelling: string): string => {
+		const absolute = path.resolve(spelling);
+		if (!hasDotSegment(spelling)) {
+			if (isUnderRootText(absolute)) return absolute;
+			return path.join(
+				identityOfDir(path.dirname(absolute)),
+				path.basename(absolute),
+			);
+		}
+		// A dot segment that ENDS the spelling names a directory itself, so there
+		// is no trailing name to keep: the whole spelling takes the kernel's
+		// answer (`<root>/link/..` is the link target's parent, not `<root>`'s
+		// lexically folded sibling).
+		const tail = path.basename(spelling);
+		if (tail === "." || tail === "..") return identityOfDir(spelling);
+		return path.join(identityOfDir(path.dirname(spelling)), tail);
+	};
 	// The textual prefix test keeps the in-root path (every walk of a project
 	// spelled by its identity) at one string compare, with no `path.relative`.
+	// #4689 batch 7: it is the owner's `isWithinForm` on one path form, so the
+	// containment rule has one spelling in the tree (#4861 F2).
 	const isUnderRootText = (absolute: string): boolean =>
-		absolute === resolvedRoot || absolute.startsWith(rootPrefix);
+		isWithinPathForm(absolute, resolvedRoot);
 	const invalidateSubtree = (subtree: string): void => {
 		const absolute = path.resolve(subtree);
-		const local = isUnderRootText(absolute)
-			? absolute
-			: identityOfDir(absolute);
+		// #4876 review r2 F2: a dot-segment spelling resolves through the kernel,
+		// so this eviction reaches the directory the memo is really keyed under.
+		let local = absolute;
+		if (hasDotSegment(subtree)) local = identityOfDir(subtree);
+		else if (!isUnderRootText(absolute)) local = identityOfDir(absolute);
 		dropVerdictsUnder(local);
 		nestedCache.delete(local);
 	};
@@ -1138,19 +1277,7 @@ function buildProjectIgnoreMatcher(
 	// Compile expanded gitignore globs once per matcher instance. Relative-path
 	// resolution remains outside this cache, so nested ignore scopes cannot leak
 	// verdicts between sibling trees. The instance lifetime bounds this map.
-	const gitignoreGlobOptions: MinimatchOptions = {
-		dot: true,
-		nocase: process.platform === "win32",
-	};
-	const compiledGlobs = new Map<string, Minimatch>();
-	const matchExpanded = (value: string, expanded: string): boolean => {
-		let compiled = compiledGlobs.get(expanded);
-		if (compiled === undefined) {
-			compiled = new Minimatch(expanded, gitignoreGlobOptions);
-			compiledGlobs.set(expanded, compiled);
-		}
-		return compiled.match(value);
-	};
+	const matchExpanded = createExpandedGlobMatcher();
 
 	// #703 perf follow-up: `normalizeEphemeralMapKey` (cheap slash-fold +
 	// Windows-lowercase, zero fs I/O), NOT `normalizeMapKey` (realpath-backed).
@@ -1191,23 +1318,19 @@ function buildProjectIgnoreMatcher(
 			// #4689: one verdict per file, whichever name reached it. The memo, the
 			// nested-rule directories and the tracked set all key on the root's own
 			// spelling.
-			const spelled = path.resolve(filePath);
-			const resolved = isUnderRootText(spelled)
-				? spelled
-				: path.join(
-						identityOfDir(path.dirname(spelled)),
-						path.basename(spelled),
-					);
+			const resolved = projectPathKey(filePath);
 			// Two namespaces (D: for directory queries, F: for file queries)
 			// because gitignore semantics differ for trailing-slash patterns.
 			const memoKey = (isDirectory ? "D:" : "F:") + resolved;
 			let verdict = patternMemo.get(memoKey);
 			if (verdict === undefined) {
-				const rootRelative = path.relative(resolvedRoot, resolved);
+				// #4689 batch 7: at-or-above the root is `!isWithinForm`, so a name
+				// beginning with `..` stays inside the root it belongs to. The dropped
+				// second test (`rootRelative.startsWith("..")`) treated `..foo/x` as
+				// outside (#4861 F2).
 				if (
-					!rootRelative ||
-					rootRelative.startsWith("..") ||
-					path.isAbsolute(rootRelative)
+					resolved === resolvedRoot ||
+					!isWithinPathForm(resolved, resolvedRoot)
 				) {
 					verdict = { ignored: false, layer: undefined };
 				} else {
@@ -1222,18 +1345,15 @@ function buildProjectIgnoreMatcher(
 						if (dirPatterns.length === 0) continue;
 						const relative = path.relative(dir, resolved);
 						const normalized = normalizeIgnorePath(relative);
-						for (const pattern of dirPatterns) {
-							if (
-								!matchesGitignorePattern(
-									pattern,
-									normalized,
-									isDirectory,
-									matchExpanded,
-								)
-							)
-								continue;
-							ignored = !pattern.negated;
-							layer = pattern.layer;
+						const winner = lastMatchingPattern(
+							dirPatterns,
+							normalized,
+							isDirectory,
+							matchExpanded,
+						);
+						if (winner) {
+							ignored = !winner.negated;
+							layer = winner.layer;
 						}
 					}
 					verdict = { ignored, layer };
@@ -1461,6 +1581,12 @@ export function getProjectIgnoreMatcher(rootDir: string): ProjectIgnoreMatcher {
  * Root changes discard the whole matcher because they change its base pattern
  * set. Nested changes evict only verdicts in that directory's subtree; the
  * matcher and compiled-glob memo remain reusable for unrelated trees.
+ *
+ * The subtree is the CALLER's spelling, never `path.resolve` of it: a bash
+ * redirect that names `src/linked/../shared/.gitignore` writes
+ * `<root>/shared/.gitignore`, and a lexical fold would evict `<root>/src/shared`,
+ * a directory that never existed (#4876 review r3 F1, CodeRabbit inline
+ * 4372287149).
  */
 export function invalidateProjectIgnoreMatcherForPath(filePath: string): void {
 	const resolvedPath = path.resolve(filePath);
@@ -1474,7 +1600,7 @@ export function invalidateProjectIgnoreMatcherForPath(filePath: string): void {
 			projectIgnoreMatcherCache.delete(cachedRoot);
 			continue;
 		}
-		cached.matcher.invalidateSubtree(path.dirname(resolvedPath));
+		cached.matcher.invalidateSubtree(path.dirname(filePath));
 	}
 }
 
@@ -1659,7 +1785,7 @@ export async function detectFileChangedAfterCommand(
  */
 export function isTestFile(filePath: string): boolean {
 	if (detectFileRole(filePath) === "test") return true;
-	const normalized = filePath.replace(/\\/g, "/");
+	const normalized = toPosix(filePath);
 	return (
 		normalized.includes("test-utils") ||
 		normalized.startsWith("test-") ||

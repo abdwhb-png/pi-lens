@@ -15,6 +15,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import {
 	createDeadline,
@@ -22,10 +23,18 @@ import {
 	yieldIfOverBudget,
 } from "./cooperative-budget.js";
 import { incrementDegradationCount } from "./degradation-ledger.js";
-import { KIND_EXTENSIONS, type FileKind } from "./file-kinds.js";
+import {
+	KIND_EXTENSIONS,
+	SPECIAL_FILENAMES,
+	type FileKind,
+} from "./file-kinds.js";
 import { isTestFileName } from "./file-role.js";
 import { PathKeyedMap } from "./path-keyed-map.js";
-import { isAtOrAboveHomeDir, normalizeEphemeralMapKey } from "./path-utils.js";
+import {
+	isAtOrAboveHomeDir,
+	normalizeEphemeralMapKey,
+	realpathOrResolve,
+} from "./path-utils.js";
 import { createSingleFlight, type SingleFlight } from "./single-flight.js";
 import {
 	createDebounceScheduler,
@@ -1064,6 +1073,7 @@ export async function collectWordIndexDocs(
 		: await collectSourceFilesAsync(root, {
 				maxFiles,
 				prioritizeCodeKinds: true,
+				includeNamedFiles: true,
 			});
 	const truncated = preflightFiles?.truncated ?? files.length === maxFiles;
 	const docs = Object.assign(
@@ -1210,6 +1220,7 @@ export async function refreshWordIndexIncrementally(
 	const walked = await collectSourceFilesAsync(root, {
 		maxFiles,
 		prioritizeCodeKinds: true,
+		includeNamedFiles: true,
 	});
 	const sourceWalkMs = Date.now() - sourceWalkStartMs;
 	if (!shouldContinue()) throw new Error("word index refresh superseded");
@@ -1560,13 +1571,15 @@ export function parseWordIndexQuery(query: string): ParsedWordIndexQuery {
 	return { terms: termParts.join(" "), filters };
 }
 
-/** `lang:X` → the extension set for FileKind X (case-insensitive), drawn
- * exclusively from `KIND_EXTENSIONS` (clients/file-kinds.ts) — the single
- * source of truth (#894 invariant: no second, hand-maintained language list).
- * An unrecognized kind throws {@link WordIndexQueryError} listing the accepted
- * kinds (KIND_EXTENSIONS' own keys), the same loud-failure contract as an
+/** `lang:X` → a path predicate for FileKind X (case-insensitive): the kind's
+ * `KIND_EXTENSIONS` set (clients/file-kinds.ts) — the single source of truth
+ * (#894 invariant: no second, hand-maintained language list) — or, for a file
+ * named rather than suffixed (Jenkinsfile, Dockerfile), the SPECIAL_FILENAMES
+ * pattern `detectFileKind` classifies it by (#5235). An unrecognized kind
+ * throws {@link WordIndexQueryError} listing the accepted kinds
+ * (KIND_EXTENSIONS' own keys), the same loud-failure contract as an
  * unsupported `key:` prefix. */
-function resolveLangExtensions(value: string): readonly string[] {
+function resolveLangMatcher(value: string): (file: string) => boolean {
 	const kind = value.toLowerCase() as FileKind;
 	const extensions = KIND_EXTENSIONS[kind];
 	if (!extensions) {
@@ -1577,10 +1590,15 @@ function resolveLangExtensions(value: string): readonly string[] {
 			`Unknown lang: "${value}" in word-index query — supported languages: ${known}.`,
 		);
 	}
-	return extensions;
+	const named = SPECIAL_FILENAMES.flatMap((entry) =>
+		entry.kind === kind ? [entry.pattern] : [],
+	);
+	return (file) =>
+		extensions.includes(path.extname(file).toLowerCase()) ||
+		named.some((pattern) => pattern.test(path.basename(file)));
 }
 
-/** `ext:ts` / `ext:.ts` → normalized to a single leading-dot, lowercased form for extname comparison. */
+/** `ext:ts` / `ext:.ts` → a single leading-dot, lowercased suffix for path-suffix comparison (#5136). */
 function normalizeExtFilterValue(value: string): string {
 	return `.${value.replace(/^\.+/, "").toLowerCase()}`;
 }
@@ -1595,19 +1613,22 @@ function resolveWordIndexFilter(
 	filter: WordIndexQueryFilter,
 ): ResolvedWordIndexFilter {
 	if (filter.key === "lang") {
-		const extensions = resolveLangExtensions(filter.value);
+		const matchesLang = resolveLangMatcher(filter.value);
 		return {
 			key: filter.key,
 			negated: filter.negated,
-			test: (file) => extensions.includes(path.extname(file).toLowerCase()),
+			test: matchesLang,
 		};
 	}
 	if (filter.key === "ext") {
-		const normalized = normalizeExtFilterValue(filter.value);
+		// Suffix match on the display path, not `path.extname` equality: a
+		// compound suffix (`.test.ts`, `.d.ts`) never equals the last dot
+		// segment `extname` returns, so `ext:test.ts` could never match (#5136).
+		const suffix = normalizeExtFilterValue(filter.value);
 		return {
 			key: filter.key,
 			negated: filter.negated,
-			test: (file) => path.extname(file).toLowerCase() === normalized,
+			test: (_file, displayPath) => displayPath.toLowerCase().endsWith(suffix),
 		};
 	}
 	// "file": substring match against the index's own normalized display path
@@ -2645,8 +2666,14 @@ export function triggerBackgroundWordIndexBuild(
 	// and via MCP where cwd can be a raw tool argument) — the session-start and
 	// quick-mode-warmup builds sit behind `canWarmCaches`, which already refuses
 	// a home-rooted cwd. Apply the same `isAtOrAboveHomeDir` ceiling here so a
-	// cold query from $HOME never starts a whole-home walk-and-read.
-	if (isAtOrAboveHomeDir(key, options.homeDir)) {
+	// cold query from $HOME never starts a whole-home walk-and-read. By real
+	// path on both sides (#4911), so a link on either side is refused too.
+	if (
+		isAtOrAboveHomeDir(
+			realpathOrResolve(key),
+			realpathOrResolve(options.homeDir ?? os.homedir()),
+		)
+	) {
 		const reason = `root at/above home directory (${key})`;
 		dbg?.(`word-index cold-build: skipped — ${reason}`);
 		logWordIndex({

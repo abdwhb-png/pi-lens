@@ -7,8 +7,10 @@ import {
 	type AdvisoryProvenance,
 } from "./advisory-provenance.js";
 import type { TestRunnerFindingsCache } from "./project-diagnostics/runner-adapters/runner-findings.js";
+import { recordDegradationOnce } from "./degradation-ledger.js";
 import { logLatency } from "./latency-logger.js";
 import {
+	resolveLensToolName,
 	translateGuidanceToolNames,
 	type LensToolHost,
 } from "./tool-config.js";
@@ -17,7 +19,34 @@ import {
 export const AUTOMATION_FRAMING =
 	"[pi-lens automated check — not a user request] ";
 
-type ContextResult = { messages: Array<{ role: "user"; content: string }> };
+type ContextResult = {
+	messages: Array<{ role: "user"; content: string }>;
+	/** #5240: the blocker text of a repeat message, for the retained-injection check. */
+	repeatBody?: string;
+};
+
+/**
+ * #5240: opens a turn-end message that repeats blockers the model was already
+ * told about. "Historical finding" means the workspace changed since capture,
+ * so a repeat must not borrow it.
+ */
+export const BLOCKER_REPEAT_HEADING =
+	"Still unresolved (already reported on an earlier turn, not new):";
+
+export function blockerRepeatContent(blockers: string): string {
+	return `${BLOCKER_REPEAT_HEADING}\n\n${blockers}`;
+}
+
+/**
+ * #5240: the last line of a delivered repeat. The staged blocker text is
+ * capped (`capTurnEndMessage`), so the repeat names the pull that lists every
+ * blocker. Added when the repeat is rendered, never staged: `repeatBody` must
+ * stay exactly the blocker text for the retained-injection check.
+ */
+function blockerRepeatPointer(): string {
+	const tool = resolveLensToolName("lens_diagnostics", "pi");
+	return `Every unresolved 🔴 blocker: ${tool} {source: "session", mode: "all", severity: "error"}`;
+}
 
 // #1432 review (S3b): a multi-file bash write can carry hundreds of changed
 // paths, one `reasons` entry apiece — logging all of them shrinks the
@@ -81,18 +110,62 @@ function turnEndMessage(
 	};
 }
 
-/** Read a turn-end finding without changing its durable delivery state. */
+/**
+ * #4943: the reader the staged turn-end message is for, or undefined when it
+ * is this reader's. One comparison per field: `deliverTo` (the composer's
+ * address) against the reader's `address`; without it, the owner `sessionId`
+ * against the reader's `sessionId`; a record that names neither is anyone's.
+ * A pi request passes its session for both. The MCP host passes its one
+ * address for every server process (`deliverTo` must outlive a restart) and
+ * its coordinator id as the owner, reassigned at each session start (advisory
+ * provenance tells a predecessor's findings apart by it). A reader that passes
+ * no session takes every message. A skip records one ledger row per addressee.
+ */
+function addressedElsewhere(
+	data: Partial<TurnEndFindingsCache>,
+	sessionId: string | undefined,
+	address: string | undefined = sessionId,
+): string | undefined {
+	if (sessionId === undefined) return undefined;
+	const addressee =
+		data.deliverTo !== undefined
+			? data.deliverTo === address
+				? undefined
+				: data.deliverTo
+			: data.sessionId !== undefined && data.sessionId !== sessionId
+				? data.sessionId
+				: undefined;
+	if (addressee === undefined) return undefined;
+	// Once per addressee, not per request: every request of the other session
+	// skips the same message until its owner reads it.
+	recordDegradationOnce({
+		kind: "turn-end-delivery-addressed-elsewhere",
+		subject: addressee,
+		reason:
+			"a staged turn-end message is addressed to another session; it waits for that session's next request",
+	});
+	return addressee;
+}
+
+/**
+ * Read a turn-end finding without changing its durable delivery state.
+ * `sessionId` and `address` name the reader (`addressedElsewhere`).
+ */
 export function peekTurnEndFindings(
 	cacheManager: CacheManager,
 	cwd: string,
 	runtime?: RuntimeCoordinator,
 	logDelivery = false,
+	sessionId?: string,
+	address?: string,
 ): ContextResult | undefined {
 	const findings = cacheManager.readCache<Partial<TurnEndFindingsCache>>(
 		"turn-end-findings",
 		cwd,
 	);
 	if (!findings?.data?.content || findings.data.consumed === true) return;
+	if (addressedElsewhere(findings.data, sessionId, address) !== undefined)
+		return;
 	const validation = validateAdvisoryProvenance(findings.data, cwd, runtime);
 	if (logDelivery)
 		logProvenanceDecision(
@@ -113,44 +186,81 @@ export function peekTurnEndFindings(
 	};
 }
 
+/**
+ * #4943: `sessionId` is the reading request's session, and `address` the
+ * address a message for it carries (`addressedElsewhere`). A message another
+ * session's turn end composed (`deliverTo`), or the blocker text of a record
+ * another session owns, is that session's: the read leaves it untouched for
+ * that session's next request.
+ */
 export function consumeTurnEndFindings(
 	cacheManager: CacheManager,
 	cwd: string,
 	runtime?: RuntimeCoordinator,
+	sessionId?: string,
+	address?: string,
+	// #5240: a repeat record waits for a request that opens a prompt, and is
+	// dropped once the reader's session holds no live blocker; every other
+	// reader takes it as any message. pi's context hook says which.
+	repeat: { atPromptTail: boolean; blockersLive: boolean } = {
+		atPromptTail: true,
+		blockersLive: true,
+	},
 ): ContextResult | undefined {
 	const findings = cacheManager.readCache<Partial<TurnEndFindingsCache>>(
 		"turn-end-findings",
 		cwd,
 	);
 	if (!findings?.data?.content || findings.data.consumed === true) return;
+	if (addressedElsewhere(findings.data, sessionId, address) !== undefined)
+		return;
+	if (findings.data.repeat === true && !repeat.atPromptTail) return;
 	const validation = validateAdvisoryProvenance(findings.data, cwd, runtime);
 	logProvenanceDecision(validation, findings.data.provenance, "turn-end", cwd);
+	settleStagedTurnEnd(cacheManager, cwd, findings.data);
+	if (validation.allFilesDeleted) return;
+	// Marked, fixed or retired since it was staged: nothing is left to repeat.
+	if (findings.data.repeat === true && !repeat.blockersLive) return;
+	return {
+		messages: [
+			turnEndMessage(
+				findings.data.repeat === true
+					? `${findings.data.content}\n\n${blockerRepeatPointer()}`
+					: findings.data.content,
+				validation.status === "current",
+				findings.data.provenance,
+			),
+		],
+		...(findings.data.repeat === true &&
+		findings.data.content.startsWith(BLOCKER_REPEAT_HEADING)
+			? {
+					repeatBody: findings.data.content.slice(
+						BLOCKER_REPEAT_HEADING.length + 2,
+					),
+				}
+			: {}),
+	};
+}
 
-	// A blocker record is also the opt-in commit gate's durable state. Mark the
-	// context message consumed without deleting the record; clean/advisory-only
-	// records retain the historical consume-and-clear behavior.
-	if (
-		findings.data.hasBlockers === true &&
-		typeof findings.data.sessionId === "string"
-	) {
+/**
+ * A blocker record is also the opt-in commit gate's durable state. Mark the
+ * context message consumed without deleting the record; clean/advisory-only
+ * records retain the historical consume-and-clear behavior.
+ */
+function settleStagedTurnEnd(
+	cacheManager: CacheManager,
+	cwd: string,
+	data: Partial<TurnEndFindingsCache>,
+): void {
+	if (data.hasBlockers === true && typeof data.sessionId === "string") {
 		cacheManager.writeCache(
 			"turn-end-findings",
-			{ ...findings.data, consumed: true },
+			{ ...data, consumed: true },
 			cwd,
 		);
 	} else {
 		cacheManager.clearCache("turn-end-findings", cwd);
 	}
-	if (validation.allFilesDeleted) return;
-	return {
-		messages: [
-			turnEndMessage(
-				findings.data.content,
-				validation.status === "current",
-				findings.data.provenance,
-			),
-		],
-	};
 }
 
 /** Read test findings without consuming them; used by acknowledged IPC delivery. */
@@ -260,16 +370,24 @@ export function consumeTestFindings(
 	return findings;
 }
 
-/** Complete an acknowledged MCP delivery without re-validating or re-rendering it. */
+/**
+ * Complete an acknowledged MCP delivery without re-validating or re-rendering
+ * it. #4943: only a message still addressed to the reader that peeked it; one
+ * a pi turn end staged since is left for its session.
+ */
 export function acknowledgeTurnEndFindings(
 	cacheManager: CacheManager,
 	cwd: string,
+	sessionId?: string,
+	address?: string,
 ): void {
 	const findings = cacheManager.readCache<Partial<TurnEndFindingsCache>>(
 		"turn-end-findings",
 		cwd,
 	);
 	if (!findings?.data?.content || findings.data.consumed === true) return;
+	if (addressedElsewhere(findings.data, sessionId, address) !== undefined)
+		return;
 	if (
 		findings.data.hasBlockers === true &&
 		typeof findings.data.sessionId === "string"

@@ -408,14 +408,14 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 		}
 	});
 
-	it("keeps the gate closed for a DEMOTED blocker, which no mark ever reached", async () => {
+	it("keeps the gate closed for a DEMOTED blocker with no mark", async () => {
 		// Decided from the existing retire semantics, not invented here:
 		// demotion takes a record out of the authoritative CHANNEL, it is not a
 		// resolution, and `clients/blocker-freshness.ts:89` pins that the commit
-		// gate is unaffected by it. The policy never runs on a stale record
-		// (`clients/runtime-turn.ts` takes the stale branch first), so a demoted
-		// record can never be a policy survivor — and must never be counted as
-		// suppressed either.
+		// gate is unaffected by it. Since #4990 the demoted arm runs the same
+		// policy stack, so the agent's own mark is the ONE thing that can take it
+		// out of the gate (the next case). Without a mark the gate still counts
+		// it.
 		const env = setupTestEnvironment("pi-lens-3248-demoted-");
 		try {
 			const cwd = env.tmpDir;
@@ -430,10 +430,6 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			expect(runtime.markInlineBlockerStale(filePath, "dependency-drift")).toBe(
 				true,
 			);
-			// Even with the mark in the store, the demoted record is not the
-			// policy's to suppress.
-			markFalsePositive(cwd, diagnostic);
-
 			registerEdit(cacheManager, cwd, filePath);
 			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
 
@@ -755,7 +751,7 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 	it("judges nothing on a closed gate with no mark in the project", async () => {
 		// #4698's pass reacts to a MARK: a file-less turn can change a survivor
 		// only through one. The guard is load-bearing on cost as well as on
-		// meaning — `applyInlineBlockerPolicy` pays `loadProjectRulePolicyMap` per
+		// meaning — `applyInlineBlockerPolicy` pays `loadProjectRulePolicy` per
 		// record — so a blocked but unmarked session must re-read nothing on a
 		// quiet turn. Without it, every reply in that state runs the whole policy
 		// pass over every live blocker.
@@ -834,13 +830,11 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 		}
 	});
 
-	it("keeps the gate closed for a DEMOTED blocker marked on a quiet turn", async () => {
-		// #4698's read-only pass shares the edit turn's rule for a demoted record
-		// verbatim: `stale` takes the record out of the authoritative CHANNEL, it
-		// is not a resolution, and the policy never judges it (the case above).
-		// A mark-only turn must not open a gate the edit-turn shape would keep
-		// shut on the same state, or the two turn shapes disagree about one
-		// disposition — the defect #4698 fixed in the other direction.
+	it("opens the gate for a DEMOTED blocker whose every finding is marked on a quiet turn", async () => {
+		// #4990 reverses #4698's rule for the demoted arm: the same policy stack
+		// judges a demoted record on BOTH turn shapes, so a fully marked one
+		// leaves the gate. #4698's invariant still holds — the two shapes must
+		// agree on one state — but the shared rule now includes the demoted arm.
 		const env = setupTestEnvironment("pi-lens-4698-demoted-mark-only-");
 		try {
 			const cwd = env.tmpDir;
@@ -861,8 +855,8 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			runtime.beginTurn();
 			await handleTurnEnd(makeTurnEndDeps(runtime, cacheManager, cwd));
 
-			expect(runtime.gitGuardHasBlockers).toBe(true);
-			expect(evaluateGitGuard(runtime, cacheManager, cwd).block).toBe(true);
+			expect(runtime.gitGuardHasBlockers).toBe(false);
+			expect(evaluateGitGuard(runtime, cacheManager, cwd).block).toBe(false);
 		} finally {
 			env.cleanup();
 		}
@@ -976,7 +970,7 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			fs.writeFileSync(filePath, "safeAlpha();\n");
 			editDispatch(runtime, cacheManager, cwd, filePath, []);
 
-			expect(runtime.gitGuardCacheUnknownReason).toBeUndefined();
+			expect(runtime.gitGuardCacheUnknownFor()).toBeUndefined();
 			expect(evaluateGitGuard(runtime, cacheManager, cwd)).toEqual({
 				block: false,
 			});
@@ -1020,7 +1014,7 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			fs.writeFileSync(blocking, "safeAlpha();\n");
 			editDispatch(runtime, cacheManager, cwd, blocking, []);
 
-			expect(runtime.gitGuardCacheUnknownReason).toBeUndefined();
+			expect(runtime.gitGuardCacheUnknownFor()).toBeUndefined();
 			expect(evaluateGitGuard(runtime, cacheManager, cwd)).toEqual({
 				block: false,
 			});
@@ -1060,7 +1054,7 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			fs.writeFileSync(filePath, "safeAlpha();\nsafeBeta();\n");
 			editDispatch(runtime, cacheManager, cwd, filePath, []);
 
-			expect(runtime.gitGuardCacheUnknownReason).toBeUndefined();
+			expect(runtime.gitGuardCacheUnknownFor()).toBeUndefined();
 			expect(evaluateGitGuard(runtime, cacheManager, cwd)).toEqual({
 				block: false,
 			});
@@ -1148,9 +1142,15 @@ describe("git-guard commit gate honors the turn-end disposition policy (#3248)",
 			// (`isTurnEndFindingsCache` at v4.2.1) checks named fields only, so an
 			// extra key leaves the record a record to it.
 			const V4750_KEYS = ["blockerWrittenAt"];
+			// #4943 adds one: the session the composer addressed `content` to.
+			// The same reader rule holds, and the gate never reads it.
+			const V4943_KEYS = ["deliverTo"];
 			expect(
 				Object.keys(after).filter(
-					(key) => !V4_2_1_KEYS.includes(key) && !V4750_KEYS.includes(key),
+					(key) =>
+						!V4_2_1_KEYS.includes(key) &&
+						!V4750_KEYS.includes(key) &&
+						!V4943_KEYS.includes(key),
 				),
 			).toEqual([]);
 		} finally {

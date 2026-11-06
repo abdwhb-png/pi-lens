@@ -14,13 +14,23 @@
  * entries whose ambient scope had changed under them.
  *
  * At each #4493 look (a bash tool_result, every tool_call) this module
- * compares the root's install stamps (lockfiles and package-manager install
- * markers) and a bounded walk of the root's declaration files, then publishes
+ * compares the root's install stamps (lockfiles, package-manager install
+ * markers and a Python venv's `site-packages` directories) and a bounded walk
+ * of the root's declaration files, then publishes
  * what changed as one `DiskChange` (#4535). The publisher allocates the
  * project sequence; its subscribers restart the root's primary clients and
  * send the exact-URI watched-files events (#4528), and move the
  * diagnostics-cache clock so the entries whose scope holds a changed path or
  * an install are refused. This module names no consumer.
+ *
+ * The same look compares the config files a server reads once and keeps
+ * (`pyrightconfig.json`, `pyproject.toml`: the closed list in
+ * `clients/lsp/server-config-files.ts`) at the root only (a config below it is
+ * a declared p3 residual: the look stats the root's names, it does not walk),
+ * and publishes a created, edited or deleted one as a `config` change (#4532
+ * gap 12). A config born after the server answered never reached it before:
+ * pyright kept its "could not be resolved" findings for the server's life until
+ * a watched-files event named the file.
  *
  * The records are process-wide per root, as the servers are (two sessions on
  * one root share them, so one install restarts once). They describe the disk,
@@ -31,7 +41,8 @@
  * published instead of recorded as a baseline the server never read.
  */
 import { promises as fsp } from "node:fs";
-import { join } from "node:path";
+import * as os from "node:os";
+import { basename, join } from "node:path";
 import { BoundedFifoMap } from "./bounded-cache.js";
 import {
 	incrementDegradationCount,
@@ -46,9 +57,17 @@ import {
 	ensureDiskChangeSubscribers,
 	LSP_CONSUMER,
 } from "./disk-change-subscribers.js";
+import { untilAborted } from "./deadline-utils.js";
 import { isExcludedDirName } from "./file-utils.js";
 import { logLatency } from "./latency-logger.js";
-import { isUnderDir, normalizeMapKey } from "./path-utils.js";
+import {
+	isAtOrAboveHomeDir,
+	isUnderDir,
+	normalizeMapKey,
+	realpathOrResolve,
+} from "./path-utils.js";
+import { SERVER_CONFIG_FILE_NAMES } from "./lsp/server-config-files.js";
+import { PROJECT_VENV_DIR_NAMES } from "./python-environment.js";
 import { createSingleFlight } from "./single-flight.js";
 import { compareOrdinal } from "./string-utils.js";
 
@@ -81,6 +100,19 @@ const INSTALL_MARKERS = [
 	".yarn-state.yml",
 	".yarn-integrity",
 ];
+/** The interpreter level of a POSIX venv's `site-packages` directory. */
+const VENV_LIB_DIR = "lib";
+/** The Windows venv layout's `site-packages`, relative to the venv root. */
+const VENV_WINDOWS_SITE_PACKAGES = join("Lib", "site-packages");
+/**
+ * Interpreter directories under `<venv>/lib` statted per look. A venv holds one
+ * per interpreter on the platform, so the cap never binds on a real
+ * environment; it exists so a pathological `lib` cannot turn every look into a
+ * stat storm, and an interpreter directory past the cap is not stamped — an
+ * install there publishes nothing, which is the bound's stated cost, chosen
+ * over an unbounded stat per look.
+ */
+const VENV_INTERPRETER_DIRS_MAX = 4;
 
 /** Directories one declaration walk reads before it stops (degraded). */
 const DECLARATION_WALK_MAX_DIRS = 4096;
@@ -88,7 +120,12 @@ const DECLARATION_WALK_MAX_DIRS = 4096;
 const DECLARATION_WALK_MAX_FILES = 2048;
 /** Directory reads in flight during one walk. */
 const DECLARATION_WALK_CONCURRENCY = 16;
-const DECLARATION_FILE = /\.d\.[cm]?ts$/i;
+/**
+ * Declaration files: TypeScript `.d.ts`/`.d.mts`/`.d.cts` and Python `.pyi`
+ * stubs (#4532 gap 3: a stub changed or added outside pi reached no server;
+ * pyright keeps the bytes of a closed stub it read for an importer).
+ */
+const DECLARATION_FILE = /(?:\.d\.[cm]?ts|\.pyi)$/i;
 /** Roots kept; the oldest is dropped (its next look is a first look). */
 const MAX_ROOTS = 64;
 
@@ -100,6 +137,8 @@ function declarationLookIntervalMs(): number {
 
 interface RootRecord {
 	stamp: string;
+	/** name -> `ino:size:mtimeMs` of each listed server config file (#4532). */
+	configs: Map<string, string> | undefined;
 	/** path -> `ino:size:mtimeMs`; undefined until a walk completes uncapped. */
 	declarations: Map<string, string> | undefined;
 	walkedAt: number;
@@ -110,15 +149,161 @@ const records = new BoundedFifoMap<string, RootRecord>(MAX_ROOTS);
  * One look per root at a time: a look that arrives mid-flight joins it and
  * gets one trailing look, which compares against the record the flight left,
  * so two sessions' looks after one install restart once. The trailing look
- * carries the first caller's trigger.
+ * runs the first caller's closure, so a joiner's walk demand rides
+ * {@link owedWalks}, not the closure.
  */
 const looks = createSingleFlight<void>({ coalesceTrailing: true });
+
+/**
+ * #4532 gap 6: roots owed a declaration walk by a caller whose trigger demands
+ * one (a bash result), by root key. The trailing pass of a joined flight runs
+ * the FIRST caller's closure, so a bash result that joined a `tool_call` look
+ * got no walk, and the file its command generated waited for some later walk.
+ *
+ * Each caller writes its demand here in the same synchronous step as its join
+ * ({@link oweDeclarationWalk}), and every pass takes its key's demand before
+ * its first await: the running pass has either not taken yet (it walks for
+ * the joiner) or has, and then the join earned the trailing pass that takes
+ * it. Process-wide like `records` (a session boundary keeps it: it is a demand
+ * on the disk, and costs at most one walk); bounded like `records`, and an
+ * evicted demand only defers the change to the next walk.
+ */
+const owedWalks = new BoundedFifoMap<string, true>(MAX_ROOTS);
+
+/**
+ * Owe `root`'s next look a declaration walk when this call demands one: a
+ * `tool_result` under the `"trigger"` rule. A `tool_call`, and every
+ * `"interval"` look, walk only when the interval has passed, which the pass
+ * reads from the record itself, so they owe nothing. The HEAD look calls this
+ * for its own caller before it joins (`resyncHeadMove`): a HEAD look that
+ * joins runs the first caller's closure too.
+ */
+export function oweDeclarationWalk(
+	root: string,
+	trigger: "tool_call" | "tool_result",
+	walk: OutOfBandLookOptions["walk"] = "trigger",
+): void {
+	if (demandsWalk(trigger, walk)) owedWalks.set(normalizeMapKey(root), true);
+}
+
+/** #4476's rule: a bash result always walks, unless the look is `"interval"`.
+ *
+ * #4532 gap 5: `"always"` is the caller saying it must not answer from a view
+ * the walk has not refreshed — the `lsp_diagnostics` body does, so a
+ * declaration file created inside `PI_LENS_DECLARATION_LOOK_MS` reaches the
+ * server before the answer rather than after the next bash result. */
+function demandsWalk(
+	trigger: "tool_call" | "tool_result",
+	walk: OutOfBandLookOptions["walk"],
+): boolean {
+	return (
+		walk === "always" || (trigger === "tool_result" && walk !== "interval")
+	);
+}
 
 const fingerprint = (stat: {
 	ino: number;
 	size: number;
 	mtimeMs: number;
 }): string => `${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+
+/** Created, changed and deleted server config files between two looks. */
+function diffServerConfigs(
+	root: string,
+	before: ReadonlyMap<string, string>,
+	after: ReadonlyMap<string, string>,
+): Array<{ filePath: string; type: number }> {
+	return diffDeclarations(
+		new Map([...before].map(([name, print]) => [join(root, name), print])),
+		new Map([...after].map(([name, print]) => [join(root, name), print])),
+	);
+}
+
+/**
+ * The stamp of `root`'s Python venv `site-packages` directories (#4532 gap 3).
+ *
+ * A project that installs with `pip install` and keeps no lockfile — the
+ * reported shape: a `pyproject.toml` and a local `.venv` — wrote nothing the
+ * lockfile and `node_modules` stamp could see, so an install published no
+ * change, no server restarted, and pyright served the `Import "x" could not be
+ * resolved` it had cached for its whole life (measured on real pyright
+ * 1.1.414: stale through 40 calls over 20 s; the same install behind a
+ * published change clears on call 1).
+ *
+ * One directory stat per `site-packages` and NO listing of its contents: `pip
+ * install` adds the package's directory and its `.dist-info` entry, which moves
+ * the directory's own mtime, inode or size. A root with no venv costs no
+ * syscall here; a venv costs one `lib` listing and one stat per interpreter
+ * directory, plus one stat for the Windows layout (absent on POSIX).
+ *
+ * Residual: an install that rewrites files INSIDE an existing package
+ * directory without adding or removing an entry (a reinstall of the same
+ * package release that leaves `<name>` and its `.dist-info` in place)
+ * changes no entry of
+ * `site-packages` itself, so it publishes nothing; pip's own uninstall-then-
+ * install moves the directory. The other side of the same bound is a write AT
+ * the `site-packages` root: Python caches a top-level module's bytecode in a
+ * `__pycache__` there, so the FIRST import of a top-level installed module
+ * moves the directory's identity and publishes one install (which also
+ * refuses the diagnostics cache workspace-wide, `clients/disk-change-
+ * subscribers.ts`). It is bounded to that first import: the `.pyc` is cached,
+ * so a re-import moves nothing. Review 5009 F2.
+ */
+async function readVenvInstallParts(
+	root: string,
+	listed: ReadonlySet<string>,
+): Promise<Array<{ part: string; changedAt: number }>> {
+	const targets: Array<{ label: string; dir: string }> = [];
+	for (const name of PROJECT_VENV_DIR_NAMES) {
+		if (!listed.has(name)) continue;
+		const venvRoot = join(root, name);
+		// The Windows layout has no interpreter level, so it is one stat either way.
+		targets.push({
+			label: `${name}/${VENV_WINDOWS_SITE_PACKAGES}`,
+			dir: join(venvRoot, VENV_WINDOWS_SITE_PACKAGES),
+		});
+		let interpreters: import("node:fs").Dirent[];
+		try {
+			interpreters = await fsp.readdir(join(venvRoot, VENV_LIB_DIR), {
+				withFileTypes: true,
+			});
+		} catch {
+			// none: the Windows layout, or a venv root that holds no `lib`.
+			continue;
+		}
+		// Deterministic order, as the declaration walk's keys are (S2871): the
+		// population that fits `VENV_INTERPRETER_DIRS_MAX` must not depend on the
+		// order the filesystem listed the entries in. The type guard runs BEFORE
+		// the cap, so a stray file in `lib` is never a candidate and cannot spend
+		// a slot the venv's own interpreter directory needs (review 5009 F1).
+		interpreters.sort((a, b) => compareOrdinal(a.name, b.name));
+		const interpreterDirs = interpreters
+			.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+			.slice(0, VENV_INTERPRETER_DIRS_MAX);
+		for (const interpreter of interpreterDirs) {
+			targets.push({
+				label: `${name}/${VENV_LIB_DIR}/${interpreter.name}/site-packages`,
+				dir: join(venvRoot, VENV_LIB_DIR, interpreter.name, "site-packages"),
+			});
+		}
+	}
+	return Promise.all(
+		targets.map(async (target) => {
+			try {
+				const stat = await fsp.stat(target.dir);
+				return {
+					part: `${target.label}=${fingerprint(stat)}`,
+					changedAt: stat.mtimeMs,
+				};
+			} catch {
+				// none: the venv has no `site-packages` at this layout, which reads as
+				// "no entry here" exactly as a listed name that could not be statted
+				// does; a layout that appears later changes the stamp.
+				return { part: `${target.label}=-`, changedAt: 0 };
+			}
+		}),
+	);
+}
 
 /**
  * The root's install stamp and the freshest timestamp in it.
@@ -138,14 +323,17 @@ const fingerprint = (stat: {
  * a cache directory under it would change the stamp and restart servers for
  * nothing (#4476's reason for listing markers instead of the directory).
  */
-async function readInstallStamp(
-	root: string,
-): Promise<{ stamp: string; newestChangeMs: number }> {
+async function readInstallStamp(root: string): Promise<{
+	stamp: string;
+	newestChangeMs: number;
+	/** The root's server config files; `undefined` when the root cannot be listed. */
+	configs: Map<string, string> | undefined;
+}> {
 	let listed: Set<string>;
 	try {
 		listed = new Set(await fsp.readdir(root));
 	} catch {
-		return { stamp: "-", newestChangeMs: 0 };
+		return { stamp: "-", newestChangeMs: 0, configs: undefined };
 	}
 	const names: string[] = [];
 	for (const name of INSTALL_LOCKFILES) if (listed.has(name)) names.push(name);
@@ -167,22 +355,43 @@ async function readInstallStamp(
 			linkChangedAt = link.mtimeMs;
 		}
 	}
-	const parts = await Promise.all(
-		names.map(async (name) => {
-			try {
-				const stat = await fsp.stat(join(root, name));
-				return {
-					part: `${name}=${fingerprint(stat)}`,
-					changedAt: stat.mtimeMs,
-				};
-			} catch {
-				return { part: `${name}=-`, changedAt: 0 };
-			}
-		}),
-	);
+	// #4532: the root's server config files are statted in the same round as
+	// the stamp's names, and kept out of the stamp (a config is no install).
+	const configNames: string[] = [];
+	for (const name of SERVER_CONFIG_FILE_NAMES)
+		if (listed.has(name)) configNames.push(name);
+	// #4532 gap 3: the venv's `site-packages` directories ride the same round,
+	// so the look pays no extra await for them.
+	const [statted, venvParts] = await Promise.all([
+		Promise.all(
+			[...names, ...configNames].map(async (name) => {
+				try {
+					const stat = await fsp.stat(join(root, name));
+					return {
+						part: `${name}=${fingerprint(stat)}`,
+						changedAt: stat.mtimeMs,
+					};
+				} catch {
+					return { part: `${name}=-`, changedAt: 0 };
+				}
+			}),
+		),
+		readVenvInstallParts(root, listed),
+	]);
+	const parts = statted.slice(0, names.length);
+	// A listed name that could not be statted reads as absent, as in the stamp.
+	const configs = new Map<string, string>();
+	for (const [index, name] of configNames.entries()) {
+		const print = (
+			statted[names.length + index] as { part: string }
+		).part.slice(name.length + 1);
+		if (print !== "-") configs.set(name, print);
+	}
 	if (linkPrint !== undefined)
 		parts.push({ part: linkPrint, changedAt: linkChangedAt });
+	parts.push(...venvParts);
 	return {
+		configs,
 		stamp: parts.map((entry) => entry.part).join("|"),
 		newestChangeMs: parts.reduce(
 			(newest, entry) => Math.max(newest, entry.changedAt),
@@ -428,9 +637,24 @@ export interface OutOfBandLookOptions {
 	 * `PI_LENS_DECLARATION_LOOK_MS`. `"interval"` walks at most that often on
 	 * every trigger, which is what a look at an EXTRA root uses: the walk is
 	 * bounded per root, and the install stamp is what an extra root is looked at
-	 * for, so a big worktree's walk cannot run on every bash result.
+	 * for, so a big worktree's walk cannot run on every bash result. `"always"`
+	 * walks on this look whatever the interval says, for a caller that is about
+	 * to answer from the servers' view (#4532 gap 5).
 	 */
-	walk?: "trigger" | "interval";
+	walk?: "trigger" | "interval" | "always";
+	/**
+	 * The caller's abort signal (#5005 F3). A caller that already abandoned its
+	 * answer looks at nothing: no install stamp, no walk, no publish, and no walk
+	 * demand owed to the next look. A caller that abandons the answer while its
+	 * look runs stops waiting for it, because an answer nobody reads must not be
+	 * held by a walk; the look itself still finishes for any caller joined to it
+	 * (see `untilAborted`).
+	 *
+	 * `| undefined` so a caller can pass its own `AbortSignal | undefined`
+	 * through the existing options object without a new
+	 * `exactOptionalPropertyTypes` diagnostic (`tools/lsp-diagnostics.ts` does).
+	 */
+	signal?: AbortSignal | undefined;
 }
 
 /**
@@ -455,9 +679,41 @@ export function lookForOutOfBandChanges(
 	runtime?: DiskChangeRuntime,
 	options: OutOfBandLookOptions = {},
 ): Promise<void> {
+	// #5005 F3: a caller that already abandoned its answer spends nothing at all.
+	// Before this guard the answer route's look ran its whole walk for a call
+	// whose signal was already aborted, and the batch it was for then answered
+	// no file.
+	if (options.signal?.aborted) return Promise.resolve();
+	// #4905: the home folder (or a folder above it) holds more directories than
+	// the declaration walk's cap on any real machine, so each look would spend
+	// its time and end capped. Same ceiling as the opaque prescan, `analysis-root`
+	// and `jscpd-client` (#4760): the walk is skipped, and said once per session,
+	// because a walk that did not run is not a walk that found nothing. Only the
+	// walk: the install stamp (one listing and a few stats) is still read and
+	// compared, so an install under this root still publishes and restarts the
+	// client rooted here.
+	// By real path on both sides, as `analysis-root` does (#4689).
+	const homeRoot = isAtOrAboveHomeDir(
+		realpathOrResolve(root),
+		realpathOrResolve(os.homedir()),
+	);
+	if (homeRoot)
+		recordDegradationOnce({
+			kind: "lsp-declaration-look-capped",
+			subject: "home-root",
+			reason:
+				"a session root that is the home folder or above it is not walked for declaration files changed outside pi-lens; such a change under it is not looked for (a dependency install still is)",
+		});
 	const key = normalizeMapKey(root);
-	return looks.run(key, () => lookOnce(root, key, trigger, runtime, options));
+	oweDeclarationWalk(root, trigger, options.walk);
+	const look = looks.run(key, () =>
+		lookOnce(root, key, trigger, runtime, options, homeRoot),
+	);
+	return untilAborted(look, options.signal);
 }
+
+/** The `DiskChange.sources` entry of a server config file change (#4532). */
+export const CONFIG_SOURCE = "config";
 
 /** `diffDeclarations`'s watched-files type codes, as the record names them. */
 const CHANGE_TYPE = {
@@ -476,13 +732,15 @@ function outOfBandChange(
 	root: string,
 	installed: boolean,
 	changes: ReadonlyArray<{ filePath: string; type: number }>,
+	configChanges: ReadonlyArray<{ filePath: string; type: number }>,
 	at: number,
 ): DiskChangeInput {
 	const sources = [
 		...(installed ? ["install"] : []),
 		...(changes.length > 0 ? ["declarations"] : []),
+		...(configChanges.length > 0 ? [CONFIG_SOURCE] : []),
 	];
-	const pathChanges = changes.map((change) => ({
+	const pathChanges = [...changes, ...configChanges].map((change) => ({
 		filePath: change.filePath,
 		type: CHANGE_TYPE[change.type as 1 | 2 | 3],
 	}));
@@ -493,12 +751,17 @@ function outOfBandChange(
 		// A stat fingerprint, not the bytes: an `inferred` change may never by
 		// itself confirm that a finding was not reproduced.
 		kind: "inferred",
+		// A config file changes the analysis of every file under its root, so it
+		// cannot be enumerated any more than an install can: the cache refuses
+		// everything scanned before it (`"unknown"`), never just the config path.
 		paths:
-			changes.length > 0
-				? changes.map((change) => normalizeMapKey(change.filePath))
-				: installed
-					? "unknown"
-					: [],
+			configChanges.length > 0
+				? "unknown"
+				: changes.length > 0
+					? changes.map((change) => normalizeMapKey(change.filePath))
+					: installed
+						? "unknown"
+						: [],
 		...(pathChanges.length > 0 ? { pathChanges } : {}),
 		at,
 	};
@@ -510,16 +773,21 @@ async function lookOnce(
 	trigger: "tool_call" | "tool_result",
 	runtime: DiskChangeRuntime | undefined,
 	options: OutOfBandLookOptions,
+	/** The root is the home folder or above it: no declaration walk (#4905). */
+	skipWalk: boolean,
 ): Promise<void> {
+	// #4532 gap 6: this pass serves every walk demand written before it
+	// started, its own caller's and any joiner's, and takes them before its
+	// first await (`owedWalks`). A pass with none walks under the interval rule,
+	// as a lone `tool_call` or `"interval"` look does.
+	const walkOwed = owedWalks.delete(key);
 	const started = Date.now();
 	const prior = records.get(key);
 	const walkDue =
-		options.walk === "interval"
-			? prior === undefined ||
-				started - prior.walkedAt >= declarationLookIntervalMs()
-			: trigger === "tool_result" ||
-				prior === undefined ||
-				started - prior.walkedAt >= declarationLookIntervalMs();
+		!skipWalk &&
+		(walkOwed ||
+			prior === undefined ||
+			started - prior.walkedAt >= declarationLookIntervalMs());
 	const [install, walked] = await Promise.all([
 		readInstallStamp(root),
 		walkDue ? walkDeclarations(root) : Promise.resolve(undefined),
@@ -545,6 +813,9 @@ async function lookOnce(
 		: (observed?.declarations ?? prior?.declarations);
 	records.set(key, {
 		stamp: install.stamp,
+		// An unlistable root keeps the previous baseline: reading it as "no
+		// config files" would publish every one as created on the next look.
+		configs: install.configs ?? prior?.configs,
 		declarations,
 		walkedAt: walkDue && !incomplete ? started : (prior?.walkedAt ?? started),
 	});
@@ -590,12 +861,16 @@ async function lookOnce(
 		walkDue && !incomplete && declarations && prior?.declarations
 			? diffDeclarations(prior.declarations, declarations)
 			: [];
-	if (!installed && changes.length === 0) return;
+	const configChanges =
+		install.configs && prior?.configs
+			? diffServerConfigs(root, prior.configs, install.configs)
+			: [];
+	if (!installed && changes.length === 0 && configChanges.length === 0) return;
 	const at = Date.now();
 	// I1: the per-root record is committed above, before any consumer runs.
 	ensureDiskChangeSubscribers();
 	const { results, failedSubscribers } = await publishDiskChange(
-		outOfBandChange(root, installed, changes, at),
+		outOfBandChange(root, installed, changes, configChanges, at),
 		runtime,
 	);
 	// The restart count belongs to the LSP subscriber's own answer; the row
@@ -616,11 +891,11 @@ async function lookOnce(
 		phase: "lsp_out_of_band_change",
 		filePath: root,
 		durationMs: Date.now() - started,
-		result: installed
-			? changes.length > 0
-				? "install+declarations"
-				: "install"
-			: "declarations",
+		result: [
+			...(installed ? ["install"] : []),
+			...(changes.length > 0 ? ["declarations"] : []),
+			...(configChanges.length > 0 ? [CONFIG_SOURCE] : []),
+		].join("+"),
 		metadata: {
 			trigger,
 			restarted,
@@ -630,9 +905,17 @@ async function lookOnce(
 			// session-cwd root and a live client's root write the same record,
 			// so this names the look, not the caller.
 			scope: prior === undefined ? "first-look" : "recorded",
+			// #4532 gap 6: the walk served a demand this row's own trigger did not
+			// make: a bash result that joined this flight (`owedWalks`).
+			joinedWalk: walkOwed && !demandsWalk(trigger, options.walk),
 			created: count(1),
 			changed: count(2),
 			deleted: count(3),
+			// The server config files this look forwarded (#4532), by name.
+			configs: configChanges.map(
+				(change) =>
+					`${CHANGE_TYPE[change.type as 1 | 2 | 3]}:${basename(change.filePath)}`,
+			),
 		},
 	});
 }

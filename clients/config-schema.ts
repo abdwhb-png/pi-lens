@@ -4,11 +4,7 @@
  * A plain JSON-Schema-shaped object, per `config-core/schema.ts`: the same
  * value the validator runs on is the value #2416 publishes as
  * `docs/schema/pi-lens-config-v1.json`, so there is no compiler between the two
- * for drift to hide in. It is the FIRST real schema through the #2418 harness —
- * `tests/config/pi-lens-config-schema.test.ts` runs `assertSchemaStabilityTiers`
- * and `assertSchemaIdentityAnchor` over this object rather than over the
- * placeholder fixture, which is what makes those two assertions load-bearing
- * instead of self-referential.
+ * for drift to hide in.
  *
  * Three deliberate shapes:
  *
@@ -93,9 +89,7 @@ function opaque(tier: StabilityTier): ConfigSchemaNode {
  * inferred from the key's name: this is the ONE piece of validation the slice
  * adds, and it earns its place — pre-#2426 a `disabledServers` that was a
  * STRING reached `new Set(config.disabledServers)` and disabled one server per
- * CHARACTER. `tests/config/pi-lens-config-schema.test.ts` asserts every
- * `LEGACY_ROOT_LSP_KEYS` member has an entry here, so a new registry row cannot
- * land untyped.
+ * CHARACTER.
  */
 const LSP_KEY_TYPES: Readonly<Record<string, "object" | "array">> = {
 	servers: "object",
@@ -276,6 +270,32 @@ function lspNamespace(): ConfigSchemaNode {
 	};
 }
 
+/**
+ * The `dispatch` namespace. `disabledRunners` is the one typed key: a DENIAL
+ * list, so a nearer tier can add to it but never lift an entry
+ * (`array-union`, the same monotonic rule as `lsp.disabledServers`). The
+ * members are plain strings here; whether each names a registered dispatch
+ * runner is the dispatch loader's check (`clients/dispatch/disabled-runners.ts`),
+ * for the reason `lspServerEntryNode` gives — this module cannot import the
+ * dispatch registry. Every other key (`runnerTimeoutFloorMs`) stays opaque, so
+ * the global loader keeps owning its per-key diagnostics.
+ */
+function dispatchNamespace(): ConfigSchemaNode {
+	return {
+		type: "object",
+		additionalProperties: true,
+		[STABILITY_TIER_KEY]: "stable",
+		properties: {
+			disabledRunners: {
+				type: "array",
+				items: { type: "string", [STABILITY_TIER_KEY]: "experimental" },
+				[DENY_KEY]: "array-union",
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+		},
+	};
+}
+
 /** The shared public rule policy shape (#4226). */
 function rulePolicyEntryNode(): ConfigSchemaNode {
 	return {
@@ -283,10 +303,23 @@ function rulePolicyEntryNode(): ConfigSchemaNode {
 		additionalProperties: true,
 		properties: {
 			threshold: { type: "number", [STABILITY_TIER_KEY]: "experimental" },
-			// These two legacy fields remain opaque so the project compatibility
-			// parser can preserve its established field-specific diagnostics.
-			disable: opaque("experimental"),
-			select: opaque("experimental"),
+			// `disable` is a denial: the union of every tier, so a nearer config
+			// adds rules and never re-enables one (#5232, #2415 AC3).
+			disable: {
+				type: "array",
+				items: { type: "string", [STABILITY_TIER_KEY]: "experimental" },
+				[DENY_KEY]: "array-union",
+				[STABILITY_TIER_KEY]: "experimental",
+			},
+			// `select` is a typed list, so a non-string member is dropped as in
+			// `disable` (#5250); a project file notices only a non-array or an
+			// all-dropped list. It is not a denial: the nearest tier that sets a
+			// key's list replaces it (the #5232 decision).
+			select: {
+				type: "array",
+				items: { type: "string", [STABILITY_TIER_KEY]: "experimental" },
+				[STABILITY_TIER_KEY]: "experimental",
+			},
 			ignorePaths: {
 				type: "array",
 				items: {
@@ -351,6 +384,7 @@ function buildConfigSchema(): ConfigSchemaNode {
 	}
 
 	for (const key of [
+		"fallow",
 		"knip",
 		"jscpd",
 		"madge",
@@ -407,6 +441,7 @@ function buildConfigSchema(): ConfigSchemaNode {
 	}
 
 	properties[LSP_NAMESPACE_KEY] = lspNamespace();
+	properties.dispatch = dispatchNamespace();
 
 	properties[CONFIG_SCHEMA_ANCHOR_KEY] = {
 		type: "string",

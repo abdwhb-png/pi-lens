@@ -27,6 +27,8 @@ import { fileURLToPath } from "node:url";
 import {
 	finalizeToolResult,
 	finalizeToolResultWithDelivery,
+	isJsonCell,
+	JSON_CELL_DETAILS_KEY,
 	renderToolText as toolText,
 	stripResultDetails,
 } from "../tools/render-compact.js";
@@ -64,8 +66,10 @@ import {
 	readSymbol,
 	readTurnEndStatus,
 	recentLatency,
-	renderCompactModuleReport,
-	renderCompactProjectReport,
+	renderModuleReportPreset,
+	renderTextProjectReport,
+	resolveModuleReportPreset,
+	renderCompactSymbolSearch,
 	renderLspBrokenStatusLines,
 	resolveRebuildScript,
 	resourceFootprint,
@@ -89,12 +93,15 @@ import {
 	createAstGrepSearchTool,
 } from "../tools/ast-grep-search.js";
 import { createLensDiagnosticsTool } from "../tools/lens-diagnostics.js";
+import { readFilePath, readPathsArgument } from "../tools/shared.js";
 import { peekMcpSessionRuntime } from "../clients/mcp/session.js";
+import { isUnderDir, walkUpDirs } from "../clients/path-utils.js";
 import { loadPiLensGlobalConfig } from "../clients/lens-config.js";
 import { loadPiLensProjectConfig } from "../clients/project-lens-config.js";
 import {
 	resolveLensToolEnabled,
 	toolRegistryEntryForMcp,
+	translateGuidanceToolNames,
 } from "../clients/tool-config.js";
 import {
 	endSituationalToolTelemetry,
@@ -103,6 +110,7 @@ import {
 } from "../clients/situational-tool-telemetry.js";
 import { logExtension, flushExtensionLog } from "../clients/extension-log.js";
 import { createLspNavigationTool } from "../tools/lsp-navigation.js";
+import { SYMBOL_SEARCH_DESCRIPTION } from "../tools/symbol-search.js";
 import { dispositionSuppressedLine } from "../clients/finding-delivery-gate.js";
 import { shouldInitializeSessionRoot } from "../clients/lsp/session-roots.js";
 import {
@@ -117,6 +125,7 @@ import {
 	STALE_WARN_ONLY,
 	StalenessGate,
 	stalenessCheckEnabled,
+	WARN_ONLY_STALE_TOOLS,
 } from "./build-staleness.js";
 
 // Any stray stdout write corrupts the JSON-RPC stream; force it onto stderr.
@@ -198,8 +207,7 @@ function isWarmBuildStale(): boolean {
 }
 
 function findRepoRoot(start: string): string {
-	let dir = start;
-	for (let depth = 0; depth < 6; depth++) {
+	for (const dir of walkUpDirs(start, { maxDepth: 6 })) {
 		const pkgPath = path.join(dir, "package.json");
 		if (fs.existsSync(pkgPath)) {
 			try {
@@ -211,9 +219,6 @@ function findRepoRoot(start: string): string {
 				// keep walking up
 			}
 		}
-		const parent = path.dirname(dir);
-		if (parent === dir) break;
-		dir = parent;
 	}
 	return path.resolve(start, "..", "..");
 }
@@ -333,15 +338,11 @@ function rejectForeignTurnCwd(route: string, cwd: string): string {
 }
 
 function isWithinServerWorkspace(cwd: string): boolean {
-	const target = path.resolve(cwd);
-	// `path.relative` applies the platform's own path semantics (including
-	// win32 case-insensitivity), which is what "inside the workspace" means
-	// here — do NOT hand-roll a case fold. An empty result means `target`
-	// IS `DEFAULT_CWD` (win32 can reach that via a pure case/drive-letter
-	// difference, since path.relative there is case-insensitive) and must
-	// be accepted, not rejected — do NOT reintroduce a `rel !== ""` guard.
-	const rel = path.relative(DEFAULT_CWD, target);
-	return !rel.startsWith("..") && !path.isAbsolute(rel);
+	// `isUnderDir` owns containment (whole segments, win32 case folding), and
+	// the workspace root itself is inside it — a win32 cwd that differs from
+	// `DEFAULT_CWD` only in case names the root and must be accepted. Do NOT
+	// hand-roll a case fold or reintroduce a `rel !== ""` guard.
+	return isUnderDir(path.resolve(cwd), DEFAULT_CWD);
 }
 
 function startIpcServer(): void {
@@ -652,11 +653,13 @@ const ALL_TOOLS = [
 		inputSchema: {
 			type: "object",
 			properties: {
-				file: {
+				path: {
 					type: "string",
 					description:
 						"Path to the file to analyze (absolute, or relative to cwd).",
 				},
+				file: { type: "string", description: "Alias for `path`." },
+				filePath: { type: "string", description: "Alias for `path`." },
 				cwd: {
 					type: "string",
 					description: "Project root. Defaults to the server's workspace.",
@@ -673,7 +676,6 @@ const ALL_TOOLS = [
 						'Optional pi-lens flag overrides for this run, e.g. {"no-lsp": true} to bench the non-LSP path.',
 				},
 			},
-			required: ["file"],
 		},
 	},
 	{
@@ -727,8 +729,7 @@ const ALL_TOOLS = [
 	},
 	{
 		name: "pilens_symbol_search",
-		description:
-			"Find relevant files by ranked identifier search. On a cold cache, project_report and symbol_search return available: false with a retry hint and start a non-blocking background build; module_report degrades to outline-only with cache freshness explicit. Example: search `authenticate user` before pilens_module_report.",
+		description: translateGuidanceToolNames(SYMBOL_SEARCH_DESCRIPTION, "mcp"),
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -759,8 +760,10 @@ const ALL_TOOLS = [
 	},
 	{
 		name: "pilens_module_report",
-		description:
+		description: translateGuidanceToolNames(
 			"Return a navigable source-module outline with references and read handles. An outline shows shape, not bodies, and does not satisfy read-before-edit; `read_symbol` and `read_enclosing` return body text and record read coverage. On a cold cache, project_report and symbol_search return available: false with a retry hint and start a non-blocking background build; module_report degrades to outline-only with cache freshness explicit. Example: use pilens_module_report on `src/app.ts` before pilens_read_symbol.",
+			"mcp",
+		),
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -768,6 +771,11 @@ const ALL_TOOLS = [
 					type: "string",
 					description: "File to report on (absolute or relative to cwd).",
 				},
+				path: {
+					type: "string",
+					description: "File to report on (the canonical spelling of `file`).",
+				},
+				filePath: { type: "string", description: "Alias for `path`." },
 				cwd: { type: "string" },
 				maxRefsPerSymbol: {
 					type: "number",
@@ -780,9 +788,8 @@ const ALL_TOOLS = [
 				},
 				view: {
 					type: "string",
-					enum: ["summary", "default", "compact"],
 					description:
-						"Payload tier. summary returns top-level entries/recommendedReads with heavy callback/usedBy/blast-radius payloads omitted. compact (cheapest) returns a line-oriented TEXT rendering of the full report instead of JSON.",
+						'Output preset: projection \u00d7 format. "summary-text" (default) = metric fields off (no usedBy/fanout/complexity fields), text. "summary-json" = same fields, JSON. "full-text" = every field, text. "full-json" = every field, JSON (byte-identical to the pre-#5137 default). Metrics render as a cx:/fan: suffix and flags as [flag]; every field appears in the text cell, `kind` prints raw so it can be reused as read_symbol\'s kind filter, and an unavailable module still renders its callbacks and recommended reads. A summary cell states the omission in its PROVENANCE footer. A maxRefsPerSymbol argument promotes the projection to full and keeps the format.',
 				},
 				blastRadius: {
 					type: "boolean",
@@ -805,13 +812,14 @@ const ALL_TOOLS = [
 						"Per-direction cap for call-graph relations (default 20).",
 				},
 			},
-			required: ["file"],
 		},
 	},
 	{
 		name: "pilens_project_report",
-		description:
-			"Orient in a project from its review graph. On a cold cache, project_report and symbol_search return available: false with a retry hint and start a non-blocking background build; module_report degrades to outline-only with cache freshness explicit. Example: use pilens_project_report before choosing a file.",
+		description: translateGuidanceToolNames(
+			'Orient in a project from its review graph. Returns a line-oriented TEXT report by default; pass view:"json" for the full JSON payload. On a cold cache, project_report and symbol_search return available: false with a retry hint and start a non-blocking background build; module_report degrades to outline-only with cache freshness explicit. Example: use pilens_project_report before choosing a file.',
+			"mcp",
+		),
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -828,21 +836,29 @@ const ALL_TOOLS = [
 				},
 				view: {
 					type: "string",
-					enum: ["default", "compact"],
+					// Plain string, no enum: "json" is the JSON hatch; anything else is text.
 					description:
-						"Payload tier. compact (cheapest) returns a line-oriented TEXT rendering instead of JSON. Default returns JSON.",
+						'Payload tier. "json" returns the full JSON report; any other value (or omitting view) returns the default line-oriented TEXT rendering.',
 				},
 			},
 		},
 	},
 	{
 		name: "pilens_read_symbol",
-		description:
+		description: translateGuidanceToolNames(
 			"Return one symbol's verbatim source. An outline shows shape, not bodies, and does not satisfy read-before-edit; `read_symbol` and `read_enclosing` return body text and record read coverage. Example: use pilens_read_symbol after pilens_module_report identifies `parseConfig`.",
+			"mcp",
+		),
 		inputSchema: {
 			type: "object",
 			properties: {
 				file: { type: "string", description: "File containing the symbol." },
+				path: {
+					type: "string",
+					description:
+						"File containing the symbol (the canonical spelling of `file`).",
+				},
+				filePath: { type: "string", description: "Alias for `path`." },
 				symbol: {
 					type: "string",
 					description:
@@ -855,13 +871,15 @@ const ALL_TOOLS = [
 				},
 				cwd: { type: "string" },
 			},
-			required: ["file", "symbol"],
+			required: ["symbol"],
 		},
 	},
 	{
 		name: "pilens_read_enclosing",
-		description:
+		description: translateGuidanceToolNames(
 			"Return the smallest symbol or callback enclosing a line. An outline shows shape, not bodies, and does not satisfy read-before-edit; `read_symbol` and `read_enclosing` return body text and record read coverage. Example: use pilens_read_enclosing after a diagnostic points to line 42.",
+			"mcp",
+		),
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -870,6 +888,12 @@ const ALL_TOOLS = [
 					description:
 						"Absolute or workspace-relative path to the source file.",
 				},
+				path: {
+					type: "string",
+					description:
+						"Absolute or workspace-relative path to the source file (the canonical spelling of `file`).",
+				},
+				filePath: { type: "string", description: "Alias for `path`." },
 				line: {
 					type: "number",
 					description:
@@ -899,7 +923,7 @@ const ALL_TOOLS = [
 						"Maximum lines for onOversize=slice; defaults to maxLines, then 80.",
 				},
 			},
-			required: ["file", "line"],
+			required: ["line"],
 		},
 	},
 	{
@@ -925,6 +949,11 @@ const ALL_TOOLS = [
 						"outside it is rejected with the `cwd` it was measured against; " +
 						"re-query with `cwd` set to that file's own workspace instead.",
 				},
+				path: {
+					type: "string",
+					description: "Path to explain (the canonical spelling of `file`).",
+				},
+				filePath: { type: "string", description: "Alias for `path`." },
 			},
 		},
 	},
@@ -978,7 +1007,7 @@ const ALL_TOOLS = [
 	{
 		name: "pilens_lsp_navigation",
 		description:
-			'Navigate source with language-server operations. Example: use `{operation: "references", path: "src/app.ts", line: 12}`.',
+			'Navigate source with language-server operations. Returns Neovim-style TEXT by default (path:line:col locations, symbol trees, diagnostics); pass view:"json" for the structured envelope. Example: use `{operation: "references", path: "src/app.ts", line: 12}`.',
 		inputSchema: schemaWithCwd(lspNavigationTool.parameters),
 	},
 ];
@@ -1086,7 +1115,11 @@ function effectiveDocumentLine(
 async function callTool(
 	name: string,
 	args: Record<string, unknown>,
-): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean }> {
+): Promise<{
+	content: { type: "text"; text: string }[];
+	isError?: boolean;
+	details?: unknown;
+}> {
 	if (name === "pilens_lsp_diagnostics") {
 		recordDegradationOnce({
 			kind: "lsp-diagnostics-compatibility",
@@ -1120,10 +1153,14 @@ async function callTool(
 		return astGrepDumpCompatibilityResult(args, "mcp");
 	}
 	if (name === "pilens_analyze") {
-		const file = args.file;
-		if (typeof file !== "string" || file.length === 0) {
+		// #5041: `path` is canonical; `file` and `filePath` stay accepted (#2418).
+		const fileRead = readFilePath(args);
+		if (fileRead.refusal)
+			return { ...toolText(fileRead.refusal), isError: true };
+		const file = fileRead.path;
+		if (!file) {
 			return {
-				...toolText("pilens_analyze requires a 'file' string."),
+				...toolText("pilens_analyze requires a `path` string."),
 				isError: true,
 			};
 		}
@@ -1281,99 +1318,48 @@ async function callTool(
 		const query = typeof args.query === "string" ? args.query : "";
 		if (!query.trim()) return toolText("Provide a non-empty `query`.");
 		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
+		// #5041: one reader owns the `paths` entry rules; #5038: the engine clamps
+		// `limit` and resolves each entry as a host path (this handler used to
+		// drop a non-string entry and clamp a second time).
+		const pathsRead = readPathsArgument(args.paths, { cwd });
+		if (pathsRead.refusal)
+			return { ...toolText(pathsRead.refusal), isError: true };
 		const limit =
 			typeof args.limit === "number" && Number.isFinite(args.limit)
-				? Math.max(1, Math.floor(args.limit))
-				: 20;
-		const paths = Array.isArray(args.paths)
-			? args.paths.filter((p): p is string => typeof p === "string")
-			: undefined;
+				? args.limit
+				: undefined;
+		const paths = pathsRead.entries.length > 0 ? pathsRead.entries : undefined;
 		const lang = typeof args.lang === "string" ? args.lang : undefined;
-		const {
-			available,
-			results,
-			hint,
-			unavailableReason,
-			coverage,
-			snapshotGeneratedAt,
-		} = await symbolSearch(query, cwd, limit, { paths, lang });
-		if (!available) {
+		const result = await symbolSearch(query, cwd, limit, { paths, lang });
+		if (!result.available) {
 			return toolText(
-				hint ??
+				result.hint ??
 					"No word index for this workspace yet — run pilens_session_start first.",
-				{ available: false, query, hint, unavailableReason },
-				true,
 			);
 		}
+		// #5104: one renderer owns the text (clients/lens-engine.ts). Passing no
+		// structured payload keeps renderToolText from appending a fenced JSON
+		// copy of the same hits; the ranked table is the answer.
 		const stalenessNote = graphStalenessNote(
-			snapshotGeneratedAt,
+			result.snapshotGeneratedAt,
 			"Project snapshot",
 		);
-		if (results.length === 0) {
-			return toolText(
-				`No files matched "${query}".` +
-					(coverage
-						? `\nIndex covers ${coverage.files} files${coverage.truncated ? " (capped — results may be incomplete)" : ""}.`
-						: "") +
-					(stalenessNote ? `\n\n${stalenessNote}` : ""),
-				{
-					available: true,
-					query,
-					results: [],
-					coverage,
-					...(stalenessNote ? { staleness: stalenessNote } : {}),
-				},
-				true,
-			);
-		}
-		const lines = [
-			`Top ${results.length} file(s) for "${query}":`,
-			...results.map(
-				(result, i) =>
-					`  ${i + 1}. ${path.relative(cwd, result.file)} ` +
-					`(score ${result.score.toFixed(2)}, ${result.hits} hit(s), ` +
-					`line ${result.startLine})`,
-			),
-			...(stalenessNote ? ["", stalenessNote] : []),
-			...(coverage
-				? [
-						`Index covers ${coverage.files} files${coverage.truncated ? " (capped — results may be incomplete)" : ""}.`,
-					]
-				: []),
-		];
-		// Compact (unindented) JSON — matches the module_report / read_symbol
-		// convention (#517): an agent parses this payload, it doesn't read it
-		// formatted. Path is relative-to-cwd once per hit, no repeated per-hit
-		// `read` block — startLine/endLine already derive offset/limit.
 		return toolText(
-			lines.join("\n"),
-			{
-				query,
-				coverage,
-				results: results.map((result) => {
-					const relFile = path.relative(cwd, result.file);
-					return {
-						file: relFile,
-						score: result.score,
-						hits: result.hits,
-						startLine: result.startLine,
-						endLine: result.endLine,
-						...(result.annotations ? { annotations: result.annotations } : {}),
-						// #771: machine-actionable discovery-funnel hint, mirroring the
-						// pi-tool-surface's suggestedNext (tools/symbol-search.ts).
-						suggestedNext: { tool: "pilens_module_report", path: relFile },
-					};
-				}),
-				...(stalenessNote ? { staleness: stalenessNote } : {}),
-			},
-			true,
+			renderCompactSymbolSearch(result, {
+				cwd,
+				// exactOptionalPropertyTypes: an absent note is an absent key.
+				...(stalenessNote ? { stalenessNote } : {}),
+				reportTool: "pilens_module_report",
+			}),
 		);
 	}
 
 	if (name === "pilens_module_report") {
-		const file = typeof args.file === "string" ? args.file : "";
-		if (!file.trim())
-			return { ...toolText("Provide a `file`."), isError: true };
+		const fileRead = readFilePath(args);
+		if (fileRead.refusal)
+			return { ...toolText(fileRead.refusal), isError: true };
+		const file = fileRead.path;
+		if (!file) return { ...toolText("Provide a `path`."), isError: true };
 		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
 		const maxRefsPerSymbol =
 			typeof args.maxRefsPerSymbol === "number" &&
@@ -1392,61 +1378,42 @@ async function callTool(
 			Number.isFinite(args.maxCallGraphEntries)
 				? Math.max(1, Math.floor(args.maxCallGraphEntries))
 				: undefined;
-		const view =
-			args.view === "summary" || args.view === "compact"
-				? args.view
-				: undefined;
+		const choice = resolveModuleReportPreset(args.view, maxRefsPerSymbol);
 		const focus = typeof args.focus === "string" ? args.focus : undefined;
 		const report = await moduleReport(file, cwd, {
 			maxRefsPerSymbol,
+			view: args.view,
+			focus,
 			blastRadius,
 			blastRadiusDepth,
 			callGraph,
 			maxCallGraphEntries,
-			view,
-			focus,
 		});
-		if (!report.available) {
+		// The graph-age advisory is a surface concern: pi's graph is per-edit warm,
+		// so a staleness line there would be noise, while an MCP caller sits on a
+		// cached graph. It wraps the text cell and never the JSON one (#5137 review).
+		const rendered = renderModuleReportPreset(report, choice);
+		const graphStaleness =
+			choice.format === "text"
+				? graphStalenessNote(report.graphBuiltAt, "Review graph")
+				: undefined;
+		const text = graphStaleness ? `${rendered}\n\n${graphStaleness}` : rendered;
+		if (!report.available)
 			return {
-				...toolText(
-					`No module report for ${path.relative(cwd, path.resolve(cwd, file))} — not a symbol-bearing file, or unreadable.`,
-					report,
-					true,
-				),
+				content: [{ type: "text" as const, text }],
 				isError: true,
+				details:
+					choice.format === "json"
+						? { [JSON_CELL_DETAILS_KEY]: true }
+						: undefined,
 			};
-		}
-		const graphStaleness = graphStalenessNote(
-			report.graphBuiltAt,
-			"Review graph",
-		);
-		const summary =
-			`${path.relative(cwd, report.path) || report.path} [${report.staleness}] — ` +
-			`${report.summary.symbols} symbol(s), ${report.summary.exports} exported, ` +
-			`${report.api.length} in public API` +
-			(graphStaleness ? `\n\n${graphStaleness}` : "");
-		if (view === "compact") {
-			const compactText = renderCompactModuleReport(report);
-			return {
-				content: [
-					{
-						type: "text" as const,
-						text: graphStaleness
-							? `${compactText}\n\n${graphStaleness}`
-							: compactText,
-					},
-				],
-			};
-		}
-		// Compact (unindented) JSON — matches the pi tool's mirror (#512); an
-		// agent parses this payload, it doesn't read it formatted.
-		return toolText(
-			summary,
-			graphStaleness
-				? { ...report, graphStalenessNote: graphStaleness }
-				: report,
-			true,
-		);
+		return {
+			content: [{ type: "text" as const, text }],
+			details:
+				choice.format === "json"
+					? { [JSON_CELL_DETAILS_KEY]: true }
+					: undefined,
+		};
 	}
 
 	if (name === "pilens_project_report") {
@@ -1456,66 +1423,85 @@ async function callTool(
 				? Math.max(1, Math.floor(args.limit))
 				: undefined;
 		const focus = typeof args.focus === "string" ? args.focus : undefined;
-		const view = args.view === "compact" ? "compact" : undefined;
-		const report = await projectReport(cwd, { limit, focus, view });
+		// #5150: default text, explicit JSON hatch. The engine call is identical
+		// either way (data never depends on the rendering), so no `view` is
+		// passed and the engine document is unchanged; the old MCP default was a
+		// summary + fenced JSON, not this bare document.
+		const report = await projectReport(cwd, { limit, focus });
 		if (!report.available) {
+			// Cold cache is still the text cell (#5150): the renderer owns the
+			// unavailable layout (hint, LAST BUILD, UNRENDERED), so no fenced
+			// JSON sidecar rides along here either.
 			return {
-				...toolText(
-					report.hint ?? "No review graph cached for this workspace yet.",
-					report,
-				),
+				content: [
+					{ type: "text" as const, text: renderTextProjectReport(report) },
+				],
 				isError: true,
 			};
 		}
-		const graphStaleness = report.trust
-			? graphStalenessNote(report.trust.graphBuiltAt, "Review graph")
-			: undefined;
-		if (view === "compact") {
-			const compactText = renderCompactProjectReport(report);
+		if (args.view === "json") {
+			// JSON hatch: the handler's payload stays a single parseable document —
+			// no staleness prose is appended to it (#5159). Staleness already
+			// lives inside the document's own trust notes. The wire still stamps
+			// the gate's universal `result ok`/usage footer onto this same block
+			// (finalizeToolResultWithDelivery), so a reader strips it before
+			// parsing. The warm-build wrapper may still append its advisory
+			// (accepted residual per #5158); that path is owned by #5159, not
+			// this tool.
 			return {
-				content: [
-					{
-						type: "text" as const,
-						text: graphStaleness
-							? `${compactText}\n\n${graphStaleness}`
-							: compactText,
-					},
-				],
+				content: [{ type: "text" as const, text: JSON.stringify(report) }],
+				details: { [JSON_CELL_DETAILS_KEY]: true },
 			};
 		}
-		const summary =
-			`Project report — ${report.hubs?.length ?? 0} hub(s), ` +
-			`${report.entryPoints?.length ?? 0} entry point(s), ` +
-			`${report.riskHotspots?.length ?? 0} risk hotspot(s)` +
-			(graphStaleness ? `\n\n${graphStaleness}` : "");
-		return toolText(
-			summary,
-			graphStaleness
-				? { ...report, graphStalenessNote: graphStaleness }
-				: report,
-			true,
-		);
+		// Default text cell: one renderer shared with the pi tool (byte-identity
+		// pinned by tests). The cell owns its trailing STALENESS block, so no
+		// graphStaleness note is appended here — and no fenced JSON sidecar
+		// rides along (renderToolText's structured payload would add one).
+		return {
+			content: [
+				{ type: "text" as const, text: renderTextProjectReport(report) },
+			],
+		};
 	}
 
 	if (name === "pilens_read_symbol") {
-		const file = typeof args.file === "string" ? args.file : "";
+		const fileRead = readFilePath(args);
+		if (fileRead.refusal)
+			return { ...toolText(fileRead.refusal), isError: true };
+		const file = fileRead.path;
 		const symbol = typeof args.symbol === "string" ? args.symbol : "";
-		if (!file.trim() || !symbol.trim()) {
-			return { ...toolText("Provide `file` and `symbol`."), isError: true };
+		if (!file || !symbol.trim()) {
+			return { ...toolText("Provide `path` and `symbol`."), isError: true };
 		}
 		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
 		const kind = typeof args.kind === "string" ? args.kind : undefined;
 		const result = await readSymbol(file, symbol, cwd, { kind });
+		if (!result.found && result.error) {
+			return {
+				...toolText(
+					`Could not inspect ${path.basename(file)}: ${result.error}`,
+					{
+						found: false,
+						error: result.error,
+						...(result.warnings ? { warnings: result.warnings } : {}),
+					},
+				),
+				isError: true,
+			};
+		}
 		if (!result.found) {
 			const suggestionSuffix = result.suggestions?.length
 				? ` Did you mean: ${result.suggestions.join(", ")}?`
 				: " Use pilens_module_report to list symbols.";
+			// #4949: extraction warnings (a recovered syntax error is one) ride the
+			// details JSON the wire text carries, as the pi tool's miss does.
 			return {
 				...toolText(
 					`Symbol "${symbol}" not found in ${path.basename(file)}.${suggestionSuffix}`,
 					{
 						found: false,
 						...(result.suggestions ? { suggestions: result.suggestions } : {}),
+						...(result.warnings ? { warnings: result.warnings } : {}),
 					},
 				),
 				isError: true,
@@ -1540,11 +1526,14 @@ async function callTool(
 	}
 
 	if (name === "pilens_read_enclosing") {
-		const file = typeof args.file === "string" ? args.file : "";
+		const fileRead = readFilePath(args);
+		if (fileRead.refusal)
+			return { ...toolText(fileRead.refusal), isError: true };
+		const file = fileRead.path;
 		const line = typeof args.line === "number" ? args.line : Number.NaN;
-		if (!file.trim() || !Number.isFinite(line)) {
+		if (!file || !Number.isFinite(line)) {
 			return {
-				...toolText("Provide `file` and a numeric `line`."),
+				...toolText("Provide `path` and a numeric `line`."),
 				isError: true,
 			};
 		}
@@ -1696,9 +1685,12 @@ async function callTool(
 
 	if (name === "pilens_effective_config") {
 		const cwd = typeof args.cwd === "string" ? args.cwd : DEFAULT_CWD;
+		const fileRead = readFilePath(args);
+		if (fileRead.refusal)
+			return { ...toolText(fileRead.refusal), isError: true };
 		const view = await effectiveConfig({
 			cwd,
-			...(typeof args.file === "string" ? { file: args.file } : {}),
+			...(fileRead.path ? { file: fileRead.path } : {}),
 			redact: true,
 		});
 		const fileLines =
@@ -1838,78 +1830,29 @@ async function callTool(
 	return { ...toolText(`Unknown tool: ${name}`), isError: true };
 }
 
-// --- Warm build-staleness — per-tool warn-only set (#535) --------------------
-//
-// `pilens_analyze` is handled specially above (force-routes to the existing
-// `fresh` worker fork — it's a stateless per-file dispatch with no dependency
-// on warm-process-only state). Every OTHER tool below either:
-//   - depends on state that only exists inside THIS long-lived process (the
-//     in-memory review graph built by warm `pilens_analyze` calls, the warm
-//     LSP client fleet, the latency/diagnostic counters, the CacheManager) —
-//     a fresh fork would start with none of that and answer differently, not
-//     "more correctly"; or
-//   - is cheap/rare enough (rebuild, session_start) that building bespoke
-//     fresh-fork plumbing isn't worth it yet.
-// So the honest move for all of them is #535's "honest degrade": warn, don't
-// silently serve, and don't pretend a fresh fork would help.
-//
-//   pilens_module_report, pilens_symbol_search — warm review-graph / word-index
-//     cache is in-memory only; a fresh fork has an EMPTY graph, which is a
-//     worse answer than a stale-but-populated one with a warning attached.
-//   pilens_project_scan                        — CacheManager instance is warm-
-//     process state; scan results are cache-derived.
-//   pilens_health, pilens_latency              — these tools report ON the warm
-//     process itself (alive LSP clients, this session's latency log) — the
-//     question "is this call's ANSWER stale" doesn't quite apply, but the code
-//     answering it might still be a stale build, so still worth a note.
-//   pilens_session_start, pilens_turn_end      — mutate warm LSP/graph state;
-//     must run in-process, can't be forked fresh.
-//   pilens_ast_grep_search, pilens_ast_grep_replace,
-//   pilens_lsp_navigation, pilens_diagnostics — depend on the warm LSP
-//     fleet / ast-grep client instances; no fresh-fork machinery exists for
-//     them today (only pilens_analyze's worker.ts loads a fresh dispatch
-//     graph) and the LSP fleet specifically CANNOT be recreated cheaply per
-//     call, so warn is the only honest option.
-//   pilens_read_symbol, pilens_read_enclosing  — stateless file reads, but no
-//     existing fresh-fork path either; warn rather than silently answer with
-//     however this stale build's tree-sitter/read-symbol logic behaves.
-//   pilens_effective_config                    — derives (never reads) the
-//     LSP config for the file's directory to say which servers it selects,
-//     and the merge/deny semantics it explains are compiled code; a stale
-//     build would explain a resolution the running one no longer performs.
-//
-// `pilens_rebuild` is deliberately excluded: it doesn't answer with analysis
-// at all (it shells out to `npm run build`/`build:dist`), and it's the very
-// mechanism that CAUSES staleness — noting "stale" on the tool that fixes
-// staleness would be confusing, not honest.
-const WARN_ONLY_STALE_TOOLS = new Set([
-	"pilens_module_report",
-	"pilens_project_report",
-	"pilens_symbol_search",
-	"pilens_project_scan",
-	"pilens_health",
-	"pilens_latency",
-	"pilens_session_start",
-	"pilens_turn_end",
-	"pilens_ast_grep_search",
-	"pilens_ast_grep_replace",
-	"pilens_lsp_navigation",
-	"pilens_read_symbol",
-	"pilens_read_enclosing",
-	"pilens_effective_config",
-]);
-
 /**
  * Appends the warm-code-stale advisory to a tool result's text (and a
- * `warmCodeStale: true` marker line) without disturbing its JSON payload
- * shape — callers already parse the fenced JSON block by locating braces
- * (see module_report/symbol_search callers), so appending plain text after it
- * is safe.
- */
+ * `warmCodeStale: true` marker line) after whatever the tool rendered. The
+ * tool's own text stays byte-identical, so the advisory only ever reads last
+ * (only `symbol_search` stopped fencing; `module_report` passes a structured
+ * payload only under *-json presets, #5104). An opted-in JSON cell gets the
+ * advisory as its own trailing text block instead, so the payload block stays
+ * parseable (#5159): block 0 is the payload, later text blocks are annotations,
+ * and the contract footer is stamped on the last block. */
 function withStaleWarning<
-	T extends { content: { type: "text"; text: string }[] },
+	T extends {
+		content: { type: "text"; text: string }[];
+		details?: unknown;
+	},
 >(result: T): T {
 	if (result.content.length === 0) return result;
+	const advisory = `warmCodeStale: true\n${STALE_WARN_ONLY}`;
+	if (isJsonCell(result)) {
+		return {
+			...result,
+			content: [...result.content, { type: "text" as const, text: advisory }],
+		};
+	}
 	const last = result.content[result.content.length - 1];
 	return {
 		...result,
@@ -1917,7 +1860,7 @@ function withStaleWarning<
 			...result.content.slice(0, -1),
 			{
 				...last,
-				text: `${last.text}\n\nwarmCodeStale: true\n${STALE_WARN_ONLY}`,
+				text: `${last.text}\n\n${advisory}`,
 			},
 		],
 	};

@@ -21,6 +21,10 @@ import {
 	realpathSync,
 	statSync,
 } from "node:fs";
+import {
+	lstat as lstatAsync,
+	realpath as realpathNativeAsync,
+} from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { win32 } from "node:path";
@@ -366,40 +370,153 @@ export function resetPathIdentityFallbacks(): void {
 }
 
 /**
+ * The identity walk's candidates, deepest first: the spelling itself, then each
+ * ancestor up to the filesystem root. `missing` grows with the climb and names
+ * the segments to fold onto the first ancestor the kernel resolves; a driver
+ * reads it only on the step it returns on, and `foldMissingTail` reverses it in
+ * place there, so a driver never resumes the walk after that.
+ *
+ * One walk, two syscall drivers (#4689 batch 10): `kernelAttempt` (sync,
+ * `realpathSync.native`) and `kernelAttemptAsync` (`fs/promises.realpath`, the
+ * same `uv_fs_realpath`). A second copy of this loop is what the async seam
+ * deleted in `clients/lsp/edits.ts`, so keep the climb here.
+ */
+function* identityCandidates(
+	spelled: string,
+	p: typeof path.posix,
+): Generator<{ candidate: string; missing: string[] }> {
+	let current = spelled;
+	const missing: string[] = [];
+	for (;;) {
+		yield { candidate: current, missing };
+		const parent = p.dirname(current);
+		if (parent === current) return;
+		missing.push(p.basename(current));
+		current = parent;
+	}
+}
+
+/**
+ * One refused identity candidate. A missing component is the expected answer for a file not yet written (a
+ * per-key hot path, #2016), not a failure; any other errno (an unreadable
+ * ancestor, a cyclic link) is tallied for the ledger's read-time fold and makes
+ * the identity UNCONFIRMED: the walk climbed over a name the kernel refused to
+ * give, so the answer is only an ancestor plus the spelling's tail.
+ */
+function recordIdentityRefusal(refusal: unknown, candidate: string): void {
+	if (isAbsenceRefusal(refusal)) return;
+	recordPathIdentityFallback(
+		(refusal as NodeJS.ErrnoException | undefined)?.code ?? "unknown",
+		candidate,
+	);
+}
+
+/**
+ * True when the kernel's refusal is the not-written answer (`ENOENT`: no such
+ * file, `ENOTDIR`: a component names a file) rather than a refused resolution
+ * (`EACCES`, `ELOOP`, `ENAMETOOLONG`): a walk that skipped the former answered
+ * about an absence, one that skipped the latter climbed over an unnamed file.
+ */
+function isAbsenceRefusal(refusal: unknown): boolean {
+	const code = (refusal as NodeJS.ErrnoException | undefined)?.code;
+	return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/**
+ * What one walk answered. `answer` is the resolved prefix with the missing tail
+ * folded on; `foldedTail` says the fold removed a segment, so the answer names a
+ * path the kernel never saw and needs one more walk (see `foldMissingTail`).
+ */
+interface KernelAttempt {
+	answer: string;
+	foldedTail: boolean;
+}
+
+/**
+ * An attempt that also answers whether the kernel confirmed the name. Only the
+ * async driver reports it: its one consumer is a containment decision
+ * (`kernelPathIdentityAsync`), and no sync caller asks — `realpathOrResolve`
+ * takes the fallback either way.
+ */
+interface ConfirmedKernelAttempt extends KernelAttempt {
+	/** False when a skipped component refused for a reason other than absence. */
+	kernelConfirmed: boolean;
+}
+
+/** One walk's identity, and whether the kernel confirmed the name. */
+export interface KernelPathIdentity {
+	/** The kernel-real path, or the nearest resolvable ancestor plus the tail. */
+	identity: string;
+	/** False when a skipped component refused for a reason other than absence. */
+	kernelConfirmed: boolean;
+}
+
+/**
+ * `real` with the walk's missing tail folded onto it. The tail names nothing on
+ * disk, so only the tail is folded (`p.join`); the resolved prefix keeps the
+ * kernel's own answer, link for link.
+ *
+ * The fold can still move a segment the kernel refused into a position it now
+ * resolves: `<dir>/<missing>/../<dir-link>/child` folds to
+ * `<dir>/<dir-link>/child`, whose `dir-link` the walk never traversed, so
+ * resolving that answer again crosses the link and the key moves. A folded
+ * answer is therefore resolved once more, and that second answer is a fixpoint
+ * — a fold removes every dot segment, so the tail it hands back holds none
+ * (#4689 r2 F-CR1).
+ */
+function foldMissingTail(
+	real: string,
+	missing: string[],
+	p: typeof path.posix,
+): string {
+	return missing.length === 0 ? real : p.join(real, ...missing.reverse());
+}
+
+/** True when the fold removed a segment, so the folded answer needs one more walk. */
+function tailHasDotSegment(missing: readonly string[]): boolean {
+	return missing.some((segment) => segment === "." || segment === "..");
+}
+
+/** One walk with the sync driver; see `identityCandidates`. */
+function kernelAttempt(
+	spelled: string,
+	p: typeof path.posix,
+): KernelAttempt | undefined {
+	for (const { candidate, missing } of identityCandidates(spelled, p)) {
+		try {
+			const real = realpathSync.native(candidate);
+			return {
+				answer: foldMissingTail(real, missing, p),
+				foldedTail: tailHasDotSegment(missing),
+			};
+		} catch (refusal) {
+			recordIdentityRefusal(refusal, candidate);
+		}
+	}
+	return undefined;
+}
+
+/**
  * The kernel-real path of an absolute `spelled` path, parsed with `p`: the
  * `realpath` of the path itself when it exists, otherwise the `realpath` of its
  * nearest existing ancestor joined with the missing tail. Only the tail is
  * folded (`p.join`): it names nothing on disk, so it holds no link for the
- * kernel to follow. `undefined` when no ancestor resolves.
+ * kernel to follow; and a fold that removed a dot segment is resolved once
+ * more, so the answer is its own re-resolution. `undefined` when no ancestor
+ * resolves.
  *
  * The first attempt is the only syscall for an existing path, which is the
- * per-edit case; a missing path pays one more `realpath` per missing segment.
+ * per-edit case; a missing path pays one more `realpath` per missing segment,
+ * and a dot segment in that tail one second walk.
  */
 function kernelRealPath(
 	spelled: string,
 	p: typeof path.posix,
 ): string | undefined {
-	let current = spelled;
-	const tail: string[] = [];
-	for (;;) {
-		try {
-			const real = realpathSync.native(current);
-			return tail.length === 0 ? real : p.join(real, ...tail.reverse());
-		} catch (refusal) {
-			// none: a missing component is the expected answer for a file not
-			// yet written (a per-key hot path, #2016), not a failure. Any other
-			// errno (an unreadable ancestor, a cyclic link) is tallied for the
-			// ledger's read-time fold. Either way the identity is decided by
-			// the nearest ancestor the kernel can resolve.
-			const code = (refusal as NodeJS.ErrnoException | undefined)?.code;
-			if (code !== "ENOENT" && code !== "ENOTDIR")
-				recordPathIdentityFallback(code ?? "unknown", current);
-			const parent = p.dirname(current);
-			if (parent === current) return undefined;
-			tail.push(p.basename(current));
-			current = parent;
-		}
-	}
+	const first = kernelAttempt(spelled, p);
+	if (!first) return undefined;
+	if (!first.foldedTail) return first.answer;
+	return kernelAttempt(first.answer, p)?.answer ?? first.answer;
 }
 
 /** `normalizeFilePath`'s POSIX arm for an absolute, slash-folded spelling. */
@@ -419,6 +536,91 @@ function posixPathIdentity(spelled: string): string {
  */
 export function realpathOrResolve(filePath: string): string {
 	return kernelRealPath(filePath, path) ?? path.resolve(filePath);
+}
+
+/**
+ * `realpathOrResolve` for a caller that already awaits (#4689 batch 10): the
+ * same identity, climbed by the same walk, resolved through
+ * `fs/promises.realpath`. Both that call and `realpathSync.native` are
+ * `uv_fs_realpath`, so the sync and async forms answer one string on every
+ * platform — unlike `realpathSync` (measured, #4689 batch 10: a `link/../f.ts`
+ * spelling comes back as the lexically folded path from `realpathSync` and as
+ * the file the kernel opens from `realpathSync.native` and from the async
+ * call). The input reaches the kernel unfolded, and a missing path is the
+ * nearest existing ancestor's real path plus the missing tail, as the sync
+ * form documents.
+ */
+export async function realpathOrResolveAsync(
+	filePath: string,
+): Promise<string> {
+	return (
+		(await kernelPathIdentityAsync(filePath))?.identity ??
+		path.resolve(filePath)
+	);
+}
+
+/** One walk with the async driver; see `identityCandidates`. */
+async function kernelAttemptAsync(
+	spelled: string,
+): Promise<ConfirmedKernelAttempt | undefined> {
+	let kernelConfirmed = true;
+	for (const { candidate, missing } of identityCandidates(spelled, path)) {
+		try {
+			const real = await realpathNativeAsync(candidate);
+			return {
+				answer: foldMissingTail(real, missing, path),
+				foldedTail: tailHasDotSegment(missing),
+				kernelConfirmed,
+			};
+		} catch (refusal) {
+			recordIdentityRefusal(refusal, candidate);
+			if (!isAbsenceRefusal(refusal)) kernelConfirmed = false;
+			// A dangling link also answers `ENOENT`, but its entry exists and a write
+			// through it lands at the link's target, not under this spelling (#4877).
+			else if (
+				!(await lstatAsync(candidate).then(
+					() => false,
+					(lstatRefusal) => {
+						// none: absence is the ordinary missing tail, and any other `lstat`
+						// refusal already leaves the walk unconfirmed, so it fails closed.
+						return isAbsenceRefusal(lstatRefusal);
+					},
+				))
+			) {
+				// Tallied like the other refused codes so the refusal reaches the
+				// ledger's read-time fold, not only the caller's error.
+				recordPathIdentityFallback("ENOENT-DANGLING", candidate);
+				kernelConfirmed = false;
+			}
+		}
+	}
+	return undefined;
+}
+
+/**
+ * The async identity, with the one fact a containment decision needs.
+ * `kernelConfirmed` is false when the walk climbed over a component the kernel
+ * refused for a reason other than absence — an unreadable ancestor (`EACCES`),
+ * a cyclic link (`ELOOP`) — so `identity` is only the nearest resolvable
+ * ancestor plus the spelling's tail, not a name the kernel ever gave. A queue
+ * key takes that answer anyway (`realpathOrResolveAsync`); a caller that decides
+ * whether a path is inside a workspace refuses it, as this file's `edits.ts`
+ * confiner did before it borrowed this seam (#4689 r2 F-CR2). `undefined` when
+ * no ancestor resolves.
+ */
+export async function kernelPathIdentityAsync(
+	filePath: string,
+): Promise<KernelPathIdentity | undefined> {
+	const first = await kernelAttemptAsync(filePath);
+	if (!first) return undefined;
+	const settled = first.foldedTail
+		? await kernelAttemptAsync(first.answer)
+		: undefined;
+	return {
+		identity: settled?.answer ?? first.answer,
+		kernelConfirmed:
+			first.kernelConfirmed && (settled?.kernelConfirmed ?? true),
+	};
 }
 
 /**
@@ -556,6 +758,38 @@ export function normalizeMapKey(filePath: string): string {
 }
 
 /**
+ * The ONE lexical containment test (#2556, shape 83). Returns `file` relative
+ * to `root`, forward-slashed, when `file` is the root itself (`""`) or inside
+ * it, and `undefined` when it is outside. Callers that need only the verdict
+ * test `!== undefined`; callers that need the relative text (a glob target, a
+ * display path, a cache key) take it from the same call, so the verdict and
+ * the text cannot disagree.
+ *
+ * Outside is decided from the `path.relative` result on three arms, every one
+ * of them required: `..` exactly, a `..` SEGMENT (`..` plus a separator, so a
+ * directory named `..foo` is inside, #4835), and an absolute result (across
+ * Windows drives `path.relative` returns the target's absolute path, which
+ * starts with no `..`, #4878 F1). No filesystem access: both operands are read
+ * as spelled, so a caller on the identity axis normalizes first.
+ *
+ * `pathImpl` picks the dialect (a Windows-shaped path on a POSIX host takes
+ * `path.win32`); production callers pass the host default or the dialect they
+ * classified, and `tests/clients/path-utils.test.ts` runs both on every lane.
+ */
+export function relativeInside(
+	root: string,
+	file: string,
+	pathImpl: typeof path = path,
+): string | undefined {
+	const relative = pathImpl.relative(pathImpl.resolve(root), file);
+	return relative !== ".." &&
+		!relative.startsWith(`..${pathImpl.sep}`) &&
+		!pathImpl.isAbsolute(relative)
+		? relative.replace(/\\/g, "/")
+		: undefined;
+}
+
+/**
  * Human-facing path relative to a project root when the file is inside it.
  *
  * Parses by path SHAPE, not host OS (refs #1150/#1152, shape-2 class #1163):
@@ -575,28 +809,54 @@ export function toProjectRelativePath(
 	filePath: string,
 	projectRoot: string,
 ): string {
+	return relativeToProjectRoot(filePath, projectRoot, () =>
+		normalizeFilePath(projectRoot),
+	);
+}
+
+/**
+ * A `toProjectRelativePath` for one project root, with that root's canonical
+ * form computed at most once per resolver.
+ *
+ * The outside-root retry canonicalizes the root on every call, and a text
+ * renderer answers hundreds of display paths from one root in one call: 500
+ * locations, half outside the root, spent 7.46 ms per render against 5.05 ms
+ * with the root canonicalized once, and 500 outside-root locations 13.44 ms
+ * against 8.54 ms (measured on this repo's macOS host, #1449). The remaining
+ * per-row cost is the file's own canonical retry, which #4101 requires.
+ */
+export function createProjectRelativePathResolver(
+	projectRoot: string,
+): (filePath: string) => string {
+	let canonicalRoot: string | undefined;
+	return (filePath: string): string =>
+		relativeToProjectRoot(
+			filePath,
+			projectRoot,
+			() => (canonicalRoot ??= normalizeFilePath(projectRoot)),
+		);
+}
+
+/** The one relative-path rule both entry points above share. */
+function relativeToProjectRoot(
+	filePath: string,
+	projectRoot: string,
+	canonicalRoot: () => string,
+): string {
 	const p = isWindowsPath(filePath) ? win32 : path;
 	if (!p.isAbsolute(filePath)) return filePath.replace(/\\/g, "/");
-	const inside = (root: string, file: string): string | undefined => {
-		const relative = p.relative(p.resolve(root), file);
-		return relative &&
-			relative !== ".." &&
-			!relative.startsWith(`..${p.sep}`) &&
-			!p.isAbsolute(relative)
-			? relative.replace(/\\/g, "/")
-			: undefined;
-	};
-	const direct = inside(projectRoot, filePath);
-	if (direct !== undefined) return direct;
+	const direct = relativeInside(projectRoot, filePath, p);
+	if (direct) return direct;
 	// #4101: a canonical key (`normalizeMapKey`: realpath on win32, so 8.3 names,
 	// junctions and subst drives are expanded) set against a root the caller
 	// spelled differently. Canonicalize both sides before giving up; a file
 	// that really is outside the root stays outside.
-	const canonical = inside(
-		normalizeFilePath(projectRoot),
+	const canonical = relativeInside(
+		canonicalRoot(),
 		normalizeFilePath(filePath),
+		p,
 	);
-	if (canonical !== undefined) return canonical;
+	if (canonical) return canonical;
 	return filePath.replace(/\\/g, "/");
 }
 
@@ -874,14 +1134,14 @@ export function findNearestMarkerRoot(
 	options: FindNearestMarkerRootOptions = {},
 ): string | null {
 	const boundaries = options.boundaries ?? [];
-	// #4689 item 6: both ends of the climb are path identities, so a directory
-	// reached through a link walks up its target's parents and a home that is
-	// itself a link still stops the walk.
-	const homeDir = realpathOrResolve(options.homeDir ?? os.homedir());
 	const markerPredicate = options.markerPredicate ?? (() => true);
-	let current = realpathOrResolve(startDir);
-	for (let depth = 0; depth < 64; depth++) {
-		if (isAtOrAboveHomeDir(current, homeDir)) return null;
+	// #4689 item 6: both ends of the climb are path identities (`walkUpDirs`),
+	// so a directory reached through a link walks up its target's parents and
+	// a home that is itself a link still stops the walk.
+	for (const current of walkUpDirs(startDir, {
+		homeDir: options.homeDir ?? os.homedir(),
+		maxDepth: 64,
+	})) {
 		if (
 			markers.some(
 				(m) =>
@@ -891,9 +1151,6 @@ export function findNearestMarkerRoot(
 		)
 			return current;
 		if (boundaries.some((m) => existsSync(path.join(current, m)))) return null;
-		const parent = path.dirname(current);
-		if (parent === current) return null;
-		current = parent;
 	}
 	return null;
 }
@@ -914,11 +1171,14 @@ export function findNearestMarkerRootDetailed(
 	options: FindNearestMarkerRootDetailedOptions,
 ): MarkerRootResult {
 	// #4689 item 6: identities at both ends, as in `findNearestMarkerRoot`.
-	const homeDir = realpathOrResolve(options.homeDir ?? os.homedir());
-	let current = realpathOrResolve(startDir);
-	for (let depth = 0; depth < 64; depth++) {
-		if (isAtOrAboveHomeDir(current, homeDir))
-			return { kind: "not-found", reason: "home-ceiling" };
+	let climbed = 0;
+	let last: string | undefined;
+	for (const current of walkUpDirs(startDir, {
+		homeDir: options.homeDir ?? os.homedir(),
+		maxDepth: 64,
+	})) {
+		climbed += 1;
+		last = current;
 		for (const marker of markers) {
 			const markerPath = path.join(current, marker);
 			const checked = options.markerPredicate(markerPath);
@@ -926,11 +1186,14 @@ export function findNearestMarkerRootDetailed(
 				return { kind: "unavailable", markerPath, cause: checked.cause };
 			if (checked.kind === "valid") return { kind: "found", root: current };
 		}
-		const parent = path.dirname(current);
-		if (parent === current) return { kind: "not-found", reason: "root" };
-		current = parent;
 	}
-	return { kind: "not-found", reason: "depth-limit" };
+	// The climb ended without a marker; the last directory it yielded says why.
+	if (last === undefined) return { kind: "not-found", reason: "home-ceiling" };
+	if (path.dirname(last) === last) return { kind: "not-found", reason: "root" };
+	return {
+		kind: "not-found",
+		reason: climbed >= 64 ? "depth-limit" : "home-ceiling",
+	};
 }
 
 /**
@@ -976,11 +1239,7 @@ export function isAtOrAboveHomeDir(
 	homeDir: string = os.homedir(),
 	pathImpl: typeof path = path,
 ): boolean {
-	const rel = pathImpl.relative(
-		pathImpl.resolve(dir),
-		pathImpl.resolve(homeDir),
-	);
-	return !rel.startsWith("..") && !pathImpl.isAbsolute(rel);
+	return relativeInside(dir, pathImpl.resolve(homeDir), pathImpl) !== undefined;
 }
 
 /**
@@ -1043,6 +1302,16 @@ export function isUnderDir(child: string, parent: string): boolean {
 	if (isWithinForm(normalizePathSpelling(child), normalizePathSpelling(parent)))
 		return true;
 	if (process.platform === "win32") return false;
+	return isWithinIdentity(child, parent);
+}
+
+/**
+ * `child` at or under `parent` on the IDENTITY axis only: both operands
+ * through `normalizeFilePath` (realpath, so a link spelling meets its target)
+ * and no spelling disjunct. Read where a lexically-inside path that links out
+ * must stay outside (a chart's template tree, #2556).
+ */
+export function isWithinIdentity(child: string, parent: string): boolean {
 	return isWithinForm(normalizeFilePath(child), normalizeFilePath(parent));
 }
 

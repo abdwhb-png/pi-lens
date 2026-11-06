@@ -61,13 +61,17 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { writeFileAtomicAsync } from "../atomic-write.js";
+import { registerBackgroundWriteDrain } from "../background-write-drains.js";
 import { BoundedLruCache } from "../bounded-cache.js";
+import { findCommandOnPath } from "../command-path.js";
 import { logExtension } from "../extension-log.js";
+import { isToolInstallDisabled } from "../env-utils.js";
 import {
 	isFullyQualified,
 	isUnderDir,
 	realpathOrResolve,
 } from "../path-utils.js";
+import { realIsPidAlive } from "../pid-liveness.js";
 import {
 	assertInstallAllowed,
 	getProjectTrustGeneration,
@@ -101,6 +105,7 @@ import {
 	startGenerationHeartbeat,
 	tryAcquireGeneration,
 } from "../generation-lock.js";
+import { windowsExe } from "../process-snapshot.js";
 import { resolveToolCwd } from "../tool-cwd.js";
 import {
 	allAvailableGlobalBinDirs,
@@ -161,15 +166,6 @@ interface InstallLockHold {
 	heartbeat: GenerationHeartbeat;
 }
 
-function isProcessAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
-}
-
 /**
  * How old a lock may be before it is stale whatever its pid says: longer than
  * any legitimate install (the owner's install bound plus slack). #946 review
@@ -200,7 +196,7 @@ function legacyInstallLockIsStale(maxAgeMs: number): boolean {
 			expired ||
 			(Number.isInteger(owner.pid) &&
 				owner.pid > 0 &&
-				!isProcessAlive(owner.pid))
+				!realIsPidAlive(owner.pid))
 		);
 	} catch {
 		// An unreadable/empty lock has no createdAt to age out: fall back to the
@@ -507,9 +503,11 @@ export interface ArchiveSpec {
 	 * For a tree bundle (no launcher), a path relative to the extract dir that must
 	 * exist after extraction to confirm success, e.g.
 	 * "PowerShellEditorServices/Start-EditorServices.ps1". Used in place of the
-	 * launcher-existence check.
+	 * launcher-existence check. A resolver `(platform) => path` is for a flat
+	 * bundle whose one marker file is spelled per platform (`fallow-lsp` against
+	 * `fallow-lsp.exe`, #4929).
 	 */
-	treeMarker?: string;
+	treeMarker?: string | ((platform: string) => string);
 	/**
 	 * Lowercase-hex sha256 of every archive this spec can resolve, KEYED BY THE
 	 * RESOLVED URL (#3400). An archive install has no `--version` verdict, so the
@@ -895,7 +893,7 @@ export const TOOLS: ToolDefinition[] = [
 		checkCommand: "jscpd",
 		checkArgs: ["--version"],
 		installStrategy: "npm",
-		packageName: "jscpd@5.4.1", // v5.4.1 is the repository's exact devDependency; the v4 packaging defect that required the older v5.0.12 pin is gone, and parseReport() reads the unchanged clone-report fields.
+		packageName: "jscpd@5.4.2", // v5.4.2 is the repository's exact devDependency; the v4 packaging defect that required the older v5.0.12 pin is gone, and parseReport() reads the unchanged clone-report fields.
 		binaryName: "jscpd",
 	},
 	// Structural search and dead code detection
@@ -1655,6 +1653,67 @@ export const TOOLS: ToolDefinition[] = [
 		},
 	},
 	{
+		// fallow-lsp (#4929): the TS/JS dead-code, duplication and cycle analyzer's
+		// LSP server, an OPT-IN language-scoped auxiliary (`--lens-fallow`). One
+		// release archive per target holds four sibling binaries (`fallow`,
+		// `fallow-lsp`, `fallow-mcp`, `fallow-similar-code`) at the archive root
+		// (verified on the 3.37.0 tar.gz and zip listings), so this is a native TREE
+		// BUNDLE like clangd and FallowServer launches `<bundle>/fallow-lsp`. The
+		// version is pinned and every archive is checked against its sha256 before
+		// extraction (a mismatch or an unpinned URL refuses the install). The
+		// release's `SHA256SUMS` lists only the VS Code extension files, so the pins
+		// are the per-asset digests GitHub publishes (`gh api
+		// repos/fallow-rs/fallow/releases/tags/v3.37.0 --jq
+		// '.assets[]|[.name,.digest]|@tsv'`), each re-computed here from the
+		// downloaded bytes. The tree marker is the `fallow-lsp` binary itself
+		// (`fallow-lsp.exe` on Windows). Linux uses the gnu build (needs glibc 2.30);
+		// Windows arm64 has its own build.
+		id: "fallow-lsp",
+		name: "fallow-lsp",
+		checkCommand: "fallow-lsp",
+		checkArgs: ["--version"],
+		installStrategy: "archive",
+		binaryName: "fallow-lsp",
+		archive: {
+			url: (platform, arch) => {
+				const base =
+					"https://github.com/fallow-rs/fallow/releases/download/v3.37.0";
+				if (arch !== "x64" && arch !== "arm64") return undefined;
+				if (platform === "linux")
+					return arch === "arm64"
+						? `${base}/fallow-aarch64-unknown-linux-gnu.tar.gz`
+						: `${base}/fallow-x86_64-unknown-linux-gnu.tar.gz`;
+				if (platform === "darwin")
+					return arch === "arm64"
+						? `${base}/fallow-aarch64-apple-darwin.tar.gz`
+						: `${base}/fallow-x86_64-apple-darwin.tar.gz`;
+				if (platform === "win32")
+					return arch === "arm64"
+						? `${base}/fallow-aarch64-pc-windows-msvc.zip`
+						: `${base}/fallow-x86_64-pc-windows-msvc.zip`;
+				return undefined;
+			},
+			kind: (platform) => (platform === "win32" ? "zip" : "tgz"),
+			stripComponents: 0,
+			treeMarker: (platform) =>
+				platform === "win32" ? "fallow-lsp.exe" : "fallow-lsp",
+			sha256: {
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-aarch64-unknown-linux-gnu.tar.gz":
+					"cbbf98681687fd2f43be852f15aab8ad34fb51cf6f7e354d3bdc1a9b7cba9c5a",
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-x86_64-unknown-linux-gnu.tar.gz":
+					"7c09d9b7812be030951f75ebfdd98a4e23ecaee6260c34d7e7f3a6c28a0c3cf0",
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-aarch64-apple-darwin.tar.gz":
+					"02caed6d3da52ea5ffff84b8619bc399a9302c5c6748633177db64005895a159",
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-x86_64-apple-darwin.tar.gz":
+					"abf1897d6521dbd8fbfb01a4add5070538fdb7cde049090f991780fd3576acc6",
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-aarch64-pc-windows-msvc.zip":
+					"26529ecf3a031c01d13adbdbf831ba627c20cf5e4ff95000a1b6ec1497513c83",
+				"https://github.com/fallow-rs/fallow/releases/download/v3.37.0/fallow-x86_64-pc-windows-msvc.zip":
+					"f20ad53eb2190e9ab04288a58068f568699757744fccf5adca216a5250789134",
+			},
+		},
+	},
+	{
 		id: "tflint",
 		name: "tflint",
 		checkCommand: "tflint",
@@ -2411,6 +2470,28 @@ export async function flushProbeCache(): Promise<ProbeCacheFlushResult> {
 	}
 }
 
+/**
+ * Test-only strict form of {@link flushProbeCache}: a flush that fails or is
+ * deferred behind another process's lock arms a retry timer, and that retry
+ * would write after a fixture root was removed. Settled only on a flush that
+ * left nothing pending; otherwise cancel the retry and report it.
+ */
+async function settleProbeCacheForTests(): Promise<string | undefined> {
+	const result = await flushProbeCache();
+	if (result === "idle" || result === "written") return undefined;
+	if (_probeCacheFlushTimer !== null) {
+		clearTimeout(_probeCacheFlushTimer);
+		_probeCacheFlushTimer = null;
+	}
+	return `probe-cache flush did not land (${result})`;
+}
+
+// #4937: the debounced flush timer above lives in this evaluation of the module;
+// the tier-2 harness's loaded extension copy owns one the test's own import
+// cannot reach, so its write lands after the fixture root is removed. The
+// harness joins it through the registry (`clients/background-write-drains.ts`).
+registerBackgroundWriteDrain(settleProbeCacheForTests);
+
 function isAstGrepVersionOutput(output: string): boolean {
 	return /\bast[- ]grep\b/i.test(output);
 }
@@ -2567,54 +2648,14 @@ export function resetPathWalkMemo(): void {
 
 /**
  * Check if a command is available in PATH by walking PATH entries and
- * verifying each candidate is a real file with non-zero size.
- * Catches broken symlinks (stat throws ENOENT or returns size 0) without
- * spawning a process — ~μs per candidate vs ~50ms for which/where.
+ * verifying each candidate is a real file with non-zero size
+ * (`findCommandOnPath`, shared with the markdownlint API loader, #5119).
  */
 export async function isCommandAvailable(
 	command: string,
 	_args?: string[],
 ): Promise<boolean> {
-	const isWindows = installerPlatform() === "win32";
-	const pathEnv =
-		process.env.PATH || process.env.Path || process.env.path || "";
-	const dirs = pathEnv.split(path.delimiter);
-
-	// On Windows, probe .exe, .cmd, and .bat extensions in addition to bare name.
-	// On Unix, probe bare name and extensionless (scripts, symlinks).
-	const names = isWindows
-		? [command, `${command}.exe`, `${command}.cmd`, `${command}.bat`]
-		: [command];
-
-	for (const dir of dirs) {
-		if (!dir) continue;
-		for (const name of names) {
-			// #4530: joined as text on POSIX, as the kernel joins it, so a
-			// `link/..` entry is read where the spawn would find it; Win32
-			// folds `..` lexically itself.
-			const candidate = isWindows
-				? path.join(dir, name)
-				: `${dir}${path.sep}${name}`;
-			try {
-				const stat = statSync(candidate);
-				// isFile() returns false for broken symlinks (target missing)
-				if (!stat.isFile() || stat.size === 0) continue;
-				// #4530: a candidate that is the session repository's bytes (a
-				// project PATH entry, a relative one, or a global link into the
-				// project) is no answer until pi trusts the project: the installer
-				// would otherwise report a project binary as an installed tool.
-				if (isUntrustedProjectPath(candidate)) {
-					recordProjectCommandRefusal(candidate);
-					continue;
-				}
-				return true;
-			} catch {
-				// ENOENT or permission denied — skip this candidate
-			}
-		}
-	}
-
-	return false;
+	return findCommandOnPath(command, installerPlatform() === "win32") !== null;
 }
 
 /**
@@ -3008,12 +3049,17 @@ export interface ToolStatus {
 }
 
 /**
- * Get detailed status for all tools
+ * Get detailed status for all tools, or for the tool ids named in `toolIds`
+ * (the nightly's per-row provenance reads only the servers it drives, #4512).
  */
-export async function getAllToolStatuses(): Promise<ToolStatus[]> {
+export async function getAllToolStatuses(
+	toolIds?: readonly string[],
+): Promise<ToolStatus[]> {
 	const statuses: ToolStatus[] = [];
 
+	const only = toolIds ? new Set(toolIds) : undefined;
 	for (const tool of TOOLS) {
+		if (only && !only.has(tool.id)) continue;
 		const status: ToolStatus = {
 			id: tool.id,
 			name: tool.name,
@@ -3175,8 +3221,9 @@ async function getArchiveTreeBundlePath(
 		return undefined;
 	}
 	const extractDir = path.join(TOOLS_DIR, tool.id);
-	const marker = tool.archive?.treeMarker
-		? path.join(extractDir, ...tool.archive.treeMarker.split("/"))
+	const treeMarker = tool.archive && resolveTreeMarker(tool.archive);
+	const marker = treeMarker
+		? path.join(extractDir, ...treeMarker.split("/"))
 		: extractDir;
 	try {
 		await fs.access(marker);
@@ -4707,7 +4754,7 @@ export interface ManagedInstallGate {
 export async function acquireManagedInstallGate(
 	context: string,
 ): Promise<ManagedInstallGate> {
-	if (process.env.PI_LENS_DISABLE_TOOL_INSTALL === "1") {
+	if (isToolInstallDisabled()) {
 		return {
 			ok: false,
 			reason: "installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
@@ -5233,6 +5280,16 @@ export function resolveArchiveUrl(
 	return typeof spec.url === "function" ? spec.url(platform, arch) : spec.url;
 }
 
+/** The tree-bundle marker path for a platform, or undefined when the spec declares none. */
+function resolveTreeMarker(
+	spec: ArchiveSpec,
+	platform: string = installerPlatform(),
+): string | undefined {
+	return typeof spec.treeMarker === "function"
+		? spec.treeMarker(platform)
+		: spec.treeMarker;
+}
+
 /** Resolve the archive format independently from the extractor implementation. */
 export function resolveArchiveKind(
 	spec: ArchiveSpec,
@@ -5498,11 +5555,11 @@ async function installArchiveTool(
 		// bare (consistent with every other tool spawn).
 		const extractor =
 			archiveKind === "zip" && isWindows
-				? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`
+				? windowsExe("WindowsPowerShell\\v1.0\\powershell.exe")
 				: archiveKind === "zip"
 					? "unzip"
 					: isWindows
-						? `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\tar.exe`
+						? windowsExe("tar.exe")
 						: "tar";
 		const extractionResult = await safeSpawnAsync(extractor, extractionArgs, {
 			cwd: TOOLS_DIR,
@@ -5557,8 +5614,9 @@ async function installArchiveTool(
 		// consuming server launches a runtime against a bootstrap inside it (e.g.
 		// PSES via pwsh).
 		if (!spec.launcher) {
-			const tmpMarker = spec.treeMarker
-				? path.join(tmpExtractDir, ...spec.treeMarker.split("/"))
+			const treeMarker = resolveTreeMarker(spec, platform);
+			const tmpMarker = treeMarker
+				? path.join(tmpExtractDir, ...treeMarker.split("/"))
 				: tmpExtractDir;
 			try {
 				await fs.access(tmpMarker);
@@ -6457,7 +6515,7 @@ export async function installTool(
 	 */
 	ownsLock?: () => boolean,
 ): Promise<boolean> {
-	if (process.env.PI_LENS_DISABLE_TOOL_INSTALL === "1") {
+	if (isToolInstallDisabled()) {
 		installFailureReasons.set(
 			toolId,
 			"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
@@ -6683,7 +6741,7 @@ async function ensureToolResolved(
 			);
 			return cacheResolvedPath(await getToolPath(toolId));
 		}
-		if (process.env.PI_LENS_DISABLE_TOOL_INSTALL === "1") {
+		if (isToolInstallDisabled()) {
 			installFailureReasons.set(
 				toolId,
 				"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",
@@ -6839,7 +6897,7 @@ async function ensureToolResolved(
 			);
 			return undefined;
 		}
-		if (process.env.PI_LENS_DISABLE_TOOL_INSTALL === "1") {
+		if (isToolInstallDisabled()) {
 			installFailureReasons.set(
 				toolId,
 				"installation disabled by PI_LENS_DISABLE_TOOL_INSTALL=1",

@@ -116,6 +116,8 @@ let deferredApplyEdit = null;
 const HANG_PROJECT_INFO = ["1", "cancel"].includes(
 	process.env.FAKE_LSP_HANG_PROJECT_INFO ?? "",
 );
+const HANG_DEFINITION = process.env.FAKE_LSP_HANG_DEFINITION === "1";
+const HANG_DOCUMENT_SYMBOL = process.env.FAKE_LSP_HANG_DOCUMENT_SYMBOL === "1";
 let hungProjectInfoId = null;
 
 // #2450 review round 2 (F2): the target line/columns/replacement text are
@@ -323,13 +325,51 @@ const STALE_MODULE_LOOKUP = process.env.FAKE_LSP_STALE_MODULE_LOOKUP === "1";
 const STALE_MODULE_EXT = process.env.FAKE_LSP_STALE_MODULE_EXT ?? ".lua";
 const failedModuleLookups = new Set();
 
+// #4532: a server whose module search path comes from a config file at its
+// root, as pyright's `pyrightconfig.json` `extraPaths` does (measured, pyright
+// 1.1.414: a config created after the server answered is read only when a
+// `workspace/didChangeWatchedFiles` event names it; the registered watchers
+// are `**/pyrightconfig.json` and `**`). `FAKE_LSP_CONFIG_FILE=<name>` makes a
+// module that is not beside its importer resolve from `<root>/libs` when the
+// config read at initialize, or at the last watched-files event naming
+// `<root>/<name>`, holds `"extraPaths": ["libs"]`. Such an event drops every
+// remembered failed lookup and re-evaluates every open document. Off by
+// default.
+const CONFIG_FILE = process.env.FAKE_LSP_CONFIG_FILE ?? "";
+let configRoot;
+let configExtraDirs = [];
+
+function readServerConfig() {
+	configExtraDirs = [];
+	if (CONFIG_FILE === "" || configRoot === undefined) return;
+	try {
+		const parsed = JSON.parse(
+			fs.readFileSync(path.join(configRoot, CONFIG_FILE), "utf8"),
+		);
+		for (const extra of parsed.extraPaths ?? [])
+			configExtraDirs.push(path.join(configRoot, extra));
+	} catch {
+		// no config (or unreadable): the module search path stays the importer's dir
+	}
+}
+
+function resolvesFromConfig(target) {
+	return configExtraDirs.some((extra) =>
+		fs.existsSync(path.join(extra, path.basename(target))),
+	);
+}
+
 function publishModuleLookups(uri) {
 	const text = openDocuments.get(uri) ?? "";
 	const dir = path.dirname(fileURLToPath(uri));
 	const diagnostics = [];
 	for (const match of text.matchAll(/import\s+"(\.\.?\/[\w/-]+)"/g)) {
 		const target = path.join(dir, `${match[1]}${STALE_MODULE_EXT}`);
-		if (!failedModuleLookups.has(target) && !fs.existsSync(target)) {
+		if (
+			!failedModuleLookups.has(target) &&
+			!fs.existsSync(target) &&
+			!resolvesFromConfig(target)
+		) {
 			failedModuleLookups.add(target);
 		}
 		if (failedModuleLookups.has(target)) {
@@ -503,6 +543,75 @@ function checkEveryOpenDocument(changedUri) {
 // `dirty` alone). Without a `refreshed` element nothing changes.
 let sequenceRefreshed = false;
 
+// #5131: a recompile-from-disk server (groovy-language-server). It "compiles"
+// one document at a time: `didOpen` and `didChange` publish one error when the
+// text holds `Foo` (an unresolved class), else an empty set, after
+// `FAKE_LSP_RECOMPILE_CLEARS_MS` of compile time for the open. A
+// `workspace/didChangeWatchedFiles` naming an open document recompiles it from
+// the tracker's reset state and publishes an EMPTY set 5 ms after the compile
+// queue drains, whatever the document holds (measured on the real server: the
+// `unable to resolve class Foo` error, then its `[]` 5 ms later, 100 ms after
+// the client's own watched-files notice). Publishes are version-less unless
+// `FAKE_LSP_RECOMPILE_VERSIONED=1` stamps the document version the server last
+// read; `FAKE_LSP_RECOMPILE_NO_WATCHED_CLEAR=1` leaves the notice unanswered;
+// `FAKE_LSP_RECOMPILE_MARK_PUBLISHES=1` follows each publish with a
+// `$/test/publishSent` notification (a `FAKE_LSP_PUBLISH_SEQUENCE` publish too).
+const RECOMPILE_CLEARS_MS = Number(
+	process.env.FAKE_LSP_RECOMPILE_CLEARS_MS ?? "-1",
+);
+const RECOMPILE_VERSIONED = process.env.FAKE_LSP_RECOMPILE_VERSIONED === "1";
+const RECOMPILE_NO_WATCHED_CLEAR =
+	process.env.FAKE_LSP_RECOMPILE_NO_WATCHED_CLEAR === "1";
+const RECOMPILE_MARK_PUBLISHES =
+	process.env.FAKE_LSP_RECOMPILE_MARK_PUBLISHES === "1";
+const recompileVersions = new Map();
+let recompileBusyUntil = 0;
+function recompilePublish(uri, diagnostics, compileMs = 0) {
+	const version = recompileVersions.get(uri);
+	const at = Math.max(Date.now() + compileMs, recompileBusyUntil) + 5;
+	recompileBusyUntil = at;
+	const timer = setTimeout(() => {
+		send({
+			jsonrpc: "2.0",
+			method: "textDocument/publishDiagnostics",
+			params: {
+				uri,
+				diagnostics,
+				...(RECOMPILE_VERSIONED && version !== undefined ? { version } : {}),
+			},
+		});
+		// The client has handled the publish by the time it reads this marker, so
+		// a test joins on it instead of polling.
+		if (RECOMPILE_MARK_PUBLISHES)
+			send({
+				jsonrpc: "2.0",
+				method: "$/test/publishSent",
+				params: { uri, count: diagnostics.length },
+			});
+	}, at - Date.now());
+	timer.unref?.();
+}
+function recompileCompile(uri, text, compileMs) {
+	recompilePublish(
+		uri,
+		text.includes("Foo")
+			? [
+					{
+						severity: 1,
+						source: "fake-recompile",
+						code: "P5131",
+						message: "unable to resolve class Foo",
+						range: {
+							start: { line: 0, character: 0 },
+							end: { line: 0, character: 1 },
+						},
+					},
+				]
+			: [],
+		compileMs,
+	);
+}
+
 function publishSequenceFor(uri) {
 	if (PUBLISH_SEQUENCE.length === 0) return false;
 	const sequence = sequenceRefreshed
@@ -537,6 +646,14 @@ function publishSequenceFor(uri) {
 							: [],
 				},
 			});
+			// #5131 round 2: the join marker a recompile publish carries, so a test
+			// reads each sequence publish's handled state off the wire, not a sleep.
+			if (RECOMPILE_MARK_PUBLISHES)
+				send({
+					jsonrpc: "2.0",
+					method: "$/test/publishSent",
+					params: { uri, count: shape === "dirty" ? 1 : 0 },
+				});
 		};
 		if (index === 0 && PUBLISH_SEQUENCE_FIRST_MS <= 0) {
 			emit();
@@ -757,6 +874,10 @@ function handle(raw) {
 	// timeout kill + 2s SIGKILL-backstop path (#1114).
 	if (data.method === "initialize") {
 		if (process.env.FAKE_LSP_IGNORE_INITIALIZE === "1") return;
+		if (CONFIG_FILE !== "" && typeof data.params?.rootUri === "string") {
+			configRoot = fileURLToPath(data.params.rootUri);
+			readServerConfig();
+		}
 		if (CLOSED_FILE_CACHE && typeof data.params?.rootUri === "string") {
 			checkerRoot = fileURLToPath(data.params.rootUri);
 			walkAmbient(checkerRoot);
@@ -888,6 +1009,9 @@ function handle(raw) {
 						: { hoverProvider: true }),
 					definitionProvider: true,
 					referencesProvider: true,
+					// #5248: a real rename only when asked, so the capability set the
+					// other suites pin does not move.
+					...(process.env.FAKE_LSP_RENAME === "1" ? { renameProvider: true } : {}),
 					...(process.env.FAKE_LSP_NO_DOCUMENT_SYMBOL === "1"
 						? {}
 						: { documentSymbolProvider: true }),
@@ -1067,6 +1191,17 @@ function handle(raw) {
 			data.params?.textDocument?.text ?? "",
 		);
 		publishSequenceFor(data.params?.textDocument?.uri);
+		if (RECOMPILE_CLEARS_MS >= 0) {
+			recompileVersions.set(
+				data.params?.textDocument?.uri,
+				data.params?.textDocument?.version,
+			);
+			recompileCompile(
+				data.params?.textDocument?.uri,
+				data.params?.textDocument?.text ?? "",
+				RECOMPILE_CLEARS_MS,
+			);
+		}
 		if (STALE_MODULE_LOOKUP) publishModuleLookups(data.params?.textDocument?.uri);
 		if (CLOSED_FILE_CACHE)
 			checkEveryOpenDocument(data.params?.textDocument?.uri);
@@ -1124,6 +1259,13 @@ function handle(raw) {
 		if (slowMarker && typeof text === "string" && text.includes(slowMarker))
 			burnCpu(Number(process.env.FAKE_LSP_SLOW_CHANGE_MS ?? "400"));
 		publishSequenceFor(data.params?.textDocument?.uri);
+		if (RECOMPILE_CLEARS_MS >= 0 && typeof text === "string") {
+			recompileVersions.set(
+				data.params?.textDocument?.uri,
+				data.params?.textDocument?.version,
+			);
+			recompileCompile(data.params?.textDocument?.uri, text, 0);
+		}
 		if (STALE_MODULE_LOOKUP) publishModuleLookups(data.params?.textDocument?.uri);
 		if (CLOSED_FILE_CACHE)
 			checkEveryOpenDocument(data.params?.textDocument?.uri);
@@ -1198,6 +1340,14 @@ function handle(raw) {
 		if (STALE_MODULE_LOOKUP) {
 			let created = false;
 			for (const change of data.params?.changes ?? []) {
+				if (
+					CONFIG_FILE !== "" &&
+					path.basename(fileURLToPath(change.uri)) === CONFIG_FILE
+				) {
+					readServerConfig();
+					failedModuleLookups.clear();
+					created = true;
+				}
 				if (change.type !== 1) continue;
 				created = failedModuleLookups.delete(fileURLToPath(change.uri)) || created;
 			}
@@ -1216,6 +1366,10 @@ function handle(raw) {
 				else ambientFiles.add(changed);
 			}
 			checkEveryOpenDocument();
+		}
+		if (RECOMPILE_CLEARS_MS >= 0 && !RECOMPILE_NO_WATCHED_CLEAR) {
+			for (const change of data.params?.changes ?? [])
+				if (openDocuments.has(change.uri)) recompilePublish(change.uri, []);
 		}
 		if (process.env.FAKE_LSP_ECHO_WATCHED_FILES) {
 			send({
@@ -1237,6 +1391,7 @@ function handle(raw) {
 
 	// Document symbol
 	if (data.method === "textDocument/documentSymbol") {
+		if (HANG_DOCUMENT_SYMBOL) return;
 		send({
 			jsonrpc: "2.0",
 			id: data.id,
@@ -1305,6 +1460,7 @@ function handle(raw) {
 	// FAKE_LSP_DEFINITION_DELAY_MS delays the reply so a test can bump the
 	// document version mid-request and exercise the stale-drop path (#276).
 	if (data.method === "textDocument/definition") {
+		if (HANG_DEFINITION) return;
 		const ln = data.params?.position?.line ?? 1;
 		const ch = data.params?.position?.character ?? 6;
 		const reply = () =>
@@ -1434,6 +1590,42 @@ function handle(raw) {
 		);
 		if (delay > 0) setTimeout(reply, delay);
 		else reply();
+		return;
+	}
+
+	// #5248: `FAKE_LSP_RENAME=1`. A real single-identifier rename over the
+	// documents the client opened: every whole-word occurrence of the identifier
+	// at the requested position becomes `newName`, in every open document, so a
+	// rename that spans two files answers a two-file WorkspaceEdit.
+	if (data.method === "textDocument/rename" && process.env.FAKE_LSP_RENAME === "1") {
+		const { uri } = data.params.textDocument;
+		const { line, character } = data.params.position;
+		const lines = (openDocuments.get(uri) ?? "").split("\n");
+		const word = [...(lines[line] ?? "").matchAll(/[A-Za-z_$][\w$]*/g)].find(
+			(m) => m.index <= character && character <= m.index + m[0].length,
+		)?.[0];
+		if (!word) {
+			send({ jsonrpc: "2.0", id: data.id, result: null });
+			return;
+		}
+		const changes = {};
+		for (const [docUri, text] of openDocuments) {
+			const edits = [];
+			text.split("\n").forEach((docLine, docLineIndex) => {
+				for (const m of docLine.matchAll(/[A-Za-z_$][\w$]*/g)) {
+					if (m[0] !== word) continue;
+					edits.push({
+						range: {
+							start: { line: docLineIndex, character: m.index },
+							end: { line: docLineIndex, character: m.index + word.length },
+						},
+						newText: data.params.newName,
+					});
+				}
+			});
+			if (edits.length > 0) changes[docUri] = edits;
+		}
+		send({ jsonrpc: "2.0", id: data.id, result: { changes } });
 		return;
 	}
 

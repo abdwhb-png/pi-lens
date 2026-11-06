@@ -203,6 +203,96 @@ describe("bookkeepLspMutation — direct path and bridge fallback are equivalent
 		);
 	});
 
+	it("name the issuing session in the change-log receipt on both branches (#4943)", () => {
+		// RECURRENCE GUARDED: #4943. An LSP edit issued by an in-process subagent
+		// (`context.sessionId`) was logged under the coordinator's id on both
+		// branches; a context with no session stays under the runtime's own.
+		const directFile = writeFixture(dirDirect, "subagent.ts");
+		const bridgeFile = writeFixture(dirBridge, "subagent.ts");
+		recordLspMutation(
+			{
+				cwd: dirDirect,
+				correlationId: "subagent-direct",
+				tool: "lsp_navigation:executeCommand",
+				source: "lsp-execute-command",
+				runtime: runtimeDirect as never,
+				cacheManager: cacheManagerDirect,
+				readGuard: runtimeDirect.readGuard,
+				emitSummary: false,
+				sessionId: "s-4943-subagent",
+			},
+			{ results: resultsFor(directFile) },
+		);
+		recordLspMutation(
+			{
+				cwd: dirBridge,
+				correlationId: "subagent-bridge",
+				tool: "lsp_navigation:executeCommand",
+				source: "lsp-execute-command",
+				emitSummary: false,
+				sessionId: "s-4943-subagent",
+			},
+			{ results: resultsFor(bridgeFile) },
+		);
+		const sessionsOf = (dir: string) =>
+			readChangesSince(dir, 0).map((change) => [
+				path.basename(change.filePath),
+				change.sessionId,
+			]);
+		expect(sessionsOf(dirDirect)).toEqual([
+			["target.ts", "s-2450-equiv-direct"],
+			["subagent.ts", "s-4943-subagent"],
+		]);
+		expect(sessionsOf(dirBridge)).toEqual([
+			["target.ts", "s-2450-equiv-bridge"],
+			["subagent.ts", "s-4943-subagent"],
+		]);
+	});
+
+	/**
+	 * #5248. Recurrence it prevents: `lsp_navigation` reported `appliedFiles`
+	 * from the files it ASKED to write, so a path the bookkeeping dropped
+	 * (`isRecordable` skipping it; the no-bridge case is pinned in
+	 * lsp-mutation-bridge-unmounted.test.ts) was still dispatched, and a path both branches recorded was dispatched twice.
+	 * `acceptedFiles` collects only what each branch recorded, once.
+	 */
+	it("collect the files each branch recorded, once, and not the ones it dropped (#5248)", () => {
+		const directFile = writeFixture(dirDirect, "collected.ts");
+		const bridgeFile = writeFixture(dirBridge, "collected.ts");
+		// The direct branch's `isRecordable` skips it.
+		const outside = writeFixture(dirDirect, "outside.ts");
+		const direct: string[] = [];
+		const viaBridge: string[] = [];
+		const directContext: LspMutationContext = {
+			cwd: dirDirect,
+			correlationId: "collect-direct",
+			tool: "lsp_navigation:rename",
+			source: "lsp-rename",
+			runtime: runtimeDirect as never,
+			cacheManager: cacheManagerDirect,
+			readGuard: runtimeDirect.readGuard,
+			emitSummary: false,
+			isRecordable: (filePath) => !filePath.endsWith("outside.ts"),
+			acceptedFiles: direct,
+		};
+		const bridgeContext: LspMutationContext = {
+			cwd: dirBridge,
+			correlationId: "collect-bridge",
+			tool: "lsp_navigation:rename",
+			source: "lsp-rename",
+			emitSummary: false,
+			acceptedFiles: viaBridge,
+		};
+		for (const [context, files] of [
+			[directContext, [directFile, outside, directFile]],
+			[bridgeContext, [bridgeFile, bridgeFile]],
+		] as const)
+			for (const filePath of files)
+				recordLspMutation(context, { results: resultsFor(filePath) });
+		expect(direct).toEqual([directFile]);
+		expect(viaBridge).toEqual([bridgeFile]);
+	});
+
 	it("enqueue no deferred autofix/format pass on either branch (F3)", () => {
 		// bookkeepLspMutation's direct path never enqueues a deferred pass for
 		// an LSP-applied edit; before this round the bridge fallback always did

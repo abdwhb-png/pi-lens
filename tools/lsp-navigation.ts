@@ -15,10 +15,21 @@ import {
 	type LspMutationContext,
 } from "../clients/lsp-mutation.js";
 import type { LSPCallHierarchyItem } from "../clients/lsp/client.js";
-import { resolveHostToolPath, uriToPath } from "../clients/path-utils.js";
+import {
+	isLspRequestTimeoutError,
+	type LspRequestTimeoutError,
+} from "../clients/lsp/request-timeout-error.js";
+import {
+	resolveHostToolPath,
+	toPosix,
+	uriToPath,
+} from "../clients/path-utils.js";
 import { escapeRegExp } from "../clients/string-utils.js";
 import { isRecordableProjectPath } from "../clients/file-utils.js";
-import { compactRenderResult } from "./render-compact.js";
+import {
+	compactRenderResult,
+	JSON_CELL_DETAILS_KEY,
+} from "./render-compact.js";
 import {
 	applyWorkspaceEdit,
 	captureRenameExpectedContent,
@@ -37,6 +48,10 @@ import {
 import type { SearchReadLocation } from "../clients/search-read-registration.js";
 import { buildLspNavigationEnvelope } from "./lsp-structured-output.js";
 import {
+	renderLspNavigationText,
+	symbolKindLabel,
+} from "./lsp-navigation-text.js";
+import {
 	applyProbeFindingPolicy,
 	describePrimaryUnavailable,
 	mergeWithheld,
@@ -48,13 +63,13 @@ import {
 	formatCacheAgeLabel,
 } from "../clients/finding-delivery-gate.js";
 import { disabledPrimaries } from "../clients/lsp/session-roots.js";
-import { SYMBOL_KIND_NAMES } from "../clients/lsp-document-symbols.js";
 import {
 	detectPythonTargetVersion,
 	isJediCompileVerdict,
 	PYTHON_DECLARATION_CONCURRENCY,
 } from "../clients/python-environment.js";
 import { mapWithConcurrency } from "../clients/map-with-concurrency.js";
+import { readFilePath } from "./shared.js";
 const VALID_OPERATIONS = [
 	"definition",
 	"typeDefinition",
@@ -409,13 +424,6 @@ type SymbolMatch = {
 	location?: { uri: string; range: Record<string, unknown> };
 	range?: Record<string, unknown>;
 };
-
-function symbolKindLabel(kind: number | undefined): string {
-	// Single source of truth for LSP SymbolKind names (#883 doctrine; the
-	// Sonar-flagged duplicate table lived here). Navigation keeps its own
-	// "symbol" fallback for unknown kinds instead of the lsp-symbol-<n> form.
-	return kind == null ? "symbol" : (SYMBOL_KIND_NAMES[kind] ?? "symbol");
-}
 
 function rangeStart(range: Record<string, unknown> | undefined): {
 	line?: number;
@@ -829,13 +837,23 @@ export function createLspNavigationTool(
 	mutationDeps?: Pick<
 		LspMutationContext,
 		"runtime" | "cacheManager" | "readGuard" | "dbg"
-	>,
+	> & {
+		/**
+		 * #4942: the guard of the session that makes the call. `readGuard` is
+		 * the one captured at activation (the coordinator's), kept for hosts
+		 * with no session lookup; a concurrent secondary's write must not
+		 * credit it.
+		 */
+		readGuardFor?: (
+			sessionId: string | undefined,
+		) => LspMutationContext["readGuard"];
+	},
 ) {
 	return {
 		name: "lsp_navigation" as const,
 		label: "LSP Navigate",
 		description:
-			'Navigate source with language-server operations such as definition, references, hover, and rename. Example: use `{operation: "references", path: "src/app.ts", line: 12}`.',
+			'Navigate source with language-server operations such as definition, references, hover, and rename. Returns Neovim-style TEXT by default (path:line:col locations, symbol trees, diagnostics); pass view:"json" for the structured envelope. Example: use `{operation: "references", path: "src/app.ts", line: 12}`.',
 		promptSnippet: "Navigate definitions and references with LSP",
 		renderResult: compactRenderResult<{
 			operation?: string;
@@ -864,6 +882,10 @@ export function createLspNavigationTool(
 				Type.String({
 					description: "Target file path.",
 				}),
+			),
+			file: Type.Optional(Type.String({ description: "Alias for `path`." })),
+			filePath: Type.Optional(
+				Type.String({ description: "Alias for `path`." }),
 			),
 			line: Type.Optional(
 				Type.Number({
@@ -951,6 +973,13 @@ export function createLspNavigationTool(
 					},
 				),
 			),
+			view: Type.Optional(
+				Type.String({
+					// Plain string, no enum: "json" is the JSON hatch; anything else is text.
+					description:
+						'Output format. "json" returns the structured envelope (machine-readable, byte-identical to the pre-text default); any other value (or omitting view) returns the default Neovim-style TEXT rendering (path:line:col locations, symbol trees, diagnostics).',
+				}),
+			),
 		}),
 		async execute(
 			_toolCallId: string,
@@ -984,7 +1013,7 @@ export function createLspNavigationTool(
 			const workspaceScopeAttribution: LSPWorkspaceScopeAttribution = {};
 
 			const finalize = (
-				payload: {
+				unreported: {
 					content: Array<{ type: "text"; text: string }>;
 					isError?: boolean;
 					details?: Record<string, unknown>;
@@ -994,12 +1023,28 @@ export function createLspNavigationTool(
 					filePath: string;
 					failureKind: string;
 					resultCount: number;
+					result?: unknown;
+					callSiteUri?: string;
 				},
 			): typeof payload & {
-				details: typeof payload.details & {
+				details: typeof unreported.details & {
 					failureKind: string;
 				};
 			} => {
+				// #5248: the files the apply wrote and the mutation bridge accepted,
+				// for `handleToolResult`'s dispatch feed. A failed, skipped or
+				// dry-run call accepted none, so it reports none.
+				const payload =
+					mutationContext?.acceptedFiles &&
+					mutationContext.acceptedFiles.length > 0
+						? {
+								...unreported,
+								details: {
+									...unreported.details,
+									appliedFiles: [...mutationContext.acceptedFiles],
+								},
+							}
+						: unreported;
 				if (
 					payload.isError &&
 					requestedApply &&
@@ -1008,7 +1053,7 @@ export function createLspNavigationTool(
 				) {
 					recordLspMutationOutcome(mutationContext, "failed");
 				}
-				const normalizedFilePath = meta.filePath.replace(/\\/g, "/");
+				const normalizedFilePath = toPosix(meta.filePath);
 				logLatency({
 					type: "phase",
 					phase: "lsp_navigation_result",
@@ -1028,25 +1073,54 @@ export function createLspNavigationTool(
 				});
 
 				const text = payload.content[0]?.text ?? "";
-				const envelope = buildLspNavigationEnvelope({
-					operation: meta.operation,
-					filePath: meta.filePath,
-					failureKind: meta.failureKind,
-					resultCount: meta.resultCount,
-					text,
-					isError: payload.isError,
-					details: payload.details,
-				});
-
+				if (params.view === "json") {
+					const envelope = buildLspNavigationEnvelope({
+						operation: meta.operation,
+						filePath: meta.filePath,
+						failureKind: meta.failureKind,
+						resultCount: meta.resultCount,
+						text,
+						isError: payload.isError,
+						details: payload.details,
+					});
+					return {
+						...payload,
+						content: [
+							{
+								type: "text" as const,
+								// Compact JSON: omit indentation. Saves ~50% on rename / workspace-edits payloads
+								// while keeping the envelope machine-parseable. Tests use JSON.parse so
+								// they are agnostic to whitespace.
+								text: JSON.stringify(envelope),
+							},
+						],
+						details: {
+							...payload.details,
+							failureKind: meta.failureKind,
+							// #5159: a JSON cell keeps block 0 parseable; a stale advisory
+							// rides a trailing block instead of joining the envelope.
+							[JSON_CELL_DETAILS_KEY]: true,
+						},
+					};
+				}
+				// Default text cell: Neovim-style lines rendered from the typed result. A
+				// result the renderer cannot read (an error, a note, the capabilities table)
+				// keeps the payload's own text.
 				return {
 					...payload,
 					content: [
 						{
 							type: "text" as const,
-							// Compact JSON: omit indentation. Saves ~50% on rename / workspace-edits payloads
-							// while keeping the envelope machine-parseable. Tests use JSON.parse so
-							// they are agnostic to whitespace.
-							text: JSON.stringify(envelope),
+							text: renderLspNavigationText({
+								operation: meta.operation,
+								result: meta.result,
+								filePath: meta.filePath,
+								cwd: ctx.cwd || ".",
+								...(meta.callSiteUri === undefined
+									? {}
+									: { callSiteUri: meta.callSiteUri }),
+								text,
+							}),
 						},
 					],
 					details: {
@@ -1075,6 +1149,27 @@ export function createLspNavigationTool(
 					},
 				);
 			}
+
+			// #5041: `path` is canonical; `file` and `filePath` stay accepted, so a
+			// caller written against either spelling reaches the same file. A
+			// conflicting pair, a non-string or a blank value is refused rather than
+			// guessed at.
+			const pathRead = readFilePath(params);
+			if (pathRead.refusal) {
+				return finalize(
+					{
+						content: [{ type: "text" as const, text: pathRead.refusal }],
+						isError: true,
+					},
+					{
+						operation: String(params.operation ?? "lsp"),
+						filePath: "(workspace)",
+						failureKind: "invalid_path",
+						resultCount: 0,
+					},
+				);
+			}
+			if (pathRead.path) params = { ...params, path: pathRead.path };
 
 			const {
 				operation: rawOperation,
@@ -1158,6 +1253,7 @@ export function createLspNavigationTool(
 					cwd,
 					sessionId: ctx.sessionManager?.getSessionId?.(),
 					correlationId: newLspMutationCorrelationId(_toolCallId),
+					acceptedFiles: [],
 					// #4187 R4-1: the call whose `tool_call` licensed the paths it
 					// named; the workspace edit's other files (a rename's importers)
 					// are unlicensed, so they end an authorship instead of advancing it.
@@ -1168,7 +1264,9 @@ export function createLspNavigationTool(
 					session,
 					readGuard: getFlag("no-read-guard", cwd)
 						? undefined
-						: mutationDeps?.readGuard,
+						: (mutationDeps?.readGuardFor?.(
+								ctx.sessionManager?.getSessionId?.(),
+							) ?? mutationDeps?.readGuard),
 					// #2450 review round 2 (F4)/round 3 (F2, F4): the SAME gate
 					// `registerMutationBridge` applies internally in `index.ts`, so
 					// this directly-threaded path and the bridge fallback
@@ -1311,6 +1409,9 @@ export function createLspNavigationTool(
 					const excludeServerIds = configDisabledAuxiliaryLspServerIds((name) =>
 						getFlag(name, ctx.cwd),
 					);
+					// #4532 gap 13: the same forced drift sweep `lsp_diagnostics` runs, so
+					// a held file changed outside pi is re-pushed before this read.
+					await lspService.sweepDocumentDrift({ force: true, full: true });
 					// #1634: the content the diagnostics below answer for is the
 					// content the policy's inline and strict-anchor checks read.
 					const openedContent = await openFileBestEffort(
@@ -1339,6 +1440,11 @@ export function createLspNavigationTool(
 						pythonCompileTarget,
 					);
 					const diagnostics = policy.kept;
+					const diagnosticsTimedOut =
+						lspService.getDiagnosticsHealth(filePath)?.failureKind ===
+						"timeout";
+					const diagnosticsPartialTimeout =
+						lspService.getDiagnosticsHealth(filePath)?.partialTimeout === true;
 					const suppressedLine = dispositionSuppressedLine(policy.suppressed);
 					// #4638 r3 (N2): a row the declaration withheld is named on this route
 					// too, so an empty answer cannot read as "no findings published".
@@ -1366,14 +1472,28 @@ export function createLspNavigationTool(
 						noteMap[diagnosticsMode] ??
 						"Note: workspace diagnostics mode unknown (no active capability snapshot)";
 					const resultCount = diagnostics.length;
+					const unavailableNote = primaryUnavailable
+						? `\nNote: ${primaryUnavailable}`
+						: "";
+					const suppressedNote = suppressedLine
+						? `\nNote: ${suppressedLine}`
+						: "";
+					const withheldNote = withheldLine ? `\nNote: ${withheldLine}` : "";
+					const timedOutNote =
+						diagnosticsTimedOut || diagnosticsPartialTimeout
+							? `\nNote: LSP diagnostics timed out for ${filePath}`
+							: "";
 					return finalize(
 						{
 							content: [
 								{
 									type: "text" as const,
-									text: `${note}\n${JSON.stringify(result)}${primaryUnavailable ? `\nNote: ${primaryUnavailable}` : ""}${suppressedLine ? `\nNote: ${suppressedLine}` : ""}${withheldLine ? `\nNote: ${withheldLine}` : ""}`,
+									text: `${note}\n${JSON.stringify(result)}${timedOutNote}${unavailableNote}${suppressedNote}${withheldNote}`,
 								},
 							],
+							...(diagnosticsTimedOut && resultCount === 0
+								? { isError: true }
+								: {}),
 							details: {
 								operation,
 								resultCount,
@@ -1394,8 +1514,14 @@ export function createLspNavigationTool(
 						{
 							operation,
 							filePath,
-							failureKind: resultCount === 0 ? "empty_result" : "success",
+							failureKind:
+								diagnosticsTimedOut && resultCount === 0
+									? "timeout"
+									: resultCount === 0
+										? "empty_result"
+										: "success",
 							resultCount,
+							result,
 						},
 					);
 				}
@@ -1501,6 +1627,7 @@ export function createLspNavigationTool(
 						failureKind:
 							diagnosticsMode === "push-only" ? "tracked_snapshot" : "success",
 						resultCount: result.length,
+						result,
 					},
 				);
 			}
@@ -1904,56 +2031,76 @@ export function createLspNavigationTool(
 
 			let result: unknown;
 			let usedDocumentSymbolFallback = false;
+			let definitionTimeout: LspRequestTimeoutError | undefined;
 			try {
-				result = await runOperation();
-				const isEmptyInitial =
-					!result || (Array.isArray(result) && result.length === 0);
-				const shouldRetryOnEmpty =
-					isEmptyInitial &&
-					needsFilePath &&
-					[
-						"definition",
-						"typeDefinition",
-						"declaration",
-						"references",
-						"hover",
-						"signatureHelp",
-						"codeAction",
-						"rename",
-						"implementation",
-					].includes(operation);
-				if (shouldRetryOnEmpty) {
-					openedFileContent = await openFileBestEffort(
-						lspService,
-						filePath,
-						true,
-					);
+				try {
 					result = await runOperation();
+					const isEmptyInitial =
+						!result || (Array.isArray(result) && result.length === 0);
+					const shouldRetryOnEmpty =
+						isEmptyInitial &&
+						needsFilePath &&
+						[
+							"definition",
+							"typeDefinition",
+							"declaration",
+							"references",
+							"hover",
+							"signatureHelp",
+							"codeAction",
+							"rename",
+							"implementation",
+						].includes(operation);
+					if (shouldRetryOnEmpty) {
+						openedFileContent = await openFileBestEffort(
+							lspService,
+							filePath,
+							true,
+						);
+						result = await runOperation();
+					}
+				} catch (err) {
+					if (
+						needsFilePath &&
+						operation === "definition" &&
+						isLspRequestTimeoutError(err)
+					) {
+						definitionTimeout = err;
+					} else {
+						throw err;
+					}
 				}
 
 				const stillEmpty =
 					!result || (Array.isArray(result) && result.length === 0);
-				if (stillEmpty && needsFilePath && operation === "definition") {
-					const content = nodeFs.readFileSync(filePath, "utf-8");
-					const token =
-						line && character
-							? tokenAtPosition(content, line, character)
-							: undefined;
-					if (token) {
-						const docSymbols = (await lspService.documentSymbol(
-							filePath,
-						)) as SymbolNode[];
-						const locations = pickLocalSymbolLocation(
-							docSymbols,
-							token,
-							filePath,
-						);
-						if (locations.length > 0) {
-							result = locations;
-							usedDocumentSymbolFallback = true;
+				try {
+					if (stillEmpty && needsFilePath && operation === "definition") {
+						const content = nodeFs.readFileSync(filePath, "utf-8");
+						const token =
+							line && character
+								? tokenAtPosition(content, line, character)
+								: undefined;
+						if (token) {
+							const docSymbols = (await lspService.documentSymbol(
+								filePath,
+							)) as SymbolNode[];
+							const locations = pickLocalSymbolLocation(
+								docSymbols,
+								token,
+								filePath,
+							);
+							if (locations.length > 0) {
+								result = locations;
+								usedDocumentSymbolFallback = true;
+							}
 						}
 					}
+				} catch (err) {
+					throw definitionTimeout ?? err;
 				}
+				if (definitionTimeout && !usedDocumentSymbolFallback)
+					throw definitionTimeout;
+
 				if (
 					mutationContext &&
 					requestedApply &&
@@ -2011,6 +2158,20 @@ export function createLspNavigationTool(
 						{ operation, filePath, failureKind: "bad_input", resultCount: 0 },
 					);
 				}
+				if (isLspRequestTimeoutError(err)) {
+					return finalize(
+						{
+							content: [{ type: "text" as const, text: err.message }],
+							isError: true,
+							details: {
+								method: err.method,
+								timeoutMs: err.timeoutMs,
+								elapsedMs: err.elapsedMs,
+							},
+						},
+						{ operation, filePath, failureKind: "timeout", resultCount: 0 },
+					);
+				}
 				return finalize(
 					{
 						content: [
@@ -2053,8 +2214,9 @@ export function createLspNavigationTool(
 					"\nHint: provide path to scope workspaceSymbol to the active language server/root.";
 			}
 			if (usedDocumentSymbolFallback) {
-				output +=
-					"\nNote: served from documentSymbol fallback due to empty primary result.";
+				output += definitionTimeout
+					? "\nNote: served from documentSymbol fallback; definition timed out."
+					: "\nNote: served from documentSymbol fallback due to empty primary result.";
 			}
 			if (
 				operation === "references" &&
@@ -2109,9 +2271,17 @@ export function createLspNavigationTool(
 					failureKind: isEmpty
 						? "empty_result"
 						: usedDocumentSymbolFallback
-							? "fallback_success"
+							? definitionTimeout
+								? "fallback_after_timeout"
+								: "fallback_success"
 							: "success",
 					resultCount,
+					result,
+					// Outgoing call sites are written in the item the caller asked
+					// about, whose uri the result does not carry.
+					...(isCallHierarchyTraversal && callHierarchyItem
+						? { callSiteUri: callHierarchyItem.uri }
+						: {}),
 				},
 			);
 		},

@@ -18,3 +18,9 @@ export function validateChangelogEntries(options?: {
 	audience: "user" | "internal";
 	entry: string;
 }>;
+
+export const USER_RELEASE_LIMIT: number;
+export function userCountLine(body: string): string;
+export function renderUserChangelog(options?: { rootDir?: string }): string;
+export function writeUserChangelog(options?: { rootDir?: string }): void;
+export function checkUserChangelog(options?: { rootDir?: string }): void;

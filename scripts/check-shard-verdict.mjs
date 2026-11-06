@@ -73,8 +73,8 @@
 
 import fs from "node:fs";
 import { parseArgs as parseNodeArgs } from "node:util";
-import { pathToFileURL } from "node:url";
 import { githubHeaders } from "./lib/github-rest.mjs";
+import { isMainModule } from "./lib/is-main-module.mjs";
 
 /** The steps whose conclusions decide whether a cancelled shard finished its
  * work. `--check-step` is repeatable, so `test` names both its work step and
@@ -156,11 +156,12 @@ export function classifyShardJob(job, checkSteps) {
 		return { outcome: "pass", reason: `${name} succeeded` };
 	}
 	if (conclusion === "skipped") {
-		// The `formal/`-unchanged rule skips the work at STEP level and the job
-		// still concludes `success`; a `skipped` job is therefore its own row
-		// shape. It ran nothing, so the aggregate cannot read it as a violation
-		// (and the aggregate only reaches this branch when its own result was
-		// not `success`, which the row-count check below then refuses).
+		// A `skipped` shard job is its own row shape: since #5082 the
+		// `formal/`-unchanged rule skips the whole job (before, it skipped the
+		// steps and the job concluded `success`). It ran nothing, so the
+		// aggregate cannot read it as a violation (and the aggregate only
+		// reaches this branch when its own result was not `success`, which the
+		// row-count check below then refuses).
 		return { outcome: "pass", reason: `${name} was skipped` };
 	}
 	if (conclusion === "cancelled") {
@@ -550,17 +551,11 @@ export async function main() {
 	process.exitCode = result.code;
 }
 
-// AGENTS.md shape 44: `import.meta.url` against `pathToFileURL(process.argv[1])`,
-// not a filename suffix. A suffix check runs `main()` when ANY wrapper whose
+// AGENTS.md shape 44: `isMainModule(import.meta.url)`, not a filename suffix. A suffix check runs `main()` when ANY wrapper whose
 // name happens to end in `check-shard-verdict.mjs` imports this module, with
 // the wrapper's argv and this module's exit code -- reproduced as a wrapper
-// exiting 2 on the module's own "missing --label" usage line (V5b). The
-// sibling scripts (`check-close-keywords.mjs`, `gen-tla-model-costs.mjs`)
-// already use the portable form.
-if (
-	process.argv[1] &&
-	import.meta.url === pathToFileURL(process.argv[1]).href
-) {
+// exiting 2 on the module's own "missing --label" usage line (V5b).
+if (isMainModule(import.meta.url)) {
 	main().catch((error) => {
 		console.error(
 			`check-shard-verdict failed: ${error instanceof Error ? error.message : String(error)}`,

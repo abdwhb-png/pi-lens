@@ -22,7 +22,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import {
 	BLOCKING_FILE,
 	CLEAN_FILE,
@@ -38,6 +38,7 @@ import {
 	readTarget,
 	step,
 	toolResults,
+	warmGuardedSession,
 	writeTarget,
 } from "./support/pi-session-commit-gate.js";
 import {
@@ -54,6 +55,9 @@ import {
 import { dataDir444 } from "./support/data-dir-4-4-4.js";
 
 const fixture = piSessionFixture();
+
+// The first guarded session's cold cost is paid in a hook (#5061).
+beforeAll(() => warmGuardedSession(fixture.root));
 
 /** A 4.4.4 link-rooted session's data dir, every file that names no absolute path. */
 const ALIAS_SESSION_444 = path.join(
@@ -439,7 +443,9 @@ describe("#4689: a mark silences its finding under any spelling of the session r
 				expect(first?.text ?? "").toContain("STOP");
 				expect(mark?.text ?? "").toContain("marked false-positive");
 				expect(second?.text ?? "").not.toContain("STOP");
-				expect(second?.text ?? "").toContain("clean");
+				// #5258: the session runs --no-lsp, so the unsilenced-STOP check above is
+				// the claim; the line itself says no primary checker ran.
+				expect(second?.text ?? "").toMatch(/⚠ .*unconfirmed/);
 			} finally {
 				await handle.dispose();
 			}
@@ -470,7 +476,7 @@ describe("#4689: a mark silences its finding under any spelling of the session r
 			const last = handle.requests.at(-1) ?? [];
 			const [write] = toolResults(last, "write");
 			expect(write?.text ?? "").not.toContain("STOP");
-			expect(write?.text ?? "").toContain("clean");
+			expect(write?.text ?? "").toMatch(/⚠ .*unconfirmed/);
 		} finally {
 			await handle.dispose();
 		}

@@ -19,6 +19,9 @@
  * policy.
  */
 
+import { FILE_PATH_KEYS } from "../tools/shared.js";
+import { isJsonCell } from "../tools/render-compact.js";
+
 /** The slice of a JSON-Schema object the check reads. */
 export interface ToolInputSchemaLike {
 	properties?: Record<string, unknown>;
@@ -174,6 +177,13 @@ function classifyKey(key: string, declared: readonly string[]): KeyMatches {
 		: { matches: suffix, retargeted };
 }
 
+/** The declared spellings that name the same parameter as `key` (#5041). */
+function spellingsOf(key: string): readonly string[] {
+	return (FILE_PATH_KEYS as readonly string[]).includes(key)
+		? FILE_PATH_KEYS
+		: [key];
+}
+
 /**
  * Compare a call's arguments with the tool's declared schema. `undefined`
  * when every key is declared (the call is untouched). An own-property test,
@@ -190,8 +200,19 @@ export function findIgnoredArguments(
 		.filter((key) => !Object.hasOwn(properties, key))
 		.map((key): IgnoredArgument => {
 			const { matches, retargeted } = classifyKey(key, declared);
-			// Sending any one spelling of the parameter (`path` or `paths`) settles it.
-			const unsent = matches.some((match) => Object.hasOwn(args, match))
+			// Sending any one spelling of the parameter (`path` or `paths`) settles
+			// it, and so does a sibling spelling of the same single-file parameter
+			// (`path`, `file`, `filePath`) when it is DECLARED (an ignored sibling
+			// settles nothing): `{ path, file_path }` names the file
+			// through `path`, so `file_path` is a mistyped extra, never a missing
+			// `filePath` (#5047 F3).
+			const unsent = matches.some((match) =>
+				spellingsOf(match).some(
+					(spelling) =>
+						Object.hasOwn(args, spelling) &&
+						Object.hasOwn(properties, spelling),
+				),
+			)
 				? undefined
 				: matches[0];
 			if (
@@ -253,6 +274,7 @@ export function ignoredArgumentsStructured(report: ArgumentReport): {
 
 interface TextContentResult {
 	content: { type: "text"; text: string }[];
+	details?: unknown;
 }
 
 /** Put the warning line first in a finished result and attach the payload. */
@@ -260,15 +282,27 @@ export function withIgnoredArguments<T extends TextContentResult>(
 	result: T,
 	tool: string,
 	report: ArgumentReport,
-): T & { structuredContent: ReturnType<typeof ignoredArgumentsStructured> } {
+): T & {
+	structuredContent: ReturnType<typeof ignoredArgumentsStructured>;
+} {
 	const line = ignoredArgumentsLine(tool, report);
+	const structuredContent = ignoredArgumentsStructured(report);
 	const [first, ...rest] = result.content;
+	if (isJsonCell(result)) {
+		return {
+			...result,
+			content: first
+				? [first, { type: "text" as const, text: line }, ...rest]
+				: [{ type: "text" as const, text: line }],
+			structuredContent,
+		};
+	}
 	return {
 		...result,
 		content: first
 			? [{ ...first, text: `${line}\n\n${first.text}` }, ...rest]
 			: [{ type: "text" as const, text: line }],
-		structuredContent: ignoredArgumentsStructured(report),
+		structuredContent,
 	};
 }
 

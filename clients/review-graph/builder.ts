@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Worker } from "node:worker_threads";
 import { constants as zlibConstants, gunzipSync, gzipSync } from "node:zlib";
@@ -32,12 +33,14 @@ import {
 	getOpenDocumentSymbols,
 	lspSymbolKindName,
 } from "../lsp-document-symbols.js";
+import { isLspRequestTimeoutError } from "../lsp/request-timeout-error.js";
 import type { LSPSymbol } from "../lsp/client.js";
 import {
 	isAtOrAboveHomeDir,
 	isUnderDir,
 	normalizeFilePath,
 	normalizeMapKey,
+	realpathOrResolve,
 	toProjectRelativePath,
 } from "../path-utils.js";
 import { collectProjectSourceFilesWithBudgetAsync } from "../project-scan-policy.js";
@@ -91,11 +94,12 @@ import {
 	type ReviewGraphRevisionDrift,
 } from "./revision-drift.js";
 import { buildSymbolId } from "./symbol-id.js";
-import type {
-	ReviewGraph,
-	ReviewGraphEdge,
-	ReviewGraphNode,
-	ReviewGraphPersistCoverage,
+import {
+	UNRESOLVED_NAME_NODE_PREFIX,
+	type ReviewGraph,
+	type ReviewGraphEdge,
+	type ReviewGraphNode,
+	type ReviewGraphPersistCoverage,
 } from "./types.js";
 import type { SymbolKind, SymbolRef } from "../symbol-types.js";
 import type { ReviewGraphPersistWorkerRequest } from "./persist-worker.js";
@@ -4134,7 +4138,7 @@ function addJsTsFile(
 			if (memberCallTexts.has(callee)) continue;
 			const targetId = callee.includes(".")
 				? `external:${callee}`
-				: `symbol-name:${callee}`;
+				: `${UNRESOLVED_NAME_NODE_PREFIX}${callee}`;
 			if (!graph.nodes.has(targetId)) {
 				addNode(graph, {
 					id: targetId,
@@ -4441,7 +4445,7 @@ function addTreeSitterFile(
 
 	for (const ref of extracted.refs) {
 		const refName = ref.symbolName ?? ref.symbolId;
-		const targetId = `symbol-name:${refName}`;
+		const targetId = `${UNRESOLVED_NAME_NODE_PREFIX}${refName}`;
 		if (!graph.nodes.has(targetId)) {
 			addNode(graph, {
 				id: targetId,
@@ -4844,18 +4848,36 @@ async function addFileToGraph(
 	// symbols whenever a scan preceded the build. For genuinely empty files
 	// the fallback is a no-op unless the file is open in a warm client.
 	if (extracted.symbols.length === 0) {
-		const lspSymbols = await getOpenDocumentSymbols(file);
+		let lspSymbols;
+		let lspSymbolTimedOut = false;
+		let lspSymbolError: string | undefined;
+		try {
+			lspSymbols = await getOpenDocumentSymbols(file);
+		} catch (err) {
+			// none: the lsp_symbol_fallback record below persists every caught outcome.
+			if (isLspRequestTimeoutError(err)) lspSymbolTimedOut = true;
+			else
+				lspSymbolError = String(err instanceof Error ? err.message : err).slice(
+					0,
+					512,
+				);
+		}
 		const added = lspSymbols
 			? addLspFallbackSymbols(graph, file, languageId, lspSymbols)
 			: 0;
 		logReviewGraph({
 			phase: "lsp_symbol_fallback",
 			cwd,
-			reason: lspSymbols
-				? added > 0
-					? "added"
-					: "empty-response"
-				: "unavailable-or-failed",
+			reason: lspSymbolTimedOut
+				? "timeout"
+				: lspSymbols
+					? added > 0
+						? "added"
+						: "empty-response"
+					: lspSymbolError !== undefined
+						? "failed"
+						: "unavailable",
+			...(lspSymbolError !== undefined && { error: lspSymbolError }),
 			nodes: added,
 		});
 	}
@@ -5711,8 +5733,9 @@ async function _doBuildGraph(
 	// already IS the project root, so there is no safe substitute root to fall
 	// back to here — skip graph construction entirely (matching #622's own
 	// stated expected behavior) rather than walking a directory the caller never
-	// asked for.
-	if (isAtOrAboveHomeDir(path.resolve(cwd))) {
+	// asked for. Both sides are real paths (#4911): `normalizedCwd` is the
+	// cwd's path identity, so a cwd or a HOME spelled through a link is refused.
+	if (isAtOrAboveHomeDir(normalizedCwd, realpathOrResolve(os.homedir()))) {
 		const graph = createEmptyGraph();
 		for (const file of normalizedChanged) {
 			upsertChangedSymbols(graph, facts, file);
@@ -6488,8 +6511,8 @@ export function extractSymbolsAndRefsFromGraph(graph: ReviewGraph): {
 		const targetSymbol = nodeSymbols.get(edge.to);
 		const targetName =
 			targetNode?.symbolName ??
-			(edge.to.startsWith("symbol-name:")
-				? edge.to.slice("symbol-name:".length)
+			(edge.to.startsWith(UNRESOLVED_NAME_NODE_PREFIX)
+				? edge.to.slice(UNRESOLVED_NAME_NODE_PREFIX.length)
 				: undefined);
 		const line =
 			typeof metadata.line === "number"

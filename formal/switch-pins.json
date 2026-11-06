@@ -1007,7 +1007,7 @@
 				},
 				"Resend": {
 					"value": "TRUE",
-					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"test": "tests/clients/head-move-resync-4507.test.ts",
 					"title": "checks a dependent against its rewritten dependency when the primary re-checks dependents only after the drain reply (push diagnostics)",
 					"narrowedBy": {
 						"FALSE": {
@@ -1243,17 +1243,17 @@
 				},
 				"WritesPrimaryFirst": {
 					"value": "TRUE",
-					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"test": "tests/clients/head-move-resync-4507.test.ts",
 					"title": "checks a dependent the command rewrote against its rewritten dependency"
 				},
 				"DispatchWaitsPhase": {
 					"value": "TRUE",
-					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"test": "tests/clients/head-move-resync-4507.test.ts",
 					"title": "checks a dependent against its rewritten dependency when the primary phase outlasts the read-only bound (%s diagnostics)"
 				},
 				"RequireOrderedDrain": {
 					"value": "TRUE",
-					"test": "tests/clients/head-move-resync-4493.test.ts",
+					"test": "tests/clients/head-move-resync-4507.test.ts",
 					"title": "records undrained when %s replies overtake queued changes"
 				},
 				"ContentGate": {
@@ -1789,6 +1789,39 @@
 					"test": "tests/index-4554-last-member-teardown.test.ts",
 					"title": "keeps the LSP fleet at a full start while another session in the process is live"
 				},
+				"UnbindAtLeave": {
+					"value": "TRUE",
+					"test": "tests/index-4554-last-member-teardown.test.ts",
+					"title": "unbinds a sibling that leaves before the primary at its own leave",
+					"also": [
+						{
+							"test": "tests/index-4554-last-member-teardown.test.ts",
+							"title": "unbinds a primary that leaves before its sibling at its own leave"
+						}
+					]
+				},
+				"DisposalUnbinds": {
+					"value": "TRUE",
+					"test": "tests/index-4704-sibling-teardown.test.ts",
+					"title": "ends the scope of each subagent pi disposed without a shutdown at the next session start",
+					"also": [
+						{
+							"test": "tests/index-4554-last-member-teardown.test.ts",
+							"title": "unbinds a member pi disposed beside a live sibling at the next start"
+						}
+					]
+				},
+				"SweepAtStart": {
+					"value": "TRUE",
+					"test": "tests/index-4704-sibling-teardown.test.ts",
+					"title": "ends the scope of each subagent pi disposed without a shutdown at the next session start",
+					"also": [
+						{
+							"test": "tests/index-4554-last-member-teardown.test.ts",
+							"title": "unbinds a member pi disposed beside a live sibling at the next start"
+						}
+					]
+				},
 				"PrimaryClaims": {
 					"value": "TRUE",
 					"test": "tests/index-4751-newsession-turn-end-scope.test.ts",
@@ -2078,6 +2111,48 @@
 					"constants": [
 						"SizeKey",
 						"BindingAt"
+					]
+				}
+			]
+		},
+		"test-runner-delivery": {
+			"pins": {
+				"StageEligible": {
+					"value": "\"idle\"",
+					"test": "tests/clients/test-runner-delivery.test.ts",
+					"title": "delivers a failure that finishes after agent_settled at the next prompt (#5259)",
+					"also": [
+						{
+							"test": "tests/clients/test-runner-delivery.test.ts",
+							"title": "delivers a newer failure that finishes between agent_settled and the next prompt instead of the older one (#5259)"
+						},
+						{
+							"test": "tests/clients/test-runner-delivery.test.ts",
+							"title": "delivers a staged failure at the next prompt when a newer run has launched but not published (#5259)"
+						}
+					]
+				},
+				"Identity": {
+					"value": "\"content\"",
+					"test": "tests/clients/test-runner-delivery.test.ts",
+					"title": "delivers a staged failure at the next prompt when a newer run has launched but not published (#5259)",
+					"also": [
+						{
+							"test": "tests/clients/test-runner-delivery.test.ts",
+							"title": "rehydrates an eligible failure across a run that launched but has not published (#5259)"
+						},
+						{
+							"test": "tests/clients/test-runner-delivery.test.ts",
+							"title": "drops an eligible result if a newer generation wins before context build"
+						}
+					]
+				}
+			},
+			"notCodeChoice": [
+				{
+					"reason": "Scenario bound: it caps the launches TLC explores; no code branch reads it.",
+					"constants": [
+						"MaxGen"
 					]
 				}
 			]

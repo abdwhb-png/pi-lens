@@ -49,12 +49,16 @@ import {
 	normalizeEphemeralMapKey,
 	normalizeMapKey,
 	pathsEqual,
+	isAbsoluteFilePath,
 	realpathOrResolve,
+	relativeInside,
 	toPosix,
+	toProjectRelativePath,
 } from "./path-utils.js";
 import { findNearestDirWithAnyBasename } from "./workspace-topology.js";
 import { isMeasuredDuration, toMeasuredDurationMs } from "./run-duration.js";
 import { safeSpawn, safeSpawnAsync } from "./safe-spawn.js";
+import { scannerReportParentDir } from "./scanner-temp-root.js";
 import { stripAnsi } from "./sanitize.js";
 import { resolveGitCheckout } from "./review-graph/git-identity.js";
 import { resolveToolCwd } from "./tool-cwd.js";
@@ -125,14 +129,29 @@ export interface TestResult {
  *
  * Two call sites intentionally test the COMPLEMENT (a truly clean result,
  * no counted failure AND no error) rather than this predicate, and are not
- * a missed fourth spelling: `runtime-turn.ts`'s `cleanFiles` filter
- * (`--lens-guard`'s clear-blocker list) and `testResultToProjectDiagnostics`'s
- * own early "nothing to report" return. Both need "genuinely clean", which
+ * a missed fourth spelling: `testResultToProjectDiagnostics`'s own early
+ * "nothing to report" return needs "genuinely clean", which
  * `!isRunnerErrorResult(result)` cannot express (it is also true for a
- * counted failure).
+ * counted failure). `runtime-turn.ts`'s clear-blocker lists use
+ * `isCompletedPassResult` below (#5257).
  */
 export function isRunnerErrorResult(result: TestResult): boolean {
 	return result.failed === 0 && !!result.error;
+}
+
+/**
+ * #5257: the ONE predicate for "this run is evidence that the target PASSED":
+ * it ran (`!notRun`), the runner reported no error, counted no failure, and
+ * counted at least one passing test. A zero-test run (an empty file, a
+ * skipped-only file, a suite the runner could not load) proves nothing about
+ * the code, so it neither reads as "all tests passed" nor clears a
+ * `--lens-guard` test-failure blocker. The complement of `isRunnerErrorResult`
+ * is NOT this: it is also true for a zero-test run and for a counted failure.
+ */
+export function isCompletedPassResult(result: TestResult): boolean {
+	return (
+		!result.error && !result.notRun && result.failed === 0 && result.passed > 0
+	);
 }
 
 export interface TestFailure {
@@ -196,6 +215,15 @@ export interface RunnerConfig {
 	binName?: string;
 	args: (testFile: string, cwd: string) => string[];
 	parseJson: boolean;
+	/**
+	 * #5257: the JSON report is written to a file, not stdout. vitest 5 prints
+	 * only `JSON report written to <path>` for `--reporter=json` (the report
+	 * lands in `<root>/.vitest/json/output.json`), so the runner is asked for
+	 * `--outputFile=<scratch path>` and the file is parsed. A run that leaves no
+	 * file is an unreadable report (an error result): vitest 3 and 5 both print
+	 * only the notice on stdout when `--outputFile` is passed (#5270).
+	 */
+	reportToFile?: boolean;
 }
 
 // Discovery table; exported so the #2928 parity test enumerates its conventions.
@@ -427,19 +455,14 @@ export function isExcludedTestTarget(
 	cwd: string,
 ): boolean {
 	const absolute = path.resolve(cwd, toPosix(testFilePath));
-	let rel = toPosix(path.relative(cwd, absolute));
+	let rel = relativeInside(cwd, absolute);
 	// #2522 review round 2, F6: a target that resolves OUTSIDE the project root
 	// yields a `..`-leading relative path (or, across Windows drives, a still
 	// absolute one), which matches none of the globs — so the bare `some()`
 	// below reported it as "not excluded" and turn_end would have auto-spawned a
 	// runner against a file outside the project the turn is running in. An
 	// out-of-tree target, and the project root itself, fail CLOSED.
-	if (
-		rel === "" ||
-		rel === ".." ||
-		rel.startsWith("../") ||
-		path.isAbsolute(rel)
-	) {
+	if (!rel) {
 		// Different aliases can spell an in-tree target as lexically outside cwd.
 		const realTarget = canonicalFailedPath(absolute);
 		const realCwd = canonicalFailedPath(cwd);
@@ -498,6 +521,7 @@ export const RUNNERS: Record<string, RunnerConfig> = {
 			"--passWithNoTests",
 		],
 		parseJson: true,
+		reportToFile: true,
 	},
 	jest: {
 		kinds: ["jsts"],
@@ -776,6 +800,8 @@ interface PytestSummary {
 	passed: number;
 	failed: number;
 	skipped: number;
+	/** #5270: collection and fixture `N error(s)` term. */
+	errors: number;
 	duration?: number;
 }
 
@@ -800,7 +826,8 @@ function parsePytestSummary(output: string): PytestSummary {
 	let passed = 0;
 	let failed = 0;
 	let skipped = 0;
-	if (!summaryLine) return { passed, failed, skipped };
+	let errors = 0;
+	if (!summaryLine) return { passed, failed, skipped, errors };
 
 	const summaryBody = summaryLine.replace(/^=+\s*|\s*=+\s*$/g, "");
 	for (const field of summaryBody.split(",")) {
@@ -817,6 +844,10 @@ function parsePytestSummary(output: string): PytestSummary {
 			case "skipped":
 				skipped = count;
 				break;
+			case "error":
+			case "errors":
+				errors = count;
+				break;
 		}
 	}
 
@@ -826,7 +857,7 @@ function parsePytestSummary(output: string): PytestSummary {
 	const duration = durationMatch
 		? toMeasuredDurationMs(Number.parseFloat(durationMatch[1]) * 1000)
 		: undefined;
-	return { passed, failed, skipped, duration };
+	return { passed, failed, skipped, errors, duration };
 }
 
 export class TestRunnerClient {
@@ -1269,16 +1300,11 @@ export class TestRunnerClient {
 		cwd: string,
 	): string | null {
 		const dir = path.dirname(sourceFilePath);
-		const relDir = path.relative(cwd, path.resolve(cwd, dir));
-		if (
-			!relDir ||
-			relDir === "." ||
-			relDir.startsWith("..") ||
-			path.isAbsolute(relDir)
-		) {
-			return null;
-		}
-		return relDir;
+		// The shared project-relative display path: relative when `dir` is
+		// strictly inside `cwd`, otherwise the absolute spelling (the root itself
+		// and an outside directory both land there).
+		const relDir = toProjectRelativePath(path.resolve(cwd, dir), cwd);
+		return isAbsoluteFilePath(relDir) ? null : relDir;
 	}
 
 	/**
@@ -1429,9 +1455,9 @@ export class TestRunnerClient {
 		if (runner === "vitest") {
 			const globs = this.parseVitestTestGlobs(cwd);
 			if (globs) {
-				const rel = path
-					.relative(cwd, path.resolve(cwd, sourceFilePath))
-					.replace(/\\/g, "/");
+				const rel = toPosix(
+					path.relative(cwd, path.resolve(cwd, sourceFilePath)),
+				);
 				const matches = (
 					globs_: string[] | undefined,
 					filter?: (g: string) => boolean,
@@ -1786,12 +1812,15 @@ export class TestRunnerClient {
 			);
 		}
 
+		// #5257: the per-run scratch directory a file-reporting runner writes its
+		// JSON report into; removed in the `finally` below on every exit path.
+		let reportDir: string | undefined;
 		try {
 			const spawnCwd = resolveToolCwd("runner", runner, absoluteTestFile, {
 				cwd: path.resolve(cwd),
 				rootMarkers: config.spawnCwdMarkers ?? config.configFiles,
 			}).cwd;
-			const { command, args, env, ownInstall } = await this.resolveExec(
+			const resolved = await this.resolveExec(
 				runner,
 				config,
 				absoluteTestFile,
@@ -1799,12 +1828,27 @@ export class TestRunnerClient {
 				spawnCwd,
 				requireOwnInstall,
 			);
+			const { command, env, ownInstall } = resolved;
 			if (requireOwnInstall && !ownInstall) {
 				return {
 					...this.emptyResult(absoluteTestFile, "", runner),
 					notRun: "no-runner-install",
 				};
 			}
+			// #5257: never the project tree (vitest 5's default report path) and
+			// never a fixed name: one directory per run, under the scanner scratch
+			// root that harnesses sweep.
+			let reportPath: string | undefined;
+			if (config.reportToFile) {
+				reportDir = fs.mkdtempSync(
+					path.join(scannerReportParentDir(), "pi-lens-testreport-"),
+				);
+				reportPath = path.join(reportDir, "report.json");
+			}
+			const args =
+				reportPath === undefined
+					? resolved.args
+					: [...resolved.args, `--outputFile=${reportPath}`];
 			this.log(
 				`Running (async): ${command} ${args.join(" ")} (cwd ${spawnCwd})`,
 			);
@@ -1825,6 +1869,18 @@ export class TestRunnerClient {
 
 			const stdout = result.stdout || "";
 			const stderr = result.stderr || "";
+			// #5257: the report file when the runner is asked for one
+			// (`reportToFile`). Stdout is no fallback for it: with `--outputFile`
+			// vitest 3.2.4 and 5.0.5 both print only `JSON report written to <path>`
+			// (probed #5270), so an absent or empty file is an unreadable report
+			// and the parser returns an error result.
+			// A file that exists but cannot be read throws into this run's catch,
+			// which returns an error result (never a clean one).
+			const reportText =
+				reportPath !== undefined && fs.existsSync(reportPath)
+					? fs.readFileSync(reportPath, "utf-8")
+					: "";
+			const jsonOutput = reportPath === undefined ? stdout : reportText;
 
 			if (result.error) {
 				this.log(`Runner error: ${result.error.message}`);
@@ -1840,7 +1896,7 @@ export class TestRunnerClient {
 			switch (runner) {
 				case "vitest":
 					parsed = this.parseVitestOutput(
-						stdout,
+						jsonOutput,
 						stderr,
 						absoluteTestFile,
 						displayRoot ?? cwd,
@@ -1917,6 +1973,10 @@ export class TestRunnerClient {
 		} catch (err: any) {
 			this.log(`Run error: ${err.message}`);
 			return this.emptyResult(absoluteTestFile, "", runner, err.message);
+		} finally {
+			if (reportDir !== undefined) {
+				fs.rmSync(reportDir, { recursive: true, force: true });
+			}
 		}
 	}
 
@@ -2163,6 +2223,7 @@ export class TestRunnerClient {
 		interface JsonResult {
 			numPassedTests: number;
 			numFailedTests: number;
+			success?: boolean;
 			// #1452: neither reporter emits `numSkippedTests`. Measured against
 			// vitest 4.1.10 and jest 30.4.2: a `test.skip` lands in
 			// `numPendingTests`, and `test.todo` in `numTodoTests`. Kept in the
@@ -2192,6 +2253,17 @@ export class TestRunnerClient {
 
 		try {
 			const json: JsonResult = JSON.parse(stdout);
+			// #5257: admit only a report that carries the reporter's two counts.
+			// `{}`, `null`, a bare string or an array parse as JSON and used to read
+			// as an empty clean run.
+			if (
+				json === null ||
+				typeof json !== "object" ||
+				!Number.isFinite(json.numPassedTests) ||
+				!Number.isFinite(json.numFailedTests)
+			) {
+				throw new Error("not a test report");
+			}
 			const failures: TestFailure[] = [];
 
 			for (const suite of json.testResults || []) {
@@ -2212,10 +2284,23 @@ export class TestRunnerClient {
 				}
 			}
 
+			// #5257: the run reported itself unsuccessful with no failed test to
+			// name: a suite that could not load (an import error), or an unhandled
+			// error. Counted zero and error-free that read as a clean run.
+			const unsuccessful = json.success === false && json.numFailedTests === 0;
+			const unloadable = unsuccessful
+				? (json.testResults ?? []).find((suite) => suite.status === "failed")
+				: undefined;
+			const [loadMessage = ""] = (
+				unloadable?.message ?? "the runner reported success: false"
+			).split("\n", 1);
+			const loadError = `Test run failed without a failed test: ${loadMessage.slice(0, 300)}`;
+
 			return {
 				file: testFile,
 				sourceFile: "",
 				runner,
+				...(unsuccessful ? { error: loadError } : {}),
 				passed: json.numPassedTests || 0,
 				failed: json.numFailedTests || 0,
 				// #1452: `numSkippedTests` is absent from both reporters' JSON, so
@@ -2235,12 +2320,17 @@ export class TestRunnerClient {
 			};
 		} catch (err) {
 			void err;
+			// #5257: shape 10. Output the parser cannot read is an ERROR result
+			// whatever the stdout says; with no `FAIL` in it the old branch returned
+			// an error-free zero, which `handleTurnEnd` read as "all tests passed".
 			const failed = stdout.includes("FAIL") || stderr.includes("FAIL");
 			return this.emptyResult(
 				testFile,
 				"",
 				runner,
-				failed ? "Tests failed (could not parse output)" : undefined,
+				failed
+					? "Tests failed (could not parse output)"
+					: `Could not read ${runner} test output (no report)`,
 			);
 		}
 	}
@@ -2384,7 +2474,8 @@ export class TestRunnerClient {
 
 		// #1479: `duration` stays undefined unless pytest emits its own `in N.NNs`
 		// summary. A measured `in 0.00s` remains a real zero.
-		const { passed, failed, skipped, duration } = parsePytestSummary(output);
+		const { passed, failed, skipped, errors, duration } =
+			parsePytestSummary(output);
 
 		// Parse individual failures: "FAILED tests/test_foo.py::test_something - AssertionError: ..."
 		const failureRegex = /FAILED\s+(\S+::\S+)\s*-\s*(.+?)(?:\n|$)/g;
@@ -2430,7 +2521,27 @@ export class TestRunnerClient {
 					? "Pytest configuration error"
 					: exitCode === 2
 						? "Pytest interrupted"
-						: undefined,
+						: // #5270: the `N error(s)` term is a collection or fixture error:
+							// that test never ran, so `1 passed, 1 error` is no pass.
+							errors > 0
+							? `Pytest reported ${errors} error${errors === 1 ? "" : "s"} (collection or fixture)`
+							: // #5257: any other non-zero exit with no counted pass or failure
+								// is a run whose summary was not read (exit 3 internal error,
+								// exit 1 with an unrecognised summary), never a clean zero. A
+								// summary that counted passes and no failure is the run's own
+								// threshold (`--cov-fail-under` exits 1): a pass, not a runner
+								// error (#5276 r1). Exit 5 is pytest's own "no tests
+								// collected", a zero-test run `isCompletedPassResult` already
+								// refuses to count as a pass.
+								exitCode !== 0 && exitCode !== 5 && passed === 0 && failed === 0
+								? `Pytest exited with ${exitCode} (no summary read)`
+								: // #5270 acceptance 2 (#5276 r2): exit 3 is an internal error or
+									// `pytest.exit(returncode=3)`. The run stopped early, so the
+									// summary it still prints (`1 passed`) is partial, whatever it
+									// counts. Exit 1 with passes stays the threshold case above.
+									exitCode === 3
+									? "Pytest internal error (exit 3)"
+									: undefined,
 		};
 	}
 

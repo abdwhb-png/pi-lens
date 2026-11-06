@@ -325,7 +325,6 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lsp/index.ts": 13,
 		"clients/lsp/server.ts": 3,
 		"clients/mcp/session.ts": 4,
-		"clients/metrics-client.ts": 7,
 		"clients/observed-mutation.ts": 7,
 		// 12 -> 11 (#2050): the prescan's `let baseline` local moved into
 		// `captureOpaqueBaseline`'s returned `state`, so one identifier use is
@@ -385,10 +384,8 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/ast-grep-client.ts": 47,
 		"clients/ast-grep-rule-manager.ts": 4,
 		"clients/biome-client.ts": 8,
-		"clients/bounded-pid-file-lock.ts": 9,
+		"clients/bounded-pid-file-lock.ts": 7,
 		"clients/bundled-resource-health.ts": 2,
-		"clients/bus-events-logger.ts": 1,
-		"clients/bus-publish.ts": 1,
 		"clients/cascade-logger.ts": 1,
 		"clients/child-unref.ts": 5,
 		"clients/config-core/normalize.ts": 2,
@@ -399,18 +396,15 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dead-code-client.ts": 4,
 		"clients/degradation-ledger.ts": 10,
 		"clients/dependency-checker.ts": 4,
-		"clients/diagnostics-publish.ts": 1,
 		"clients/dispatch/dispatcher.ts": 7,
 		"clients/dispatch/integration.ts": 2,
 		"clients/dispatch/pending-runner-findings.ts": 2,
 		"clients/dispatch/runners/biome-check.ts": 4,
 		"clients/dispatch/runners/cpp-check.ts": 1,
 		"clients/dispatch/runners/cue-vet.ts": 9,
-		"clients/dispatch/runners/gleam-check.ts": 1,
 		"clients/dispatch/runners/helm-lint.ts": 2,
 		"clients/dispatch/runners/helm-render.ts": 7,
 		"clients/dispatch/runners/oxlint.ts": 3,
-		"clients/dispatch/runners/prisma-validate.ts": 1,
 		"clients/dispatch/runners/psscriptanalyzer.ts": 3,
 		"clients/dispatch/runners/rust-clippy.ts": 1,
 		"clients/dispatch/runners/pyright.ts": 1,
@@ -427,18 +421,15 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/runners/utils/spawn-outcome.ts": 2,
 		"clients/dispatch/runners/vale.ts": 1,
 		"clients/dispatch/runners/zig-check.ts": 1,
-		"clients/disposition-publish.ts": 1,
 		"clients/durable-store.ts": 3,
 		"clients/effective-config.ts": 2,
 		"clients/error-class.ts": 3,
 		"clients/extension-log.ts": 3,
 		"clients/file-utils.ts": 3,
-		"clients/format-events-publish.ts": 4,
 		"clients/format-service.ts": 11,
 		"clients/formatters.ts": 26,
-		"clients/generation-lock.ts": 7,
+		"clients/generation-lock.ts": 5,
 		"clients/git-tracked-ignore.ts": 2,
-		"clients/gitleaks-client.ts": 3,
 		"clients/govulncheck-client.ts": 6,
 		// 2 -> 4 (#4402): the worker loop's catch answers with an `error`, and
 		// readGzipStageWorkerResult reads the wire field `error` (the worker
@@ -448,15 +439,14 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 26 -> 28 (#4530), and the new launch.ts row:
 		// starts that moved onto the spawn seam read the spawn result's `error`
 		// field (SpawnResult.error), not a delivery tier.
-		"clients/installer/index.ts": 28,
+		"clients/installer/index.ts": 26,
 		"clients/installer/managed-tool-refresh.ts": 2,
 		"clients/instance-reaper.ts": 4,
 		"clients/instance-registry-lock.ts": 3,
 		"clients/jscpd-client.ts": 2,
 		"clients/knip-client.ts": 3,
 		"clients/lens-config.ts": 4,
-		"clients/lens-events.ts": 1,
-		"clients/live-bus-emitter.ts": 2,
+		"clients/live-bus-emitter.ts": 4,
 		"clients/lsp/cascade-tier.ts": 1,
 		"clients/lsp/client-registry.ts": 4,
 		"clients/lsp/client.ts": 13,
@@ -467,13 +457,18 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/mcp/ipc.ts": 8,
 		"clients/mcp/review.ts": 8,
 		"clients/mcp/session.ts": 1,
-		"clients/module-report.ts": 27,
+		"clients/module-report.ts": 32,
+		// 31 -> 32 (#5138): the callback-handle kind refusal returns the report's
+		// own `error` condition too.
+		// 29 -> 31 (#5138): the kind-mismatch refusal and the unreadable catch
+		// both read the report's own `error` condition.
+		// 27 -> 29 (#5137): the text renderer prints the report's own `error`
+		// field twice on one line, as the guard and as the message.
 		// 3 -> 5 (#4493): readGitHead and listGitHeadDelta read the spawn
 		// result's `error` field (SpawnResult.error), not a delivery tier.
 		"clients/opaque-mutation-scan.ts": 5,
 		"clients/opengrep-client.ts": 11,
 		"clients/package-manager.ts": 2,
-		"clients/partial-edit-apply.ts": 7,
 		"clients/performance-report.ts": 3,
 		"clients/pipeline.ts": 13,
 		"clients/project-diagnostics/fresh-fetch.ts": 4,
@@ -484,20 +479,28 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/project-snapshot.ts": 7,
 		"clients/project-trust.ts": 1,
 		"clients/review-graph-logger.ts": 1,
-		"clients/review-graph/builder.ts": 16,
+		"clients/review-graph/builder.ts": 17,
 		"clients/ruff-client.ts": 7,
 		"clients/runtime-agent-end.ts": 6,
 		"clients/runtime-tool-call.ts": 7,
-		"clients/runtime-turn.ts": 10,
+		// 10 -> 9 (#5257): the clear-blocker filter reads `isCompletedPassResult`,
+		// not a local `value.error` test.
+		"clients/runtime-turn.ts": 9,
 		// 52 -> 53 (#4530): a lookup refusal builds its SpawnResult's `error`.
 		"clients/safe-spawn.ts": 53,
-		"clients/security-scan-client.ts": 2,
+		// 2 -> 6: the report-scan seam (`runReportScan`) carries the `result.error` reads
+		// gitleaks (3) and trivy (3) each had, plus the failure record; net 8 -> 6.
+		"clients/security-scan-client.ts": 6,
 		"clients/sg-runner.ts": 32,
 		"clients/shared-checkout-guard.ts": 1,
 		"clients/single-flight.ts": 3,
 		"clients/smells-rollup.ts": 2,
-		"clients/test-runner-client.ts": 21,
-		"clients/test-runner-delivery.ts": 6,
+		// 21 -> 23 (#5257): `isCompletedPassResult` reads the result's `error`,
+		// and the JSON parser sets the unreadable-output and load-failure errors.
+		"clients/test-runner-client.ts": 23,
+		// 6 -> 7 (#5259): the stage-time idle read's `delivery-failed` record
+		// carries the thrown text in the record's own `error` field.
+		"clients/test-runner-delivery.ts": 7,
 		"clients/tool-agreement.ts": 2,
 		"clients/tree-sitter-cache.ts": 4,
 		// #3605: 18 -> 6. The rewritten wasm classifier, `reportWasmAbort` and
@@ -505,7 +508,6 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/tree-sitter-client.ts": 6,
 		"clients/tree-sitter-logger.ts": 1,
 		"clients/tree-sitter-symbol-extractor.ts": 3,
-		"clients/trivy-client.ts": 3,
 		"clients/warm-attach.ts": 14,
 		"clients/word-index-logger.ts": 1,
 		"clients/word-index.ts": 2,
@@ -517,9 +519,14 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"tools/lens-diagnostic-mark.ts": 4,
 		"tools/lens-diagnostics.ts": 6,
 		"tools/lsp-diagnostics.ts": 8,
+		// 1 (#1449): the LSP `RenameNotifyFailure.error` field's own name — the
+		// server's report of a failed rename notification, not a finding tier.
+		"tools/lsp-navigation-text.ts": 1,
 		"tools/module-report.ts": 11,
 		"mcp/analyze-cli.ts": 1,
-		"mcp/server.ts": 32,
+		// 32 -> 36 (#5138): the read_symbol handler renders `result.error` as the
+		// pi tool does (condition test, message, structured `error` field).
+		"mcp/server.ts": 36,
 	},
 	filter: {
 		"clients/actionable-warnings.ts": 10,
@@ -562,7 +569,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/diagnostic-dispositions.ts": 3,
 		"clients/diagnostic-tracker.ts": 1,
 		"clients/diagnostics-publish.ts": 2,
-		"clients/dispatch/auxiliary-lsp.ts": 3,
+		// 3 -> 5 (#4944): `dropExcludedServers` keeps the rows and the
+		// coverage-gap names of servers that are not switched off, two
+		// `Array.prototype.filter` calls, not a delivery filter.
+		"clients/dispatch/auxiliary-lsp.ts": 5,
 		// 16 -> 17 (#4484): `heldBackBlockers` keeps the blocking findings the
 		// delta calls not new, an `Array.prototype.filter` call, not a delivery
 		// filter.
@@ -570,7 +580,13 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// blocking findings it reports and removes its matches from the visible
 		// and held-back lists, `Array.prototype.filter` calls, not a delivery
 		// filter.
-		"clients/dispatch/dispatcher.ts": 21,
+		// 21 -> 22 (#5010): `buildCoverageNotice` keeps the rows
+		// `dispatch.disabledRunners` skipped, an `Array.prototype.filter` call,
+		// not a delivery filter.
+		// 22 -> 23 (#5258): the coverage rule reads the rows the dispatcher
+		// kept for the primary group, an `Array.prototype.filter` call, not a
+		// delivery filter.
+		"clients/dispatch/dispatcher.ts": 23,
 		"clients/dispatch/fact-runner.ts": 1,
 		"clients/dispatch/fact-scheduler.ts": 2,
 		"clients/dispatch/facts/function-facts.ts": 2,
@@ -585,7 +601,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// `Array.prototype.filter` is deleted with the delta.
 		// 19 -> 20 (#4483): the pre-edit capture keeps a dispatch group's
 		// linter runner ids, an `Array.prototype.filter` call.
-		"clients/dispatch/integration.ts": 20,
+		// 20 -> 21 (#5055): the unplaced-referrer check drops the files edited this
+		// turn with one `Array.prototype.filter`.
+		"clients/dispatch/integration.ts": 21,
 		// #4483: the seed's runner and line selection, `Array.prototype.filter`
 		// calls, not a delivery filter.
 		"clients/dispatch/pre-edit-seed.ts": 4,
@@ -615,6 +633,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/runners/utils/tool-failure.ts": 2,
 		"clients/dispatch/runners/yaml-rule-parser.ts": 1,
 		"clients/dispatch/suppress-writer.ts": 1,
+		// 0 -> 1 (#5258): `checkedVerdict` keeps the rows of runners that
+		// completed, an `Array.prototype.filter` call, not a delivery filter.
+		"clients/dispatch/types.ts": 1,
 		"clients/dispatch/utils/lsp-diagnostics.ts": 1,
 		"clients/file-kinds.ts": 1,
 		"clients/file-role.ts": 3,
@@ -635,10 +656,12 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/govulncheck-client.ts": 1,
 		"clients/gradle-ktfmt-style.ts": 1,
 		"clients/inline-blocker-dispositions.ts": 1,
-		// 2 (#3814 r2): the pipeline's own-file line filter and its number filter,
-		// moved verbatim from `clients/pipeline.ts` (6 -> 4) so the collect-later
-		// merge calls them instead of re-deriving them; no new filter.
-		"clients/inline-blocker-fields.ts": 2,
+		// `clients/inline-blocker-fields.ts`'s row is GONE (#5008 r3): the 2
+		// (#3814 r2) pinned `.filter(` calls — the own-file line filter and its
+		// number filter — became one classification loop in
+		// `inlineBlockerPlacement`, which returns the places AND the counts of what
+		// it could not place. No delivery filter left the tree; the file has no
+		// `filter` use left to pin.
 		"clients/installer/index.ts": 4,
 		"clients/installer/managed-tool-refresh.ts": 2,
 		"clients/instance-reaper.ts": 3,
@@ -655,7 +678,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/language-profile.ts": 2,
 		"clients/language-registry.ts": 1,
 		"clients/lens-config.ts": 1,
-		"clients/lens-engine.ts": 3,
+		// 3 -> 2 (#5047 F5): the engine's own blank-entry filter is deleted; the
+		// shared reader in tools/shared.ts owns the rule.
+		"clients/lens-engine.ts": 2,
 		"clients/lens-flag-registry.ts": 2,
 		"clients/lens-map.ts": 2,
 		"clients/lsp-budget.ts": 1,
@@ -672,7 +697,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 50 -> 51 (#3734): rename-file provenance selects contributing clients.
 		// 49 -> 50 (#4323): a read that excludes a switched-off server drops
 		// that server's rows from the last known answer it falls back to.
-		"clients/lsp/index.ts": 51,
+		// 51 -> 50 (#4944): the stored-rows filter above moved into
+		// `dropExcludedServers` (`clients/dispatch/auxiliary-lsp.ts`).
+		"clients/lsp/index.ts": 50,
 		"clients/lsp/inferred-project.ts": 2,
 		"clients/lsp/jvm-runtime.ts": 3,
 		"clients/lsp/language.ts": 1,
@@ -705,6 +732,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// `Array.prototype.filter` call.
 		"clients/opaque-mutation-scan.ts": 2,
 		"clients/opengrep-client.ts": 2,
+		// 1 (#5009): the venv interpreter candidates are filtered to directories
+		// and symlinks BEFORE the cap, an `Array.prototype.filter` call, not a
+		// delivery filter.
+		"clients/out-of-band-changes.ts": 1,
 		"clients/path-utils.ts": 1,
 		"clients/persistent-reverify.ts": 4,
 		// 4 -> 6 (#4484): `liveBlockers.filter` and `recordBlockers.filter` split the
@@ -727,7 +758,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/project-snapshot.ts": 3,
 		"clients/python-provenance.ts": 4,
 		"clients/read-guard-logger.ts": 3,
-		"clients/read-guard-tool-lines.ts": 6,
+		"clients/read-guard-tool-lines.ts": 4,
 		"clients/read-guard.ts": 9,
 		"clients/recent-touches.ts": 2,
 		"clients/resource-sampler.ts": 2,
@@ -741,13 +772,20 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/review-graph/workspace-modules.ts": 6,
 		"clients/ruff-client.ts": 1,
 		"clients/runtime-agent-end.ts": 7,
-		"clients/runtime-coordinator.ts": 3,
+		// 3 -> 4 (#4921): `getInlineBlockersSnapshot` keeps one turn session's
+		// records, an `Array.prototype.filter` call, not a delivery gate.
+		// 4 -> 5 (#4990): the per-source row retirement keeps the rows the clean
+		// verdict did not cover, the same array call, not a delivery gate.
+		// 5 -> 6 -> 5 (#5020): `retireForeignRows` first kept the rows no retire
+		// judged with this array call; it now splits retired from kept in one
+		// loop, because the widget store takes the retired half.
+		"clients/runtime-coordinator.ts": 5,
 		"clients/runtime-session.ts": 4,
 		// 3 -> 5 -> 3 (#4187): round 4's tool-call authorship retirement filtered
 		// the owned in-process mutation paths; round 5 folds two of its three
 		// branches onto the observational net's arm, and the surviving ast-grep
 		// site walks its `paths` array instead of filtering it.
-		"clients/runtime-tool-call.ts": 3,
+		"clients/runtime-tool-call.ts": 2,
 		// #4535 slice 2: the LSP consumer narrows a publish's population to the
 		// documents a live client holds and keeps the stale ones among them —
 		// two `Array.prototype.filter` calls that moved here from
@@ -778,7 +816,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// neighbours a run owns, the pending entries this turn did not observe
 		// and the runs that carry an unconfirmed bucket, three
 		// `Array.prototype.filter` calls, not a delivery filter.
-		"clients/runtime-turn.ts": 33,
+		// 33 -> 34 (#5055): the unresolved-reference advisory bucket selects its
+		// runs with one `Array.prototype.filter`, like the binding and budget buckets.
+		// 34 -> 35 (#5257): the empty-batch clear list filters on `isCompletedPassResult`.
+		"clients/runtime-turn.ts": 35,
 		"clients/safe-spawn.ts": 5,
 		"clients/scratch-tree-policy.ts": 2,
 		"clients/session-repository.ts": 1,
@@ -802,24 +843,38 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/turn-end/lanes/secrets.ts": 3,
 		"clients/turn-summary-render.ts": 3,
 		"clients/vanished-instance-marker.ts": 1,
-		"clients/widget-state.ts": 16,
+		// 16 -> 18 (#5258, #5020): the header counts the files no check completed
+		// on, and `retireWidgetCitedRows` keeps the rows no retire named; both are
+		// `Array.prototype.filter` calls, not delivery filters.
+		"clients/widget-state.ts": 18,
 		"clients/word-index.ts": 14,
 		"clients/workspace-topology.ts": 1,
 		"tools/activate-tools.ts": 2,
-		"tools/ast-grep-outline.ts": 1,
 		"tools/effective-config.ts": 4,
 		"tools/lens-diagnostic-mark.ts": 1,
 		// Six array projections scope and count request-local session evidence;
 		// these are Array.prototype.filter calls, not new delivery-policy seams.
-		"tools/lens-diagnostics.ts": 43,
+		// 43 -> 42 (#5041): the `paths` entry filter moved into tools/shared.ts's
+		// one reader, which every tool now calls.
+		"tools/lens-diagnostics.ts": 42,
 		// 12 -> 13 (#4346): the batch selects its finding-bearing files to resolve.
 		// 13 -> 14 (#4322): the batch counts its files with auxiliary findings
 		// only, one `Array.prototype.filter` use, not a delivery filter.
-		"tools/lsp-diagnostics.ts": 14,
+		// 14 -> 12 (#5128): the navigation-only tally filters left with the field.
+		"tools/lsp-diagnostics.ts": 12,
+		// 2 (#1449): the default text view's `stringArray` keeps the string
+		// entries of a heterogeneous list, an `Array.prototype.filter` call, not a
+		// delivery filter.
+		"tools/lsp-navigation-text.ts": 2,
 		"tools/lsp-navigation.ts": 6,
+		// 1 (#1449): `lspNavigationTextSurround` drops the blank lines a balanced
+		// JSON prefix leaves behind, the same array call, not a delivery filter.
+		"tools/lsp-structured-output.ts": 1,
 		"tools/render-compact.ts": 3,
 		"mcp/analyze-cli.ts": 1,
-		"mcp/server.ts": 9,
+		// 9 -> 8 (#5041): pilens_symbol_search's own entry filter is deleted; the
+		// shared reader in tools/shared.ts applies the rule now.
+		"mcp/server.ts": 8,
 		"mcp/tool-arguments.ts": 4,
 		// #1416: /lens-health's effective tool projection adds two semantic
 		// filters; keep the existing census entry pinned to the live population.
@@ -840,7 +895,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/ast-grep-rule-manager.ts": 4,
 		"clients/ast-grep-tool-logger.ts": 1,
 		"clients/biome-client.ts": 4,
-		"clients/bus-events-logger.ts": 1,
+		"clients/live-bus-emitter.ts": 1,
 		// 10 -> 12 (#3274): `readCacheAsync` and the shared `freshAgeMs` each log
 		// their own verdict through the manager's existing verbose logger. Same
 		// sense as the ten beside them; no new logging concept.
@@ -863,7 +918,6 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/types.ts": 1,
 		"clients/disposition-logger.ts": 1,
 		"clients/extension-log.ts": 1,
-		"clients/gitleaks-client.ts": 1,
 		"clients/go-client.ts": 4,
 		"clients/govulncheck-client.ts": 12,
 		"clients/host-ports.ts": 2,
@@ -871,8 +925,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/knip-client.ts": 14,
 		"clients/latency-logger.ts": 1,
 		"clients/mcp/session.ts": 1,
-		"clients/metrics-client.ts": 4,
-		"clients/module-report.ts": 17,
+		// 18 -> 19 (#5138): the callback-handle kind refusal logs its miss too.
+		// 17 -> 18 (#5138): the kind-mismatch refusal logs its miss through the
+		// same `read_symbol` phase as every other miss in this file.
+		"clients/module-report.ts": 19,
 		"clients/ndjson-logger.ts": 2,
 		"clients/opengrep-client.ts": 1,
 		"clients/process-singletons.ts": 4,
@@ -882,12 +938,11 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/ruff-client.ts": 4,
 		"clients/runtime-session.ts": 4,
 		"clients/rust-client.ts": 4,
-		"clients/security-scan-client.ts": 8,
+		"clients/security-scan-client.ts": 9,
 		"clients/sg-runner.ts": 5,
 		"clients/test-runner-client.ts": 17,
 		"clients/tool-cwd.ts": 2,
 		"clients/tree-sitter-logger.ts": 1,
-		"clients/trivy-client.ts": 1,
 		"clients/word-index-logger.ts": 1,
 		"clients/word-index.ts": 2,
 		"mcp/analyze-cli.ts": 1,
@@ -926,17 +981,18 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// `path.resolve(dir)`, mirroring `withGenerationLockSync`'s own (#3578).
 		"clients/bounded-pid-file-lock.ts": 6,
 		"clients/build-identity.ts": 3,
-		"clients/bus-events-logger.ts": 2,
+		"clients/live-bus-emitter.ts": 2,
 		"clients/bus-publish.ts": 3,
 		// 17 -> 19 (#3274): `readCacheAsync` builds the same two store paths its
 		// synchronous sibling does (`cachePath`, `metaPath`). Same sense, one more
 		// reader of the same two files.
-		"clients/cache-manager.ts": 19,
+		"clients/cache-manager.ts": 18,
 		// 7 -> 5 (#3930 r2): the shared fingerprint replaces the cache's
 		// duplicated path operations with one owner.
 		"clients/cache/rule-cache.ts": 5,
 		"clients/call-graph.ts": 4,
-		"clients/cargo-manifest.ts": 6,
+		// 6 -> 5 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		"clients/cargo-manifest.ts": 5,
 		"clients/cascade-logger.ts": 2,
 		"clients/code-quality-warnings.ts": 5,
 		// 5 -> 4 (#4689 r2): the entry's file is rendered by
@@ -961,7 +1017,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 29 -> 30 (#3435): the single-file lane now derives its base with
 		// `path.dirname(target)` instead of passing `projectRoot` through — one
 		// more `path` use, same sense (a path operation).
-		"clients/dependency-checker.ts": 30,
+		"clients/dependency-checker.ts": 28,
 		"clients/diagnostic-dispositions.ts": 10,
 		"clients/diagnostic-logger.ts": 3,
 		"clients/diagnostics-publish.ts": 6,
@@ -971,7 +1027,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/integration.ts": 1,
 		"clients/dispatch/rule-id-normalize.ts": 2,
 		"clients/dispatch/rule-ignores.ts": 3,
-		"clients/dispatch/runner-context.ts": 11,
+		// 11 -> 10 (#4689 batch 7): the absolute runner path is `realpathOrResolve`,
+		// not a `path.resolve` of the spelling the tool reported.
+		"clients/dispatch/runner-context.ts": 9,
 		"clients/dispatch/runners/actionlint.ts": 4,
 		"clients/dispatch/runners/ast-grep-napi.ts": 4,
 		"clients/dispatch/runners/biome-check.ts": 6,
@@ -986,8 +1044,8 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/runners/gleam-check.ts": 3,
 		"clients/dispatch/runners/golangci-lint.ts": 3,
 		"clients/dispatch/runners/hadolint.ts": 4,
-		"clients/dispatch/runners/helm-lint.ts": 11,
-		"clients/dispatch/runners/helm-render.ts": 16,
+		"clients/dispatch/runners/helm-lint.ts": 8,
+		"clients/dispatch/runners/helm-render.ts": 12,
 		"clients/dispatch/runners/htmlhint.ts": 4,
 		"clients/dispatch/runners/javac.ts": 5,
 		"clients/dispatch/runners/ktlint.ts": 4,
@@ -1004,7 +1062,8 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 8 -> 4 (#4689 item 6): `findShellcheckConfig` delegates to
 		// `findLocalToolConfig`, dropping its `path.join` / `path.resolve` /
 		// `path.dirname` loop and the `fs` pre-check.
-		"clients/dispatch/runners/shellcheck.ts": 4,
+		// 4 -> 3: dialect extension resolution moved to clients/shell-dialect.ts.
+		"clients/dispatch/runners/shellcheck.ts": 3,
 		"clients/dispatch/runners/spellcheck.ts": 6,
 		"clients/dispatch/runners/spotbugs.ts": 4,
 		"clients/dispatch/runners/sqlfluff.ts": 3,
@@ -1016,6 +1075,8 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/runners/tree-sitter.ts": 2,
 		"clients/dispatch/runners/trivy-config.ts": 4,
 		"clients/dispatch/runners/utils/diagnostic-parsers.ts": 3,
+		// 7 (#5119): `node:path` joins and resolves while locating cli2's package.
+		"clients/dispatch/runners/utils/markdownlint-api.ts": 7,
 		// 23 -> 30 (#2660): the resolver now carries its selected `path` and
 		// `resolution.path` through the evidence seam, adding seven same-sense
 		// path identifiers while preserving the four-rung lookup ladder.
@@ -1034,10 +1095,12 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/effective-config.ts": 5,
 		"clients/extension-log.ts": 2,
 		"clients/file-kinds.ts": 2,
-		"clients/file-time.ts": 7,
+		"clients/file-time.ts": 6,
 		// 18 -> 13 (#4689): the private nearest-existing realpath walk folded
 		// onto path-utils' `realpathOrResolve`.
-		"clients/ephemeral-root.ts": 13,
+		// 13 -> 11 (#4689 batch 7): the git-marker climb is `walkUpDirs`, so its
+		// two `path.dirname` steps are the seam's.
+		"clients/ephemeral-root.ts": 11,
 		// 61 -> 68 (#4689 r4): the data-dir adoption joins its walk with the
 		// node `path` module (no `path` binding of its own). 68 -> 70 (r5): the
 		// done-marker's path and its parent. 70 -> 68 (#4530): machineStateDir
@@ -1045,7 +1108,14 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// batch 5): the ignore matcher's off-root namespace joins the identity of
 		// a directory with the node `path` module (`path.join`, `dirname`,
 		// `basename`, `sep`); no `path` binding of its own.
-		"clients/file-utils.ts": 72,
+		// 72 -> 65 (#4689 batch 7): the ignore matcher's containment tests are the
+		// owner predicate on one path form, so four `path.relative` /
+		// `path.isAbsolute` folds and the `rootPrefix`'s `path.sep` are gone.
+		// 65 -> 68 (#4876 r2): `projectPathKey` keys a dot-segment spelling by its
+		// DIRECTORY's identity (`path.dirname` + `path.basename` of the caller's
+		// own spelling), so the kernel — not `path.resolve` — folds the `..`.
+		// 68 -> 67 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		"clients/file-utils.ts": 67,
 		"clients/finding-identity.ts": 2,
 		"clients/fix-worklog.ts": 3,
 		// 3 -> 2, 16 -> 15 (#4689): the formatter is handed `realpathOrResolve`,
@@ -1053,20 +1123,24 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// the widget row kept the caller's spelling, a `path.resolve` again;
 		// 3 -> 2 (#4689 item 3): the row is written under the identity.
 		"clients/format-service.ts": 2,
-		"clients/formatters.ts": 15,
+		// 15 -> 14 (#4689 batch 7): `findUp` climbs `walkUpDirs`, so its own
+		// `path.dirname` step is the seam's.
+		"clients/formatters.ts": 14,
 		"clients/generated-artifacts.ts": 4,
 		"clients/generation-lock.ts": 7,
 		"clients/git-guard.ts": 7,
 		"clients/git-tracked-ignore.ts": 3,
-		"clients/gitleaks-client.ts": 25,
+		// 20 -> 19 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		"clients/gitleaks-client.ts": 19,
 		"clients/go-client.ts": 2,
 		"clients/govulncheck-client.ts": 7,
-		"clients/gradle-ktfmt-style.ts": 5,
+		// 5 -> 4 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		"clients/gradle-ktfmt-style.ts": 4,
 		"clients/grammar-source.ts": 4,
 		"clients/gzip-stage-write.ts": 2,
 		"clients/inline-blocker-dispositions.ts": 2,
 		"clients/install-diagnostics.ts": 11,
-		"clients/installer/index.ts": 108,
+		"clients/installer/index.ts": 104,
 		// 4 -> 9 (#4765): refreshOpengrepRulePack computes the candidate's
 		// scratch directory, cwd and sweep with `path.dirname`/`path.join`.
 		"clients/installer/managed-tool-refresh.ts": 9,
@@ -1077,18 +1151,24 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/instance-registry.ts": 2,
 		"clients/jscpd-client.ts": 8,
 		"clients/json-cache-read.ts": 4,
-		"clients/knip-client.ts": 26,
+		"clients/knip-client.ts": 24,
 		// 14 -> 12 (#4689 r2): the language-root clamp asks `isUnderDir`
 		// instead of taking a `path.relative` of two spellings.
 		"clients/language-profile.ts": 12,
 		"clients/latency-logger.ts": 2,
 		"clients/lens-config.ts": 3,
-		"clients/lens-engine.ts": 6,
+		// 8 -> 9 (#5047 F1): the path-glob matcher relativizes an entry under cwd.
+		// 9 -> 11 (#5104): the shared hit renderer prints a hit's path relative to
+		// the query cwd, and the footer's next-step line does the same for the top
+		// hit. Both are the `node:path` module, never the retired map-key sense.
+		// 11 -> 12 (#5235): `symbolSearchFileMatchesLang` reads the basename of a
+		// file a kind names by pattern (`path.basename`), like the inline filter.
+		"clients/lens-engine.ts": 12,
 		"clients/lens-flag-registry.ts": 13,
 		"clients/lens-map.ts": 14,
 		"clients/log-cleanup.ts": 9,
 		"clients/lsp-mutation.ts": 3,
-		"clients/lsp/client-registry.ts": 4,
+		"clients/lsp/client-registry.ts": 2,
 		// 0 -> 1 (#4615): the `[lsp-pub]` debug row's `path` member carries the
 		// client's own normalized document key into extension.log. One more
 		// `path` use, same sense (a path value written to a sink), and it is an
@@ -1100,12 +1180,18 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lsp/config.ts": 3,
 		// #4346: resolves a Go importer's package directory to announce its peers.
 		"clients/lsp/created-import-targets.ts": 3,
-		"clients/lsp/edits.ts": 23,
+		// 23 -> 19 (#4689 batch 10): `resolveExistingAncestor`'s own upward walk
+		// (`path.resolve` / `path.dirname` / `path.basename` / `path.join`) is
+		// deleted; the confinement asks `realpathOrResolveAsync` for the root and
+		// each URI's identity, so four `path` uses leave the module.
+		// 19 -> 18 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		"clients/lsp/edits.ts": 18,
 		// #4532: the environment-gap gate resolves its walk-up from the file's
 		// own directory, so these are real filesystem `path` calls. 5 -> 8
 		// (#4532 round 5): the manifest walk-up reads `package.json` at each
 		// level on the same bounded ancestry.
-		"clients/lsp/environment-gap.ts": 8,
+		// 8 -> 5 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		"clients/lsp/environment-gap.ts": 5,
 		"clients/lsp/file-server-match.ts": 3,
 		"clients/lsp/index.ts": 15,
 		// #4346: Go package directories and TS/JS extensions of the implicit
@@ -1141,13 +1227,20 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 124 -> 121 (#4689 item 6): the root walks take their start, stop and
 		// refused home through `realpathOrResolve`, replacing three
 		// `path.resolve` calls; the extensions walk keeps its count.
+		// 121 -> 124 (#4914): `findEffectTsgoLsp` joins the `@effect/tsgo` manifest
+		// path, the `.bin/effect-tsgo` path, and `findNativeTypeScriptLsp` hands
+		// back its `node_modules` directory: three `path.join` filesystem calls.
+		// 122 -> 111 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		// 111 -> 112 (#5123): Groovy resolves its configured jar from pi's cwd
+		// before launching, one filesystem path use in the reviewed fix.
 		// The retained fork's agent-level tsconfig lookup adds path.dirname:
 		// this is the node:path namespace, not a retired domain identifier.
-		"clients/lsp/server.ts": 122,
+		"clients/lsp/server.ts": 113,
 		"clients/lsp/session-roots.ts": 8,
 		// 13 -> 15 (#4346): a creation's path joins the entry's dependency
 		// scope test (Go package directory, created-file stem/directory names).
-		"clients/lsp/workspace-diagnostics-cache.ts": 15,
+		// 12 -> 11 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		"clients/lsp/workspace-diagnostics-cache.ts": 11,
 		// #4346: a creation record carries the created file's path.
 		"clients/lsp/workspace-diagnostics-session.ts": 2,
 		// 6 -> 5 (#3643): removed the obsolete ring path-comparison branch;
@@ -1160,9 +1253,13 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// name and the stale-socket owner marker. No path-key owner changes.
 		"clients/mcp/ipc.ts": 7,
 		"clients/mcp/session.ts": 3,
-		"clients/metrics-client.ts": 6,
-		"clients/metrics-history.ts": 7,
-		"clients/module-report.ts": 30,
+		// 7 -> 6 (#4966): the two `path.dirname(filePath)` starts of the commit lookup become one inside `getCurrentCommit`.
+		"clients/metrics-history.ts": 6,
+		// 30 -> 31 (#5137): the text header prints the report's own `path`.
+		// 31 -> 32 (#5138): the kind-mismatch refusal returns the same `path`
+		// field as every other `readSymbol` miss.
+		// 32 -> 33 (#5138): so does the callback-handle kind refusal.
+		"clients/module-report.ts": 33,
 		// 6 -> 9 (#3650): MutationLineResult.path field, the adapter-declared
 		// preference, and the readToolResultPathField return.
 		"clients/mutating-tool.ts": 9,
@@ -1202,12 +1299,29 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// the kernel as it is, with no `path.isAbsolute`/`path.resolve` first.
 		// 38 -> 34 (#4689 item 6): the two marker walks start at
 		// `realpathOrResolve(startDir)` and `realpathOrResolve(homeDir)`.
-		"clients/path-utils.ts": 33,
+		// 33 -> 37 (#4689 batch 10): the async twin of the identity walk adds
+		// its own `path` uses (the `typeof path.posix` parameter, the `path`
+		// argument `identityCandidates` parses with, the missing tail's
+		// `path.join` and the `path.resolve` fallback). Three are the same
+		// senses the sync walk already carries; the fourth is the seam's own
+		// fallback.
+		// 37 -> 39 (#4689 r2 F-CR1): each driver's attempt now folds its tail
+		// through the shared `foldMissingTail` (one `path` argument for the
+		// `typeof path.posix` parser), and `kernelAttemptAsync` carries the same
+		// argument its sync twin does; the fold and fallback calls are the same
+		// senses counted above.
+		// 39 -> 41 (#2556): `relativeInside` takes a `pathImpl: typeof path = path`
+		// argument so callers can pass the win32 dialect; the default and its
+		// annotation are the two senses.
+		// 41 -> 40 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		"clients/path-utils.ts": 40,
 		"clients/php-cs-fixer-config.ts": 4,
 		// 26 -> 24 (#4689 batch 3): the changed-file set is a PathKeyedMap, so two
 		// `path.resolve` calls are gone. 24 -> 22: the postMutation gate compares
 		// through `normalizeMapKey`, two more.
-		"clients/pipeline.ts": 22,
+		// 22 -> 23 (#5258): the unconfirmed line names an unknown-kind file by
+		// its extension, a filesystem path operation.
+		"clients/pipeline.ts": 23,
 		// 10 -> 12 (#4530): machineStateDir moved here from file-utils.ts.
 		"clients/probe-home-state.ts": 12,
 		"clients/project-changes.ts": 5,
@@ -1225,13 +1339,15 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/project-diagnostics/runner-adapters/runner-findings.ts": 4,
 		"clients/project-diagnostics/runner-adapters/trivy.ts": 5,
 		"clients/project-diagnostics/scanner.ts": 4,
-		"clients/project-lens-config.ts": 19,
+		"clients/project-lens-config.ts": 17,
 		"clients/project-report.ts": 5,
 		"clients/project-snapshot.ts": 15,
 		// 18 -> 22 (#3871 r2, r3): ambient-environment containment uses four
 		// path operations at the shared Python resolver seam; r3 restored the
 		// `path.isAbsolute` leg that rejects another Windows drive (V1).
-		"clients/python-environment.ts": 19,
+		// 19 -> 18 (#5009): the two root-level venv candidates became one
+		// `path.join` inside the list the resolver and the install stamp share.
+		"clients/python-environment.ts": 13,
 		"clients/read-guard-logger.ts": 3,
 		"clients/recent-touches.ts": 5,
 		"clients/reverse-deps.ts": 8,
@@ -1239,12 +1355,13 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 33 -> 36 (#4346): the importer pass names a created file by its stem
 		// and directory; 36 -> 33 (#4346 final lane): that name test moved to
 		// import-resolvers.ts `fileAnswerNames`, shared with the LSP cache.
-		"clients/review-graph/builder.ts": 33,
+		"clients/review-graph/builder.ts": 32,
 		"clients/review-graph/format.ts": 4,
 		// 10 -> 11 (#4508): the walk joins the `.git` entry and its HEAD.
 		"clients/review-graph/git-identity.ts": 11,
 		// 61 -> 64 (#4346 final lane): `fileAnswerNames`, moved from builder.ts.
-		"clients/review-graph/import-resolvers.ts": 64,
+		// 64 -> 61 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		"clients/review-graph/import-resolvers.ts": 61,
 		"clients/review-graph/tsconfig-paths.ts": 35,
 		"clients/review-graph/workspace-modules.ts": 27,
 		"clients/ruff-client.ts": 4,
@@ -1268,7 +1385,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 28 -> 16 (#4689 batch 1 r2): the other eleven inline-store accessors and
 		// the deferMutation key drop their `path.resolve` too; every accessor keys
 		// the raw spelling through normalizeMapKey (review F1).
-		"clients/runtime-coordinator.ts": 16,
+		// 16 -> 17 (#5020): `retireForeignRowsOfMissingFiles` asks `path.isAbsolute`
+		// before it judges a cited file, so a relative cite is never retired.
+		"clients/runtime-coordinator.ts": 17,
 		"clients/runtime-session.ts": 15,
 		// 22 -> 21 (#4137): the baseline slot's `path.resolve` moved into
 		// `opaqueBaselineSlot` (clients/opaque-mutation-scan.ts).
@@ -1278,7 +1397,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// the single-path branches, and with them the `input.path` read.
 		// 22 -> 21 (#2657): the LSP config root for an edit is no longer a
 		// `path.dirname(filePath)`; `resolveSessionConfigRoot` answers it.
-		"clients/runtime-tool-call.ts": 21,
+		// 21 -> 23 (#3650): the `lsp_navigation` branch reads the `path` field
+		// the tool declares, in its condition and its return.
+		"clients/runtime-tool-call.ts": 22,
 		// 22 -> 20 (#3650): the tool_result path read is routed through
 		// readToolResultPathField; the open-coded input.path cast is gone.
 		// 19 -> 18 (#4576): the tool_result path resolves through
@@ -1301,13 +1422,15 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 27 -> 19 (#4689): the eight test-target `path.relative(cwd, …)`
 		// renderings go through `toRunnerDisplayPath`, which relates path
 		// identities.
-		"clients/runtime-turn.ts": 19,
+		// 19 -> 20 (#4954 r3): the turn-end stamp's entry type names its
+		// `path` field beside the role it carries.
+		"clients/runtime-turn.ts": 20,
 		"clients/rust-client.ts": 5,
 		// 26 -> 32 (#4530): the search-path scoping and lookup split PATH on
 		// `path.delimiter` and resolve each entry with `path` namespace calls.
 		"clients/safe-spawn.ts": 32,
 		"clients/search-read-registration.ts": 3,
-		"clients/security-scan-client.ts": 4,
+		"clients/security-scan-client.ts": 6,
 		// #4530: the bin layouts moved here from package-manager.ts.
 		"clients/session-repository.ts": 9,
 		"clients/session-state-store.ts": 3,
@@ -1318,7 +1441,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 25 -> 26 (#3930 r4): the cycle-memo key is derived with
 		// `path.resolve(projectRoot)`, the normalization every sibling map key
 		// in this file already uses (`cachedBaselines`, `rootArtifactKey`).
-		"clients/sgconfig.ts": 26,
+		"clients/sgconfig.ts": 25,
+		// The path namespace and extname call moved from the ShellCheck runner.
+		"clients/shell-dialect.ts": 2,
 		"clients/skills-resolver.ts": 3,
 		"clients/slow-fs.ts": 4,
 		"clients/smells-rollup.ts": 3,
@@ -1327,7 +1452,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// the target with `path.basename`, the same call every walker path uses.
 		"clients/source-walker.ts": 4,
 		"clients/spawn-timeout-cooldown.ts": 3,
-		"clients/startup-scan.ts": 9,
+		"clients/startup-scan.ts": 7,
 		// 61 -> 66: filesystem ownership/discovery operations plus the alias
 		// exception's physical policy-relative path (R4). These remain filesystem
 		// operations, not delivery lanes; the census measures every use.
@@ -1335,7 +1460,8 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// for pytest, PHPUnit, Mix, and generic runner locations.
 		// 74 -> 72 (#4689 batch 2): two `path.resolve` locals dropped from the root and
 		// failed-target keys.
-		"clients/test-runner-client.ts": 72,
+		// 68 -> 70 (#5257): the per-run report scratch path (`reportDir`, `reportPath`).
+		"clients/test-runner-client.ts": 70,
 		"clients/todo-scanner.ts": 3,
 		// 4 -> 10 (#3655): the Node lockfile walk-up and supplier selection
 		// resolve pnpm/yarn evidence through `path.join`, `path.relative`,
@@ -1343,32 +1469,47 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// (a path operation).
 		"clients/tool-agreement.ts": 10,
 		// 13 -> 12 (#4689 item 6): the file is resolved by `realpathOrResolve`.
-		"clients/tool-cwd.ts": 12,
-		"clients/tool-policy.ts": 64,
-		"clients/tree-sitter-client.ts": 19,
+		// 12 -> 10 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		"clients/tool-cwd.ts": 10,
+		// 64 -> 62 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		"clients/tool-policy.ts": 62,
+		// 19 -> 18 (#4689 batch 7): the grammar write probe climbs `walkUpDirs`, so
+		// its own `path.dirname` step is the seam's.
+		"clients/tree-sitter-client.ts": 18,
 		"clients/tree-sitter-logger.ts": 2,
 		// 11 -> 18 (#3930 r2): the loader's complete rule fingerprint walks
 		// language rule directories and normalizes their paths.
 		"clients/tree-sitter-query-loader.ts": 18,
 		"clients/tree-sitter-shared.ts": 2,
 		"clients/tree-sitter-symbol-extractor.ts": 3,
-		"clients/trivy-client.ts": 6,
+		// 4 -> 5 (#4617 review F1): a rendered trivy report cites its own rows'
+		// `target` resolved against the scan root, one more `path` operation, same
+		// sense as the four above (a filesystem path operation).
+		"clients/trivy-client.ts": 5,
 		"clients/warm-attach.ts": 3,
-		"clients/widget-state.ts": 7,
+		// 7 -> 8 (#5258): the footer names the unchecked file by its basename, a
+		// filesystem path operation.
+		"clients/widget-state.ts": 8,
 		"clients/word-index-logger.ts": 2,
+		// 51 -> 52 (#5235): the `lang:` predicate also matches a named kind's
+		// basename (`path.basename`), so `lang:groovy` selects a Jenkinsfile.
+		// 52 -> 51 (#5136): the `ext:` predicate matches a path suffix on the
+		// display path instead of `path.extname`, dropping one `path` operation.
 		"clients/word-index.ts": 51,
 		"clients/workspace-topology.ts": 7,
 		"clients/zizmor-config.ts": 4,
 		// 8 -> 5 (#4233): the ast-grep tools fold their relative-path resolution
 		// onto the shared `resolveHostToolPath` seam, so ast-grep-outline.ts drops
 		// its own `path` import and two `path.*` calls.
-		"tools/ast-grep-outline.ts": 5,
+		// 5 -> 1 (#5071 r2 F1): the header and the sort read the project-relative
+		// header, not each file's absolute `file.path`; one `file.path` read remains.
+		"tools/ast-grep-outline.ts": 1,
 		"tools/ast-grep-search.ts": 2,
-		"tools/effective-config.ts": 2,
+		"tools/effective-config.ts": 6,
 		// 6 -> 4 (#4577 M2): the `path` argument folds onto
 		// `resolveHostToolPath`, dropping the `path.isAbsolute`/`path.resolve`
 		// pair.
-		"tools/lens-diagnostic-mark.ts": 4,
+		"tools/lens-diagnostic-mark.ts": 6,
 		// 30 -> 27 (#4576): `resolvePathsScope` folds onto
 		// `resolveHostToolPath`, dropping three `path.*` calls.
 		// 27 -> 26 (#4689 r2): mode=all renders a row's file through
@@ -1377,7 +1518,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// `toProjectRelativePath` too.
 		// 25 -> 19 (#4689 batch 4): mode=full's merge keys its Sets, dedup key and
 		// per-file map by `normalizeMapKey`, dropping six `path.resolve` calls.
-		"tools/lens-diagnostics.ts": 19,
+		"tools/lens-diagnostics.ts": 22,
 		// 10 -> 8 (#4577 M2): the scalar and batch `path`/`paths` arguments fold
 		// onto `resolveHostToolPath`, dropping one `path.resolve` each.
 		"tools/lsp-diagnostics.ts": 8,
@@ -1388,7 +1529,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// `path.isAbsolute`/`path.resolve` calls goes and the merged file keeps
 		// path OPERATIONS only (`path.basename`, `path.resolve` of a read target),
 		// the sense the glossary does not retire.
-		"tools/lsp-navigation.ts": 11,
+		"tools/lsp-navigation.ts": 14,
 		// 29 -> 27 (#4577 M2): `resolveFile` folds onto `resolveHostToolPath`,
 		// dropping the `path.isAbsolute`/`path.resolve` pair.
 		"tools/module-report.ts": 27,
@@ -1397,16 +1538,26 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// `path.resolve(base)` alone instead of going through
 		// `resolveHostToolPath`, because that generated path is pi-lens's own and
 		// must keep its bytes.
-		"tools/shared.ts": 2,
-		"tools/symbol-search.ts": 5,
+		"tools/shared.ts": 8,
+		// 5 -> 0 (#5104): the row text moved into `renderCompactSymbolSearch`, so
+		// this wrapper no longer spells a path.
 		"mcp/analyze-cli.ts": 4,
 		"mcp/cli.ts": 2,
-		"mcp/server.ts": 33,
+		// 31 -> 30 (#4966): the upward climb folds onto `walkUpDirs`, so a `path.dirname` / `path.resolve` use leaves the module.
+		// 41 -> 38 (#5104): the rendered table replaces the inline rows and the JSON
+		// payload's per-hit `path.relative`; the renderer now owns that spelling.
+		// 38 -> 33 (#5137): the module_report handler stops building its own
+		// `path.relative` summary and delegates the rendering.
+		// 33 -> 34 (#5138): the read_symbol error branch names `path.basename(file)`.
+		"mcp/server.ts": 34,
 		"index.ts": 20,
+		"clients/command-path.ts": 5,
 	},
 	record: {
 		"clients/actionable-warnings.ts": 14,
-		"clients/advisory-provenance.ts": 8,
+		// 8 -> 9 (#4617): the well-formed check reads the new `filelessParts`
+		// flag on the record it validates, so one more `record.` use exists.
+		"clients/advisory-provenance.ts": 9,
 		"clients/cache-observability.ts": 2,
 		"clients/config-core/merge.ts": 3,
 		"clients/config-core/normalize.ts": 12,
@@ -1415,7 +1566,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/degradation-ledger.ts": 16,
 		// #3968 PR 2: +1 — `redactServerSpec` reads `record.covers` (the
 		// rendered claim beside the existing redacted fields).
-		"clients/effective-config.ts": 11,
+		// 11 -> 10 (#5127): `redactServerSpec` reads `record.command` once into
+		// `rawCommand` instead of twice in the string-only test.
+		"clients/effective-config.ts": 10,
 		// 44 -> 59 (#4725): the any-age read, the retire and the refusal's
 		// remedy each name the `turn-end-findings` row, the durable cache row the
 		// glossary keeps `record` for. 53 -> 65 (#4738): the partition reads, the
@@ -1424,7 +1577,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// stamp and its shape check read the same row.
 		"clients/git-guard.ts": 67,
 		"clients/govulncheck-client.ts": 4,
-		"clients/inline-blocker-dispositions.ts": 4,
+		"clients/inline-blocker-dispositions.ts": 3,
 		// #3654: the unified bridge's own `record()` API (RFC §3) — a method
 		// name, not the retired finding-record noun; the lexical census cannot
 		// tell the two senses apart.
@@ -1439,7 +1592,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/mcp/analyze.ts": 2,
 		"clients/observed-mutation.ts": 4,
 		"clients/opaque-mutation-scan.ts": 1,
-		"clients/partial-edit-apply.ts": 5,
+		"clients/partial-edit-apply.ts": 4,
 		"clients/persistent-reverify.ts": 3,
 		"clients/project-diagnostics/fresh-fetch.ts": 12,
 		"clients/project-lens-config.ts": 8,
@@ -1452,15 +1605,22 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// `InlineBlockerRecord` (param, path, count, write index).
 		// 23 -> 29 (#4213): the deferred lifecycle identity reads its queued
 		// record and returns its ownership fields.
-		"clients/runtime-coordinator.ts": 29,
+		// 29 -> 31 (#4921): `noteResolvedBlockerFile` carries the removed
+		// record's owning session onto its Resolved note.
+		// 31 -> 33 (#4943): a secondary's owned-only claim reads the queued
+		// record's owner and leaves another session's record queued.
+		"clients/runtime-coordinator.ts": 33,
 		"clients/runtime-tool-call.ts": 1,
 		"clients/runtime-tool-result.ts": 5,
 		// 6 -> 8 (#3218): the resolved-blocker filter keys each current blocker
 		// record.
-		"clients/runtime-turn.ts": 8,
+		// 8 -> 9 (#4990): the demoted channel names the mark's demoted record.
+		"clients/runtime-turn.ts": 9,
 		"clients/search-read-registration.ts": 1,
 		"clients/test-runner-client.ts": 4,
-		"clients/test-runner-delivery.ts": 15,
+		// 15 -> 16 (#5259): the stage-time idle read writes its failure through
+		// the module's existing `record` helper.
+		"clients/test-runner-delivery.ts": 16,
 		"clients/turn-summary.ts": 4,
 		"clients/warm-attach.ts": 9,
 		"tools/lsp-diagnostics.ts": 1,
@@ -1483,7 +1643,6 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/metrics-history.ts": 11,
 		"clients/observed-mutation.ts": 7,
 		"clients/opaque-mutation-scan.ts": 8,
-		"clients/partial-edit-apply.ts": 6,
 		"clients/pipeline.ts": 6,
 		"clients/project-diagnostics/cache.ts": 16,
 		"clients/project-diagnostics/scanner.ts": 10,
@@ -1491,10 +1650,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// #4129 adds the word-index splice and worker heap slot's snapshot uses.
 		"clients/project-snapshot.ts": 130,
 		"clients/read-guard-branch.ts": 2,
-		"clients/read-guard-tool-lines.ts": 3,
+		"clients/read-guard-tool-lines.ts": 2,
 		"clients/read-guard.ts": 2,
 		"clients/reverse-deps.ts": 14,
-		"clients/runtime-session.ts": 45,
+		"clients/runtime-session.ts": 38,
 		"clients/runtime-tool-call.ts": 2,
 		"clients/runtime-tool-result.ts": 2,
 		"clients/session-scope.ts": 2,
@@ -1513,6 +1672,8 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// #3867 moved the coverage decision onto `hasUsableResult`: dispatcher.ts
 		// no longer compares the bare `status` field at four sites (37 -> 32), and
 		// the claimSource admission guard (#3968 F2) reads it once more (32 -> 33).
+		// The `dispatch.disabledRunners` skip names the field twice, in the latency
+		// row and in its log row, as the applies_to skip beside it does (33 -> 35).
 		"clients/actionable-warnings.ts": 5,
 		"clients/advisory-provenance.ts": 5,
 		"clients/ast-grep-client.ts": 7,
@@ -1524,15 +1685,15 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/child-unref.ts": 6,
 		"clients/config-resolve.ts": 11,
 		"clients/dead-code-client.ts": 3,
-		"clients/dispatch/dispatcher.ts": 33,
+		"clients/dispatch/dispatcher.ts": 35,
 		"clients/dispatch/integration.ts": 1,
 		"clients/dispatch/pending-runner-findings.ts": 1,
 		"clients/dispatch/runners/actionlint.ts": 2,
 		"clients/dispatch/runners/ast-grep-napi.ts": 11,
-		"clients/dispatch/runners/biome-check.ts": 10,
+		"clients/dispatch/runners/biome-check.ts": 8,
 		"clients/dispatch/runners/cpp-check.ts": 3,
 		"clients/dispatch/runners/credo.ts": 2,
-		"clients/dispatch/runners/cue-vet.ts": 8,
+		"clients/dispatch/runners/cue-vet.ts": 6,
 		"clients/dispatch/runners/dart-analyze.ts": 1,
 		"clients/dispatch/runners/detekt.ts": 6,
 		"clients/dispatch/runners/dotnet-build.ts": 4,
@@ -1542,7 +1703,7 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// #4309: folded unavailable/absent-command exits remove one status use.
 		// 5 -> 6 (#4522): the exitless-run guard reads the exit status once.
 		"clients/dispatch/runners/fish-indent.ts": 6,
-		"clients/dispatch/runners/gleam-check.ts": 7,
+		"clients/dispatch/runners/gleam-check.ts": 5,
 		"clients/dispatch/runners/go-vet.ts": 5,
 		"clients/dispatch/runners/golangci-lint.ts": 4,
 		"clients/dispatch/runners/hadolint.ts": 3,
@@ -1551,15 +1712,18 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/dispatch/runners/htmlhint.ts": 3,
 		"clients/dispatch/runners/javac.ts": 4,
 		"clients/dispatch/runners/ktlint.ts": 2,
+		// 10 -> 11 (#5008 review r2): the all-clear arm's stale-bound answer
+		// returns `status: "skipped"` instead of `succeeded` — the same
+		// `RunnerResult.status` member sense as every other row here.
 		"clients/dispatch/runners/lsp.ts": 11,
 		"clients/dispatch/runners/markdownlint.ts": 4,
 		"clients/dispatch/runners/mypy.ts": 2,
-		"clients/dispatch/runners/oxlint.ts": 12,
+		"clients/dispatch/runners/oxlint.ts": 11,
 		"clients/dispatch/runners/php-lint.ts": 2,
 		"clients/dispatch/runners/phpstan.ts": 4,
-		"clients/dispatch/runners/prisma-validate.ts": 5,
+		"clients/dispatch/runners/prisma-validate.ts": 4,
 		"clients/dispatch/runners/psscriptanalyzer.ts": 14,
-		"clients/dispatch/runners/pyright.ts": 4,
+		"clients/dispatch/runners/pyright.ts": 3,
 		"clients/dispatch/runners/rubocop.ts": 2,
 		"clients/dispatch/runners/ruff.ts": 2,
 		"clients/dispatch/runners/rust-clippy.ts": 10,
@@ -1578,19 +1742,25 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		// 14 -> 15 (#4226): the early-return runner result preserves the existing
 		// status field while disclosing a fully path-excluded query set.
 		"clients/dispatch/runners/tree-sitter.ts": 15,
-		"clients/dispatch/runners/trivy-config.ts": 10,
+		// 10 -> 9 (#4130 r2): the shared classifier replaces a status test.
+		"clients/dispatch/runners/trivy-config.ts": 9,
 		"clients/dispatch/runners/utils/availability-policy.ts": 5,
 		"clients/dispatch/runners/utils/candidate-probe.ts": 1,
 		"clients/dispatch/runners/utils/lazy-installer.ts": 3,
 		"clients/dispatch/runners/utils/runner-helpers.ts": 8,
-		"clients/dispatch/runners/utils/spawn-outcome.ts": 9,
-		"clients/dispatch/runners/utils/tool-failure.ts": 21,
+		// 9 -> 10 (#4130 r2): `processCutShort` reads the exit status once.
+		"clients/dispatch/runners/utils/spawn-outcome.ts": 10,
+		// 19 -> 20 (#4130 r2): `faultIfCutShort` builds the one partial-findings `failed` result.
+		"clients/dispatch/runners/utils/tool-failure.ts": 20,
 		"clients/dispatch/runners/vale.ts": 4,
 		"clients/dispatch/runners/yamllint.ts": 2,
-		"clients/dispatch/runners/zig-check.ts": 3,
+		"clients/dispatch/runners/zig-check.ts": 2,
 		// 5 -> 6 (#4484 r2): `reachedNoVerdict` reads the runner result's status.
 		// 6 -> 7 (#4733 r2): `checkedWholeFile` reads each latency row's status.
-		"clients/dispatch/types.ts": 7,
+		// 7 -> 8 (#4130): `faultResult` builds the one `failed` runner result.
+		// 9 -> 10 (#5258): `checkedVerdict` reads each row's runner status through
+		// `hasUsableResult`.
+		"clients/dispatch/types.ts": 10,
 		"clients/file-utils.ts": 2,
 		"clients/finding-delivery-gate.ts": 3,
 		"clients/formatters.ts": 8,
@@ -1621,7 +1791,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lsp/server.ts": 4,
 		"clients/mcp/analyze.ts": 9,
 		"clients/mcp/review.ts": 1,
-		"clients/module-report.ts": 6,
+		// 6 -> 9 (#5137): the text cell prints call-graph coverage `status` and
+		// the report's own staleness line.
+		"clients/module-report.ts": 9,
 		// 24 -> 26 (#4493): readGitHead and listGitHeadDelta read the spawn
 		// result's exit `status`, not a delivery status.
 		// 26 -> 27 (#4502): readGitStatusEntries checks the spawn result's exit
@@ -1641,13 +1813,16 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/runtime-context.ts": 4,
 		"clients/runtime-coordinator.ts": 4,
 		"clients/runtime-turn.ts": 6,
-		"clients/safe-spawn.ts": 25,
-		"clients/security-scan-client.ts": 2,
+		// 25 -> 24 (#5289): the deleted sync `isCommandAvailable` read the spawn
+		// result's exit `status` once.
+		"clients/safe-spawn.ts": 24,
+		"clients/security-scan-client.ts": 5,
 		"clients/sg-runner.ts": 32,
 		"clients/shared-checkout-guard.ts": 2,
 		"clients/skills-resolver.ts": 6,
 		"clients/spawn-timeout-cooldown.ts": 1,
-		"clients/test-runner-client.ts": 15,
+		// 15 -> 16 (#5257): the JSON parser reads the failed suite that explains an unsuccessful run.
+		"clients/test-runner-client.ts": 16,
 		"clients/tree-sitter-logger.ts": 2,
 		// 1 -> 4 (#2678): the health-check record reads the resource status
 		// twice and writes metadata.status; none denotes a delivery status.
@@ -1702,7 +1877,9 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/lsp/lombok.ts": 6,
 		// #4299: 16 -> 18; two reads of the external TypeScript package
 		// manifest's literal version field, not a pi-lens generation identity.
-		"clients/lsp/server.ts": 18,
+		// 18 -> 20 (#4914): the same read of `@effect/tsgo`'s manifest field, and
+		// the session-start line that prints the TypeScript package version.
+		"clients/lsp/server.ts": 20,
 		"clients/lsp/workspace-diagnostics-cache.ts": 6,
 		"clients/mcp/ipc.ts": 15,
 		"clients/metrics-history.ts": 3,
@@ -1770,7 +1947,10 @@ const PINS: Readonly<Record<string, Readonly<Record<string, number>>>> = {
 		"clients/pipeline.ts": 6,
 		"clients/project-diagnostics/runner-adapters/call-graph-impact.ts": 1,
 		"clients/runtime-agent-end.ts": 6,
-		"clients/runtime-turn.ts": 16,
+		// 16 -> 18 (#4617): the code-quality advisory cites the `filePath` of each
+		// kept `warning` the report was built from, so the loop variable is read
+		// twice more.
+		"clients/runtime-turn.ts": 18,
 		"clients/secret-findings.ts": 3,
 		"clients/widget-state.ts": 1,
 		"tools/ast-grep-search.ts": 6,

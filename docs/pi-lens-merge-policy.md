@@ -19,19 +19,24 @@ acceptance surface quoted from that run's log. Any self-bound inside the lane
 must sit below the job cap by a stated margin so the loud-failure path is
 reachable.
 
-Every PR body starts with `## Why`, `## Notes for the reviewer`, and
-`## Change outline`, followed by the existing `## Summary`, `## Tests`,
-`## Blast radius`, `## Class sweep`, `## Observability`, and `## Fold check`
-sections. The change outline is the changed symbol's caller/callee tree with
-`+`/`-` on moved lines; include only structural views that changed.
+Every PR body has `## Summary` (at most three sentences, counted sentences in
+its `Refs #NNN`, `Remaining #NNN:` and `Closes #NNN` lines included),
+`## Notes for the reviewer` (at most five bullets), `## Change outline`, and
+`## Proof and checks`, which holds `### Tests`, `### Class sweep`,
+`### Observability`, and `### Fold check`, plus the conditional sections the
+template lists. The change outline is the changed symbol's caller/callee tree
+with `+`/`-` on moved lines; include only structural views that changed.
+`scripts/check-pr-body.mjs` caps visible text at 5000 characters and each code
+fence at 20 lines (#5003).
 
 ## The loop, per PR
 
 1. **Review.** Spawn `pi-lens-reviewer` (worktree isolation) with the PR
    number, a one-paragraph summary of the claim, and any PR-specific attack
    angles. Self-authored and small PRs get reviewed too — the depth follows
-   the review tier below, never the priority label. Bots review the PR as well:
-   every bot thread (Greptile and others) gets a disposition reply, `fixed in
+   the review tier below, never the priority label. Bots review a PR when the
+   orchestrator requests it (`@coderabbitai review`, `@greptileai`,
+   `/agentic_review`), never on their own: every bot thread (Greptile and others) gets a disposition reply, `fixed in
    <sha>`, `accepted and disclosed`, or `rejected because <reason>`.
 2. **Fix rounds.** Send findings back to the PR's original author agent when
    its worktree survives (SendMessage — cheapest context); otherwise spawn
@@ -209,7 +214,7 @@ issue filed without one is a triage defect, not a shortcut.
 **Merge bar (user, 2026-10-18).** A PR merges when no HIGH finding is open and
 every gating check is green on the exact head. Each MEDIUM or LOW finding
 either folds into the same PR or becomes an accepted residual: the PR body
-lists it under `## Accepted residuals`, named `p3` with its severity and live
+lists it under `### Accepted residuals`, named `p3` with its severity and live
 population (for example `p3 (MEDIUM, live 0): <the gap>`), so the gap keeps a
 priority without an issue.
 A residual never becomes a follow-up issue. File an issue only for p2 or
@@ -221,9 +226,15 @@ reopen the round.
 **Known gaps (user, 2026-10-19).** An open p3 issue is an accepted known gap,
 not backlog. The orchestrator closes it as not planned with the `known-gap`
 label and lists it under its seam on the pinned tracker #4626. When a PR
-merges, its `## Accepted residuals` lines join the same tracker under their
+merges, its `### Accepted residuals` lines join the same tracker under their
 seam. A known gap reopens as p2 when it turns material: a live wrong result,
 data loss, a hang, or a leak with no bound.
+
+**Ideas go on the tracker (user, 2026-10-31).** A rule candidate, research idea
+or optional slice that no lane will start is never filed as a p3 issue. It goes
+straight onto the pinned known-gaps tracker under its seam. On 2026-10-31 five
+such issues were filed from research passes (#5083, #5091, #5093, #5094,
+#5096); three were closed onto #4835.
 
 Every reviewer **follow-up issue** generalization verdict that meets that bar is
 filed and assigned to a seam group on the tracking queue in the same turn. At each regroup, scan
@@ -237,7 +248,7 @@ reviewer. File only different-seam, blocked, decision-dependent, untouched
 pre-existing, or risk-class-changing items, as one consolidated issue per PR.
 
 Folds also decide the issue list itself, one step earlier than a review
-finding: `AGENTS.md`, "Orchestration and delegated work" states that check.
+finding: `docs/pi-lens-orchestration.md` states that check.
 
 A brief carries the lane's facts and the task, and points at the role
 contract for everything else. Lane facts are the worktree, branch, base,
@@ -261,15 +272,15 @@ These are the habits the train depends on. They live here, not in any one
 operator's private notes, so a different orchestrator can run the same train.
 
 - **Contracts move in the same session.** When a review or a dogfood finding
-  reveals a defect CLASS (not an instance), add a numbered shape to AGENTS.md's
-  catalog with the issue ref and a one-line screen, extend the fixer's screen
+  reveals a defect CLASS (not an instance), add a numbered shape to the defect-shape
+  catalog (`docs/defect-shapes.md`) with the issue ref and a one-line screen, extend the fixer's screen
   list, and cite the number in the next brief — before the next dispatch. "To
   err twice is not the mark of a wise man." (2026-09-03: shapes 28–36 came out
   of one day's reviews this way.)
 - **Second instance of a catalogued shape opens the consolidation lane, not a
   third instance fix (2026-09-09).** The trigger is the shape recurring at all,
   not only twice in one session: when a review, an issue or a dogfood finding
-  is the second member of a shape already in AGENTS.md's catalog, the
+  is the second member of a shape already in the defect-shape catalog, the
   orchestrator files the consolidation lane BEFORE the second instance merges,
   with three fixed deliverables: one seam every consumer calls, one log line
   per resolution (which value was chosen and why, throttled once per key per
@@ -312,7 +323,7 @@ operator's private notes, so a different orchestrator can run the same train.
   | a change that touches identifier uses of a glossary-retired synonym | run `tests/config/glossary-synonym-sweep.test.ts` on the head AND on the merge with `origin/master`, then re-pin in the PR from the sweep's own `UNPINNED`/`STALE` output — #3279, #3283, #3284, #3288 |
   | a new `vi.mock` in a test file | run `tests/config/vi-mock-export-sweep.test.ts`; whole-module mocks of a production module must spread `importOriginal` — PR #3268's CI red, fixed by trailing commit `621d61c5c` |
   | a changelog fragment | front matter `section: <Section>` plus `audience: user` or `audience: internal` and exactly one top-level entry; new user entries open with a bold lead of at most 100 characters (refs excluded), never `CHANGELOG.md`, validated by `node scripts/check-changelog-fragments.mjs` — PR #3268 r1 shipped `category:` and a paragraph |
-  | a PR body | the header gate: exactly one-sentence `## Why`, `## Notes for the reviewer`, `## Change outline`, plus Summary / Tests with `### Test assessment` / Blast radius / Class sweep / Fold check / Observability; run `node scripts/check-pr-body.mjs --lint-local` before pushing — three PRs this week needed orchestrator body edits |
+  | a PR body | the header gate: `## Summary`, `## Notes for the reviewer`, `## Change outline`, plus Tests / Class sweep / Fold check / Observability, inside the caps; run `node scripts/check-pr-body.mjs --lint-local` before pushing — three PRs this week needed orchestrator body edits |
   | a whole-tree docs restructure of `AGENTS.md` | every governance test that reads `AGENTS.md`, with markers on their own lines — PR #3265 r1 |
   | a raw poll in a test | the flake-shape ratchet; the fix is the governed wait, never a header admission — #2781 r1 |
   | a new, renamed or deleted rule file under `rules/` | `npm run docs:rule-catalogs` and commit the generated catalog; `tests/scripts/rule-catalogs.test.ts` is a strict consumer of every rule file, not of rule ids — #3214 r1 |
@@ -366,8 +377,9 @@ operator's private notes, so a different orchestrator can run the same train.
   applies to human PRs; a bump title can never carry a ref. Merge order: one
   at a time (each merge dirties the rest; dependabot rebases them itself);
   gate on Lint, Unit tests and every non-advisory check on the exact head;
-  pr-metadata.yml itself skips "PR title", "PR body (advisory)" and
-  "Close-keyword syntax" for dependabot (2026-09-09, refs #2714), so nothing
+  pr-metadata.yml itself skips "PR metadata" (the title and close-keyword
+  checks, one job since #5002) and "PR body (advisory)" for dependabot
+  (2026-09-09, refs #2714), so nothing
   needs hand-ignoring; hold anything red on a real check
   with a comment naming the check (2026-09-07: tsls 6 needs a Node-floor bump, biome
   fails the install test, vitest 5 fails four gates; a bump whose install
@@ -418,7 +430,7 @@ operator's private notes, so a different orchestrator can run the same train.
   also fine). The merge loop is
   `node scripts/ci-verdict.mjs <pr> --wait <seconds>` — read its final line:
   0 merge, 3 still pending (re-arm the wait), anything else read the table. Never
-  text-match the table for `failure`: advisory rows (PR body, Vale)
+  text-match the table for `failure`: advisory rows (PR body, Lint (advisory))
   print `failure` while the verdict is green, and on 2026-09-07 that stopped
   the #2692 loop on a green PR.
 - **Maintainer trailing commits** are for intent-free deltas only (a literal
@@ -435,7 +447,8 @@ operator's private notes, so a different orchestrator can run the same train.
   `final-review`; NOT borrowed from it: auto-fixing null checks, error
   handling or cleanup hooks, which change meaning.
 - **Allocate the catalog number at MERGE, not at dispatch (2026-09-15).**
-  AGENTS.md's defect-shape catalog is a markdownlint MD029 ordered list: the
+  The defect-shape catalog (`docs/defect-shapes.md`) is a markdownlint MD029
+  ordered list: the
   number is the list position, so dispatch-time reservations create a gap on
   branches whose holder has not merged. The orchestrator owns allocation; a
   lane may draft a shape but must not claim a number. At merge, insert or
@@ -516,7 +529,7 @@ operator's private notes, so a different orchestrator can run the same train.
   the verdict table for `failure`, because advisory rows print `failure` on a
   green PR. But "does not gate" is not "carries no information", and filtering
   advisory rows out of your attention is a different mistake from filtering
-  them out of the gate. `typos (advisory)` found a real defect in #2955's
+  them out of the gate. The typos step of `Lint (advisory)` found a real defect in #2955's
   round-12 diff — a comment in which "reading" was misspelt — which the
   gating checks had no opinion about and which would otherwise have reached
   master. (The misspelling is described rather than reproduced here: quoting
@@ -553,16 +566,20 @@ operator's private notes, so a different orchestrator can run the same train.
   DETECTION lesson in one line: which verification layer caught it and which
   layer SHOULD have caught it earlier and at what cost. The accepted layer
   words are the `DETECTION_LAYERS` list exported by `scripts/check-pr-body.mjs`,
-  which the `## Detection` body check reads; the prose does not restate them.
-  `nightly` may carry its workflow as `nightly:<workflow>`, and a bug-closing
-  PR is refused when `Caught by:`, `Should have been caught by:`, the reason
-  after `Gap: none:`, the `Shape: new:` name or the `Enforcer: none:` reason is
-  a placeholder (starts with `unknown`, or is exactly `n/a`, `tbd` or `?`)
+  which the `### Detection` body check reads; the prose does not restate them.
+  `nightly` may carry its workflow as `nightly:<workflow>`. A PR that only
+  references a `bug` or `nightly-drift` issue, in its body or its title, owes
+  the section too (#4968: the 2026-10-29 audit found 24 bug-linked PRs merged
+  in one week with `Refs #N` and no lesson). A PR that owes the section is refused when `Caught by:`,
+  `Should have been caught by:`, the reason after `Gap: none:`, the
+  `Shape: new:` name or the `Enforcer: none:` reason is a placeholder (starts
+  with `unknown`, or is exactly `n/a`, `tbd` or `?`)
   (#4519: 139 of 363 closed bugs read unknown in the 2026-10-16 retro).
   If that layer does not exist, file it as an issue with the bug as
   its named recurrence — the same standard shapes are held to. The lesson
   names the defect SHAPE and its tree-wide enforcer, not only a test for the
-  instance: the Gap names the `AGENTS.md` catalog shape (or a new shape) and
+  instance: the Gap names the `docs/defect-shapes.md` catalog shape (or a new
+  shape) and
   either a test that scans the whole population, an issue to build one, or
   `judgment-only` with the reason. A one-bug test is the fix's regression
   test, not the closed gap (lint half: #4439). The ledger
@@ -718,7 +735,7 @@ Each row cost a lane at least once; the prose above carries the record.
 | Reviewing a branch head that no longer carries master | Reviewer merges origin/master into the scratch checkout first; CONFLICTING is not reviewable (#2808 vs #2795) |
 | Pushing docs, config or data straight to master without preflight | `npm run preflight` on the exact tree first; three master reds on 2026-09-09 |
 | Nudging a capped small-model lane more than once | One continuation, then reassign to the strongest model (GLM lanes, 2026-09-09) |
-| Waiting on CI for a bot-authored PR (github-actions nightly refresh) | A GITHUB_TOKEN push fires no `pull_request` run: required checks stay ABSENT forever; close/reopen the PR to fire them (#2801, 2026-09-09) |
+| Waiting on CI for a bot-authored PR (github-actions nightly refresh) | A GITHUB_TOKEN push fires no `pull_request` run. Since #5062 the opening job dispatches `ci.yml` and `lint.yml` on the bot branch (`docs/ci-bot-pr-checks.md`); a bot PR still BLOCKED with every check absent means that dispatch step failed or did not run: read the nightly's `Open refresh PRs` job, then close/reopen to fire the checks (#2801, 2026-09-09) |
 | Leaving a design question to the fixer (where evidence comes from, which identity rule) | Decide it in the brief; #2900 oscillated three rounds (walker → findings → walker again) until round 4's brief fixed the evidence source (2026-09-10) |
 | Guessing a lane's branch name when writing a brief | Read `gh pr view N --json headRefName` in the same command that builds the brief; plegma refused two dispatches on invented refs (#2908, #2898; 2026-09-10) |
 | `git add -A -- . ':!<ignored file>'` in a chained command | The exclude pathspec on an IGNORED path makes `git add` exit 1 and the chain stops before the commit; use plain `git add -A` (ignored files never stage) and verify the index afterwards (2026-09-10, twice) |
@@ -821,7 +838,7 @@ Each row cost a lane at least once; the prose above carries the record.
 | Routing on the word "governance" instead of the risk | #4350 (a CodeQL pin-equality test) went to Opus as "governance authoring"; the Opus rule is for source-scanning detectors only. |
 | Leaving the `dist/` precondition undeclared | At least 5 lanes (#4417, #4418, the #4422 verify, the #4410 r1 review, the #4423 review F5) each ruled out the same 3 census reds that need `npm run build:dist` (2026-10-14). Mechanical: fail fast when a selected test needs `dist/` and it is missing or stale (#4436); `CLAUDE.md` names `npm run build:dist` for those files meanwhile |
 | A wait helper with a fixed wall-clock budget | `interleaving-kit` `waitFor` ran out at 3000 ms under CI load (run 38618401454, `tests/clients/fix-run-restore.test.ts:378`); the file passed alone and under 3 shuffle seeds, so the red read as a flake. Mechanical, filed as #4437 |
-| Briefing a worker to "report the size first" before a large migration | A worker cannot wait for a reply, so the #4432 fixer did the migration anyway (2026-10-14). A brief authorizes the conditional branch with its bound, or tells the worker to stop and hand back; `AGENTS.md` "Orchestration and delegated work" |
+| Briefing a worker to "report the size first" before a large migration | A worker cannot wait for a reply, so the #4432 fixer did the migration anyway (2026-10-14). A brief authorizes the conditional branch with its bound, or tells the worker to stop and hand back; `docs/pi-lens-orchestration.md` |
 | Naming a file by basename in a brief | "index.ts" meant `clients/lsp/index.ts`; a Haiku measurement pass searched the root `index.ts` and reported the #2052 comment missing (2026-10-14). Name every file by its repo path |
 | Sending a lane that must find its own failure space to Haiku | #4342 rounds 1 and 2 left three review findings (a wall-clock bound, a wrong offline premise, a 13-vs-20 population); a fresh Opus round with a state table passed verify first time (#4410 round 3). Haiku folds with a prescribed remedy (#4340, #4341, #4345, #4356, #4368, #4372, #4374, #4417) landed first try. Haiku takes only a prescribed change; `AGENTS.md` "Orchestration and delegated work" |
 | Listing a blast radius without the changed result's callers | #4411 round 3 changed `touchFile`'s result and the body omitted the cascade neighbour caller (`clients/dispatch/integration.ts:2139`), which then printed an uncaused "inconclusive" line every turn (review N2). `AGENTS.md` already requires `module_report` with `blastRadius: true` before and after; run it for the changed result and quote every caller, then read each one |
@@ -830,7 +847,7 @@ Each row cost a lane at least once; the prose above carries the record.
 | Concluding "no existing seam does this" from a search of your own call names | #4528 searched `notifyExternalFileChange\(` and missed six freshness modules in `clients/`; five detectors ended up wiring their own consumers (#4535). Search by primitive (`docs/pi-lens-fixer.md` "Before code"); the reviewer widens the query (`docs/pi-lens-reviewer.md`, #4536) |
 | Importing `dist/` from a script a workflow runs before any build | #4525's `scripts/assert-evaluated.mjs` reached `dist/` through `lib/clean-signal.mjs`, so `tool-smoke-prs` would fail on every refresh PR. #4531 pins the import graph with a test and plants |
 | Pinning workflow step shell as text instead of running it | #4531 r1: four mutations of the Swift, APFS and handshake shell survived, including deleting `set +e`. Run the extracted step shell against stubs in a test |
-| Filing gap after gap on one mechanism without an audit | Eleven freshness gaps went into #4532 before anyone asked why there were eleven; the cause was one missing fan-out (#4535). Three issues on one mechanism open a consolidation audit (`AGENTS.md` "Orchestration and delegated work") |
+| Filing gap after gap on one mechanism without an audit | Eleven freshness gaps went into #4532 before anyone asked why there were eleven; the cause was one missing fan-out (#4535). Three issues on one mechanism open a consolidation audit (`docs/pi-lens-orchestration.md`) |
 | Landing with an unresolved bot review thread | #4548 and #4558 merged with open Greptile threads (2026-10-17); each one's disposition arrived or never did, and nothing held the land. Every bot thread gets a disposition reply and is resolved before the merge (step 1 and step 4 of "The loop, per PR") |
 | Pushing a worker tree on a stale "failed" settlement | The #4575 r5 settlement read as failed while its resumed turn was live and about to push (plegma #752). The orchestrator's push-verify now refuses a tree with a live agent process, and its wait loop takes a `turnId`. |
 | Settling a fix round with unpushed commits | #4582 r1 settled with the commits still local and nobody noticed (plegma #753). The settlement hook now prints `UNPUSHED` or `DIRTY` for the tree it just settled. |
@@ -844,9 +861,14 @@ Each row cost a lane at least once; the prose above carries the record.
 | Pushing to a PR branch while a fix round is queued against its old head | Merging master into #4594 staled the queued round's lease; the worker pushed a diverged copy to its handle branch (plegma #723). The orchestrator's push-verify refuses while a round still publishes to that branch. |
 | Resuming a reviewer without naming the deliverable | The resumed verifies of #4575 and #4593 inherited report names that did not match the brief, so the hand-back missed the report. Every resumed round names its `deliverables` explicitly. |
 | Calling an issue "blocked on a release" without reproducing it on master | #4554 waited on a release; 58 runs on master did not reproduce it, and it closed crediting #4563. Reproduce on master before naming a blocker. |
-| Bolding a residual bullet (`- **p3 (LOW, live 0):**`) under `## Accepted residuals` | The tracker parser read only a bare `p3`, so #4832's three residuals were recorded as "none" (2026-10-25). `known-gap-add.sh` now reads the bold form, pinned by its test case (g) |
+| Bolding a residual bullet (`- **p3 (LOW, live 0):**`) under `### Accepted residuals` | The tracker parser read only a bare `p3`, so #4832's three residuals were recorded as "none" (2026-10-25). `known-gap-add.sh` now reads the bold form, pinned by its test case (g) |
 | Planning a tracker layout before measuring the platform's limits | An 11-issue pinned split was proposed and dispatched; GitHub pins 3 issues per repository, and the assumed 65k body cap was already exceeded by #4626 at 91k (2026-10-25). Measure the limit first, then plan |
 | Pasting the `claude-lane.sh` header into a brief | The header began `Worktree (created, ...):`, the brief guard wants `Worktree:`, and two dispatches were refused (2026-10-25). The header now starts with `Worktree:`, pinned by `test-claude-lane-header.sh` |
 | Linting a PR body in the main checkout | The main checkout sits on another branch, so citations resolved against the wrong tree; three edits needed a hand-built head tree (2026-10-25). `pr-body.sh edit` without `--tree` now builds a temp tree at the PR head |
 | Guessing issue labels (`area:ci`, `area:formal`, `chore`) | Three filings were refused, and the refusal listed only priority labels (2026-10-25). `file-issue.sh` now lists the known type, area and priority labels |
 | Reaping a lane whose issue is closed while its ledger row is live | Two maintainer-ordered lanes on closed issues (#4714, #4691) were flagged for TaskStop (2026-10-25). `agent-reap.sh` now skips a closed issue with a live ledger row |
+| Dispatching four heavy plegma workers while a local model server runs | The host ran out of memory, hung, and took the daemon and two reviews with it (2026-11-02). The cap is two heavy workers while `ds4-server` or `llama-server` runs, and the orchestrator dispatch guard now lowers the daemon's live heavy cap to two while either process runs |
+| Regenerating `package-lock.json` with the npm on PATH | npm 9.2 dropped every `libc` field twice in one day (#5200, the #5201 bump), and npm 11.18.0 had to redo it. Regenerate only with `npx npm@11.18.0 install --package-lock-only --ignore-scripts`. The default `check:lockfile` reads `libc` only on the root entry, so it does not refuse the drop yet; #5207 (open) adds that refusal |
+| Applying a reviewer's reuse prescription without its ratchets | Verify r3 on #5202 asked to import `REAL_NODE_MODULES` from lane-check-kit; that module imports `child_process`, and the flake-shape real-process-spawn ratchet then flagged the test (2026-11-02). Run the governance suite on a prescription before pushing it; the round reverted to the local path |
+| Bisecting a worktree-only red by hand | Three unrelated files red in one plegma tree and green on master; an hour of bisecting ended at a stale shared `node_modules/.vitest-cache` (2026-11-02). Rerun once with `--fsModuleCache=false` before bisecting; #5212 moved Vitest's module cache (`fsModuleCachePath`) into each worktree's `.vitest-cache`, so new runs stop writing the shared copy. The old copy in the main install stays until someone deletes it, and the runtime `vitest.config.mjs` from `tests/support/lane-check-kit.ts` still writes there (accepted residual) |
+| Dispatching a user-facing design before the maintainer has seen the output | #5202 round 4 was interrupted twice as the maintainer moved from full prose to headlines to a straight copy of the release bodies (2026-11-02). Show the rendered sample and agree the design before the round |

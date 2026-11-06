@@ -4,6 +4,8 @@
 
 # pi-lens
 
+[![omp status](https://omppackages.com/badge/pi-lens.svg)](https://omppackages.com/packages/pi-lens)
+
 pi-lens gives AI coding agents fast, language-aware feedback while they write/edit.
 
 > **Working in this project as an AI agent?** Read the [agent guide](docs/agent-guide.md)
@@ -136,7 +138,7 @@ flowchart TD
 Architecture-level view, updated when a lane changes. Per-tool inventories live
 in [features](docs/features.md) and
 [language coverage](docs/language-coverage.md). Today the edit-time lane carries
-45+ runner modules over 35+ file kinds, and the LSP lane speaks to 47
+45+ runner modules over 35+ file kinds, and the LSP lane speaks to 50
 language server definitions.
 
 The gating box is an abstraction, not a call order. Freshness covers several
@@ -186,6 +188,36 @@ expects to be operated.
 > "Lifecycle-script approvals"). Installing from a git source (`pi install
 > git:...` / `pi update --extension git:...`) may similarly prompt for
 > git-dependency approval; accept it to let the `prepare` build step run.
+
+### Android/Termux fallback
+
+Try the normal install first. If it fails in `@ast-grep/cli`'s
+`postinstall.js` with `Failed to locate @ast-grep/cli native binary`, the
+fallback below has worked in one Termux environment:
+
+```bash
+pkg install rust clang
+cargo install ast-grep --locked
+ast-grep --version
+npm_config_ignore_scripts=true pi install npm:pi-lens
+```
+
+`npm_config_ignore_scripts=true` skips every dependency lifecycle script for
+that `pi install` command, not only the failing `@ast-grep/cli` script. Use it
+only for this fallback after installing and checking the Rust-built `ast-grep`
+binary separately. `pi update` runs the same postinstall, so set the variable
+for it too. `ast-grep --version` must succeed from a new shell, which means
+`~/.cargo/bin` is on your `PATH`.
+
+In the verified environment, `/lens-health` reported zero pipeline crashes and
+listed the `ast-grep` and `bash` LSP servers as available. This confirms startup
+and server discovery only; `ast_grep_search` was not tested end to end.
+
+pi-lens only looks for an `ast-grep` on `PATH` (such as Cargo's
+`~/.cargo/bin/ast-grep`) when pi trusts the project, so in an untrusted
+project this fallback leaves `ast_grep_search` unavailable. The in-process
+ast-grep rules (`@ast-grep/napi`) and Biome have no Android build, so they stay
+unavailable either way.
 
 ## Documentation
 
@@ -500,11 +532,26 @@ Thanks goes to these wonderful people:
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/Nyarlathoteppppp"><img src="https://avatars.githubusercontent.com/u/126082256?v=4" width="100px;" alt=""/><br /><sub><b>bowen xu</b></sub></a><br /><a href="#code-Nyarlathoteppppp" title="Code">💻</a> <a href="https://github.com/apmantza/pi-lens/commits?author=Nyarlathoteppppp" title="Tests">⚠️</a></td>
     </tr>
     <tr>
-      <td align="center" valign="top" width="14.28%"><a href="https://github.com/dmae97"><img src="https://avatars.githubusercontent.com/u/146327957?v=4" width="100px;" alt=""/><br /><sub><b>dmae97</b></sub></a><br /><a href="#code-dmae97" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/dmae97"><img src="https://avatars.githubusercontent.com/u/146327957?v=4" width="100px;" alt=""/><br /><sub><b>dmae97</b></sub></a><br /><a href="#code-dmae97" title="Code">💻</a> <a href="#bug-dmae97" title="Bug reports">🐛</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/Battlelamb"><img src="https://avatars.githubusercontent.com/u/12995996?v=4" width="100px;" alt=""/><br /><sub><b>Battlelamb</b></sub></a><br /><a href="#code-Battlelamb" title="Code">💻</a></td>
-      <td align="center" valign="top" width="14.28%"><a href="http://wayneh.tw/"><img src="https://avatars.githubusercontent.com/u/5166321?v=4" width="100px;" alt=""/><br /><sub><b>WeiHung</b></sub></a><br /><a href="#code-wayne930242" title="Code">💻</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="http://wayneh.tw/"><img src="https://avatars.githubusercontent.com/u/5166321?v=4" width="100px;" alt=""/><br /><sub><b>WeiHung</b></sub></a><br /><a href="#code-wayne930242" title="Code">💻</a> <a href="#ideas-wayne930242" title="Ideas & Planning">🤔</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/wertyMSD"><img src="https://avatars.githubusercontent.com/u/130595241?v=4" width="100px;" alt=""/><br /><sub><b>wertyMSD</b></sub></a><br /><a href="#bug-wertyMSD" title="Bug reports">🐛</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/rcdailey"><img src="https://avatars.githubusercontent.com/u/1768054?v=4" width="100px;" alt=""/><br /><sub><b>Robert Dailey</b></sub></a><br /><a href="#bug-rcdailey" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://twitter.com/letwir"><img src="https://avatars.githubusercontent.com/u/16576177?v=4" width="100px;" alt=""/><br /><sub><b>letwir</b></sub></a><br /><a href="#doc-letwir" title="Documentation">📖</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="http://www.erikdarling.com/"><img src="https://avatars.githubusercontent.com/u/2136037?v=4" width="100px;" alt=""/><br /><sub><b>Erik Darling</b></sub></a><br /><a href="#bug-erikdarlingdata" title="Bug reports">🐛</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/Silvio-Re"><img src="https://avatars.githubusercontent.com/u/5860449?v=4" width="100px;" alt=""/><br /><sub><b>Silvio</b></sub></a><br /><a href="#bug-Silvio-Re" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/forge18"><img src="https://avatars.githubusercontent.com/u/31629847?v=4" width="100px;" alt=""/><br /><sub><b>forge18</b></sub></a><br /><a href="#ideas-forge18" title="Ideas & Planning">🤔</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/paymog"><img src="https://avatars.githubusercontent.com/u/1986950?v=4" width="100px;" alt=""/><br /><sub><b>Paymahn Moghadasian</b></sub></a><br /><a href="#doc-paymog" title="Documentation">📖</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/vjda"><img src="https://avatars.githubusercontent.com/u/20127271?v=4" width="100px;" alt=""/><br /><sub><b>Victor J. Diaz Ayuste</b></sub></a><br /><a href="#ideas-vjda" title="Ideas & Planning">🤔</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/GlitchOverride"><img src="https://avatars.githubusercontent.com/u/112761176?v=4" width="100px;" alt=""/><br /><sub><b>GlitchOverride</b></sub></a><br /><a href="#bug-GlitchOverride" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/sbscan"><img src="https://avatars.githubusercontent.com/u/18386839?v=4" width="100px;" alt=""/><br /><sub><b>Can Gürcan</b></sub></a><br /><a href="#ideas-sbscan" title="Ideas & Planning">🤔</a> <a href="#bug-sbscan" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/zackchiutw"><img src="https://avatars.githubusercontent.com/u/107488700?v=4" width="100px;" alt=""/><br /><sub><b>Zachary Chiu</b></sub></a><br /><a href="#bug-zackchiutw" title="Bug reports">🐛</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/yxlimo"><img src="https://avatars.githubusercontent.com/u/13878887?v=4" width="100px;" alt=""/><br /><sub><b>ShayLu</b></sub></a><br /><a href="#bug-yxlimo" title="Bug reports">🐛</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/aprudkin"><img src="https://avatars.githubusercontent.com/u/126267327?v=4" width="100px;" alt=""/><br /><sub><b>aprudkin</b></sub></a><br /><a href="#bug-aprudkin" title="Bug reports">🐛</a></td>
     </tr>
   </tbody>
 </table>

@@ -53,6 +53,7 @@ interface LspMutationRuntime {
 		source: ProjectChangeSource;
 		cwd?: string;
 		changedRange?: ProjectChangeRange;
+		sessionId?: string | undefined;
 		onAppendError?: (err: unknown) => void;
 	}) => { projectSeq: number; fileSeq: number };
 	telemetrySessionId?: string;
@@ -167,6 +168,14 @@ export interface LspMutationContext {
 	 * branches for the exact same kind of write.
 	 */
 	isRecordable?: (filePath: string) => boolean;
+	/**
+	 * #5248: the files this context's mutation recorded, once each: the paths
+	 * that passed `isRecordable` and, on the bridge fallback, the bridge
+	 * accepted. A caller that wants them (`lsp_navigation`, which reports them
+	 * as `details.appliedFiles`) passes `[]`; every other context leaves it
+	 * unset and collects nothing.
+	 */
+	acceptedFiles?: string[];
 }
 
 export interface LspMutationSummaryOptions {
@@ -369,6 +378,8 @@ function bookkeepLspMutation(
 			context.dbg?.(`lsp mutation not recordable, skipping ${filePath}`);
 			continue;
 		}
+		// #5248: stays true unless the bridge fallback below drops the path.
+		let accepted = true;
 		if (sessionLive && context.readGuard) {
 			try {
 				// #3525: the server computed these bytes; the agent never saw
@@ -411,6 +422,7 @@ function bookkeepLspMutation(
 				// varies per LSP operation — "lsp_navigation:rename" vs
 				// "...executeCommand" — so the SAME session could log this
 				// degradation once per operation kind instead of truly once).
+				accepted = false;
 				recordDegradationOnce({
 					kind: "lsp-mutation-bridge-unmounted",
 					subject: "lsp-mutation:no-bridge",
@@ -472,6 +484,7 @@ function bookkeepLspMutation(
 						}),
 					});
 					if (!recorded) {
+						accepted = false;
 						context.dbg?.(
 							`lsp mutation bridge dropped ${filePath} (recordMutation() ` +
 								"returned false — see the mutation_bridge debug output " +
@@ -480,6 +493,7 @@ function bookkeepLspMutation(
 						);
 					}
 				} catch (err) {
+					accepted = false;
 					context.dbg?.(
 						`lsp mutation bridge fallback failed for ${filePath}: ${err}`,
 					);
@@ -494,6 +508,8 @@ function bookkeepLspMutation(
 				source: context.source as ProjectChangeSource,
 				cwd: context.cwd,
 				changedRange: detail.range,
+				// #4943: the issuing activation's change-log row.
+				sessionId: context.sessionId,
 				onAppendError: (err) =>
 					context.dbg?.(
 						`lsp mutation project change append failed for ${filePath}: ${err}`,
@@ -553,6 +569,12 @@ function bookkeepLspMutation(
 				context.recordAutofix(filePath);
 			}
 		}
+		if (
+			accepted &&
+			context.acceptedFiles &&
+			!context.acceptedFiles.includes(filePath)
+		)
+			context.acceptedFiles.push(filePath);
 	}
 	if (context.publishFilesTouched && files.length > 0) {
 		context.publishFilesTouched(files);

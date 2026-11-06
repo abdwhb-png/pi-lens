@@ -52,6 +52,8 @@ import {
 	cleanupTestEnvironmentsDrained,
 	setupTestEnvironment,
 } from "./test-utils.js";
+import { useConfigPath } from "../support/global-config.js";
+const setConfigPath = useConfigPath();
 
 const repoRoot = path.resolve(
 	path.dirname(fileURLToPath(import.meta.url)),
@@ -69,7 +71,7 @@ const PREFIX = "pi-lens-4403-cascade-";
 const turnEndCap = RUNTIME_CONFIG.turnEnd as { maxChars: number };
 
 const cascadeLine = (ids: string, cause: string): string =>
-	`⚠️ Cascade: no language server answered for neighbor files of ${ids} (${cause}), so their cross-file errors were not checked (not a clean result).`;
+	`⚠️ Cascade: no primary language server answered for neighbor files of ${ids} (${cause}), so their cross-file errors were not confirmed (not a clean result).`;
 
 // The cause matrix moved to the tier-2 file (#4632 slice 7); this file keeps
 // only the cap-bound cells, which need a compile-time constant, and the one
@@ -200,11 +202,10 @@ async function runTurns(
 	turns: readonly Turn[],
 ): Promise<string[][]> {
 	const workspace = makeWorkspace(testCase);
-	const savedConfigPath = process.env.PI_LENS_CONFIG_PATH;
 	const savedInstall = process.env.PI_LENS_DISABLE_LSP_INSTALL;
 	const configPath = path.join(workspace, "global-config.json");
 	fs.writeFileSync(configPath, "{}\n");
-	process.env.PI_LENS_CONFIG_PATH = configPath;
+	setConfigPath(configPath);
 	process.env.PI_LENS_DISABLE_LSP_INSTALL = "1";
 	let shutdown: (() => Promise<unknown>) | undefined;
 	const savedMaxChars = turnEndCap.maxChars;
@@ -252,8 +253,6 @@ async function runTurns(
 		await shutdown?.();
 		await getLSPService().shutdown();
 		resetLSPService();
-		if (savedConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-		else process.env.PI_LENS_CONFIG_PATH = savedConfigPath;
 		if (savedInstall === undefined)
 			delete process.env.PI_LENS_DISABLE_LSP_INSTALL;
 		else process.env.PI_LENS_DISABLE_LSP_INSTALL = savedInstall;

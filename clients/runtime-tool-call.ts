@@ -1,10 +1,10 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
-import { loadBootstrapClients, requestBootstrapClients } from "./bootstrap.js";
+import { requestBootstrapClients } from "./bootstrap.js";
 import type { CacheManager } from "./cache-manager.js";
 import { resolveSessionConfigRoot } from "./analysis-root.js";
 import { recordDegradationOnce } from "./degradation-ledger.js";
-import { detectFileKind } from "./file-kinds.js";
+import { CODE_KINDS, detectFileKind } from "./file-kinds.js";
 import { isPathIgnoredByProject } from "./file-utils.js";
 import { evaluateGitGuard, isGitCommitOrPushAttempt } from "./git-guard.js";
 import { dropHashlineAnchorMemo } from "./hashline-anchor.js";
@@ -34,15 +34,19 @@ import {
 	noteAgentCallStart,
 } from "./fix-run-restore.js";
 import { LANGUAGE_POLICY } from "./language-policy.js";
-import { isComplexitySupportedFile } from "./tree-sitter-shared.js";
+import {
+	getSharedTreeSitterClient,
+	isComplexitySupportedFile,
+	resolveTreeSitterLanguage,
+} from "./tree-sitter-shared.js";
 import {
 	classifyMutatingTool,
+	isProviderReplayCall,
 	readMutationPathField,
 } from "./mutating-tool.js";
 import { isProvisionalLearnedAttribution } from "./mutation-attribution.js";
 import { armObservedMutation } from "./observed-mutation.js";
 import { extractWrittenPathsFromCommand } from "./bash-file-access.js";
-import type { LSPShutdownOptions } from "./lsp/client.js";
 import { getLSPService } from "./lsp/capabilities.js";
 import {
 	findDocumentSymbolAtLine,
@@ -50,11 +54,11 @@ import {
 	lspSymbolKindName,
 	qualifiedLspSymbolName,
 } from "./lsp-document-symbols.js";
+import { isLspRequestTimeoutError } from "./lsp/request-timeout-error.js";
 import {
 	computeTrailingWhitespaceOldTextPatch,
 	findUniqueMatchLineRange,
 } from "./oldtext-autopatch.js";
-import { applyPartiallyApplicableEdits } from "./partial-edit-apply.js";
 import {
 	isExternalOrVendorFile,
 	resolveToolCallFilePath,
@@ -67,25 +71,25 @@ import {
 } from "./read-expansion.js";
 import { scanFileLines } from "./read-guard.js";
 import {
+	boundedEditIndexes,
 	boundedIndexesForCount,
 	createReadGuardEditBatchSummary,
+	formatBoundedEditIndexes,
 	getReadGuardCorrelationId,
 	logReadGuardEvent,
 } from "./read-guard-logger.js";
 import {
-	formatAlreadyAppliedNotes,
 	getTouchedLinesForGuard,
 	relocateEditRange,
 	tryCorrectIndentationMismatch,
 	tryCorrectIndentationMismatchFromContent,
 } from "./read-guard-tool-lines.js";
 import type { RuntimeCoordinator } from "./runtime-coordinator.js";
-import { handleToolResult, resyncHeadMove } from "./runtime-tool-result.js";
+import { resyncHeadMove } from "./runtime-tool-result.js";
 import {
 	resolveReadEvidenceCorrelationId,
 	resolveToolCallCorrelationId,
 } from "./tool-event.js";
-import { getSharedTreeSitterClient } from "./tree-sitter-shared.js";
 import { loadDispatchIntegration } from "./dispatch/lazy.js";
 
 const LSP_TOOLCALL_NAV_TOUCH_BUDGET_MS = Math.max(
@@ -101,39 +105,6 @@ const LSP_TOOLCALL_TOUCH_BUDGET_MS = Math.max(
 	0,
 	Number.parseInt(process.env.PI_LENS_TOOLCALL_TOUCH_MS ?? "750", 10) || 750,
 );
-
-/**
- * Composes the final block reason for a partial apply whose commit landed
- * (#2402). The committed bytes lead the message; the preflight's per-edit
- * failure bodies follow UNCHANGED, so they still describe exactly the edits
- * that were NOT applied. The preflight header (🔄/🛑) is never reused here —
- * relabelling committed edits as a retryable oldText miss is the #2402 defect.
- */
-function composePartialApplyReason(args: {
-	appliedCount: number;
-	appliedIndices: string;
-	postEditStatus: "succeeded" | "failed";
-	postEditOutput?: string;
-	preflightDetails?: string[];
-	alreadyAppliedEdits?: number[];
-}): string {
-	const parts: string[] = [];
-	const editSuffix = args.appliedCount === 1 ? "" : "s";
-	parts.push(
-		args.postEditStatus === "failed"
-			? `⚠️ PARTIAL APPLY — ${args.appliedCount} edit${editSuffix} committed (${args.appliedIndices}). Post-edit analysis failed after the commit; the committed bytes stand and were not reverted. Do NOT resubmit the applied edits.`
-			: `⚠️ PARTIAL APPLY — ${args.appliedCount} edit${editSuffix} committed (${args.appliedIndices}). Do NOT resubmit the applied edits.`,
-	);
-	if (args.preflightDetails && args.preflightDetails.length > 0) {
-		parts.push(args.preflightDetails.join("\n\n"));
-	}
-	const alreadyNotes = formatAlreadyAppliedNotes(args.alreadyAppliedEdits);
-	if (alreadyNotes) parts.push(alreadyNotes.trimStart());
-	if (args.postEditOutput && args.postEditStatus === "succeeded") {
-		parts.push(`Post-apply analysis:\n${args.postEditOutput}`);
-	}
-	return parts.join("\n\n");
-}
 
 function getToolCallRawFilePath(
 	toolName: string,
@@ -153,6 +124,16 @@ function getToolCallRawFilePath(
 	}
 
 	if (toolName === "lsp_navigation") {
+		// #3650: the tool declares its target as `path`
+		// (`tools/lsp-navigation.ts:863`). Reading `filePath` first left every
+		// read-only navigation call with no path at all, so nothing resolved and
+		// every path-keyed step below (`if (!filePath) return;` included) was
+		// skipped for a file the call had just named. `filePath` stays as the
+		// fallback the branch already accepted, in the same order as `read`.
+		if (typeof inputObj.path === "string") return inputObj.path;
+		// #5041: `file` is a declared alias of `path`; a rename sent through it
+		// must resolve, credit and attribute like the same rename through `path`.
+		if (typeof inputObj.file === "string") return inputObj.file;
 		return typeof inputObj.filePath === "string"
 			? inputObj.filePath
 			: undefined;
@@ -185,6 +166,7 @@ function retireAstGrepApplyTargets(
 	event: { input?: unknown },
 	runtime: ToolCallDeps["runtime"],
 	ctx: { cwd?: string },
+	sessionId: string | undefined,
 ): void {
 	const input = (event.input ?? {}) as Record<string, unknown>;
 	if (toolName !== "ast_grep_replace" || input.apply !== true) return;
@@ -198,16 +180,15 @@ function retireAstGrepApplyTargets(
 			runtime.projectRoot,
 		)?.path;
 		if (!resolved) continue;
-		runtime.readGuard?.retireChangedAuthorship?.(resolved);
+		runtime.readGuardFor(sessionId).retireChangedAuthorship?.(resolved);
 		checked.push(resolved);
 	}
 	// A folder target resolves but authors nothing, so it licenses no file: the
 	// files the apply rewrites inside it are unlicensed and end their
 	// authorship. Omitted `paths` (the project default) returns above.
-	runtime.readGuard?.noteCheckedPaths?.(
-		resolveToolCallCorrelationId(event),
-		checked,
-	);
+	runtime
+		.readGuardFor(sessionId)
+		.noteCheckedPaths?.(resolveToolCallCorrelationId(event), checked);
 }
 
 type ReadToolInput = {
@@ -333,7 +314,10 @@ interface ToolCallEvent {
 	 * (#1642).
 	 */
 	toolCallId?: string;
-	/** Parent codemode call carrying nested tool results on the transcript. */
+	/**
+	 * Parent tool call carrying nested tool results on the transcript. Any tool
+	 * that calls `ctx.executeTool` sets it; codemode is one example.
+	 */
 	parentToolCallId?: string;
 	input?: unknown;
 	details?: unknown;
@@ -381,7 +365,6 @@ interface ToolCallDeps {
 			) => string;
 		},
 	) => void;
-	resetLSPService: (options?: LSPShutdownOptions) => void;
 	getTreeSitterClient?: typeof getSharedTreeSitterClient;
 	/**
 	 * #3613: the stable session id of the session whose tool call this is, so
@@ -445,6 +428,7 @@ async function captureOpaqueBaseline(
 	root: string,
 	sessionRoot: boolean,
 	startedAt: number,
+	toolName: string,
 ): Promise<{ state: PendingOpaqueBaseline; note: string }> {
 	if (!sessionRoot)
 		return { state: { startedAt, strategy: "git" }, note: "git" };
@@ -469,6 +453,11 @@ async function captureOpaqueBaseline(
 		};
 	}
 	const outcome = await captureFileStats(root, { withHashes: true });
+	// #4905: bash names its unknown verdict through its coverage row at the
+	// result, so a refused home root would leave no ledger record for it. One
+	// record per session (the ledger's once-key is the subject).
+	if (outcome.unknownReason === "home-root")
+		recordOpaqueCaptureRefused("home-root", toolName);
 	return {
 		state: outcome.snapshot
 			? { startedAt, strategy: "stat-diff", stats: outcome.snapshot }
@@ -561,9 +550,11 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		cacheManager,
 		ensureLSPConfigInitialized,
 		updateLspStatus,
-		resetLSPService,
 		getTreeSitterClient = getSharedTreeSitterClient,
 	} = deps;
+	// #4943: the calling session, which this call's read-guard log rows name
+	// (an in-process subagent's call is its own, not the coordinator's).
+	const callSessionId = deps.sessionId ?? runtime.telemetrySessionId;
 
 	// #2423 review round 4, finding F5: the hashline anchor memo is keyed by
 	// mtime+size, which a same-size rewrite inside one mtime tick cannot
@@ -678,7 +669,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				commandInput.command,
 				runtime.projectRoot || process.cwd(),
 			))
-				runtime.readGuard?.retireChangedAuthorship?.(target);
+				runtime.readGuardFor(deps.sessionId).retireChangedAuthorship?.(target);
 	}
 	// #4504: the record and the take resolve their root through one owner, so a
 	// session whose cwd is not the coordinator's project root (a concurrent
@@ -705,7 +696,9 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			: otherOpaqueTool && callId !== undefined
 				? ""
 				: undefined;
-	if (opaqueCommand !== undefined) {
+	// #5162 r3: a provider replay's work ran before its call, so a diff of its
+	// window is another writer's; its tool_result skips the recovery too.
+	if (opaqueCommand !== undefined && !isProviderReplayCall(event)) {
 		if (scanRoot && shouldRunOpaqueRecovery(toolName, scanRoot)) {
 			const started = Date.now();
 			// #2050: the trees this command's writes must be recovered from. The
@@ -730,6 +723,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					root,
 					index === 0,
 					started,
+					toolName,
 				);
 				if (index === 0) resultNote = baseline.note;
 				// Session-stamped slot: a concurrent-secondary session (#473)
@@ -781,6 +775,9 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	if (
 		(mutation === undefined || isProvisionalLearnedAttribution(toolName)) &&
 		toolName !== "bash" &&
+		// #5160: a provider's display-only replay ran before it arrived, so any
+		// disk change in its window is another writer's, not this call's.
+		!isProviderReplayCall(event) &&
 		!getFlag("no-read-guard")
 	) {
 		const observedRawPath = readMutationPathField(event);
@@ -799,10 +796,12 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			// here.
 			const observedCallId = resolveToolCallCorrelationId(event);
 			const retire = (target: string) => {
-				runtime.readGuard?.retireChangedAuthorship?.(target);
+				runtime.readGuardFor(deps.sessionId).retireChangedAuthorship?.(target);
 			};
 			retire(observedPath);
-			runtime.readGuard?.noteCheckedPaths?.(observedCallId, [observedPath]);
+			runtime
+				.readGuardFor(deps.sessionId)
+				.noteCheckedPaths?.(observedCallId, [observedPath]);
 			await armObservedMutation({
 				toolCallId: observedCallId,
 				toolName,
@@ -814,14 +813,16 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				isLiveTurn: (key) => runtime.isLiveTurnKey(key),
 				onUniverse: (paths) => {
 					paths.forEach(retire);
-					runtime.readGuard?.noteCheckedPaths?.(observedCallId, paths);
+					runtime
+						.readGuardFor(deps.sessionId)
+						.noteCheckedPaths?.(observedCallId, paths);
 				},
 				signal: ctx.signal,
 				dbg,
 			});
 		}
 	}
-	retireAstGrepApplyTargets(toolName, event, runtime, ctx);
+	retireAstGrepApplyTargets(toolName, event, runtime, ctx, deps.sessionId);
 
 	if (
 		getFlag("lens-guard") &&
@@ -832,6 +833,8 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			cacheManager,
 			ctx.cwd ?? runtime.projectRoot,
 			ctx.host ?? "pi",
+			deps.sessionId,
+			{ toolName, input: event.input },
 		);
 		if (guard.block) {
 			return {
@@ -1141,8 +1144,40 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				effectiveReadOffset = expansion.newOffset;
 				effectiveReadLimit = expansion.newLimit;
 				let enriched = false;
+				let lspSymbolTimedOut = false;
 				let enrichedAncestry = expansion.ancestry;
-				const lspSymbols = await getOpenDocumentSymbols(filePath);
+				let lspSymbols;
+				let lspSymbolOutcome:
+					| "outer-deadline"
+					| "caller-abort"
+					| "failed"
+					| undefined;
+				let lspSymbolError: string | undefined;
+				try {
+					const result = await bounded(
+						getOpenDocumentSymbols(filePath).then((symbols) => ({ symbols })),
+						{
+							ms: EXPANSION_BUDGET_MS,
+							signal: deps.ctx.signal,
+							hook: "tool_call",
+							label: "read-lsp-document-symbols",
+						},
+					);
+					lspSymbols = result?.symbols;
+					if (result === undefined)
+						lspSymbolOutcome = deps.ctx.signal?.aborted
+							? "caller-abort"
+							: "outer-deadline";
+				} catch (err) {
+					// none: ts_range_expanded below persists timeout or failure with the file identity.
+					if (isLspRequestTimeoutError(err)) lspSymbolTimedOut = true;
+					else {
+						lspSymbolOutcome = "failed";
+						lspSymbolError = String(
+							err instanceof Error ? err.message : err,
+						).slice(0, 512);
+					}
+				}
 				const located = lspSymbols
 					? findDocumentSymbolAtLine(
 							lspSymbols,
@@ -1193,7 +1228,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				}
 				logToolReadGuardEvent({
 					event: "ts_range_expanded",
-					sessionId: runtime.telemetrySessionId,
+					sessionId: callSessionId,
 					filePath,
 					requestedOffset: requestedReadOffset,
 					requestedLimit: requestedReadLimit,
@@ -1205,6 +1240,9 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					symbolEndLine: expansion.enclosingSymbol.endLine,
 					metadata: {
 						enriched,
+						...(lspSymbolTimedOut && { lspSymbolTimeout: true }),
+						...(lspSymbolOutcome && { lspSymbolOutcome }),
+						...(lspSymbolError !== undefined && { lspSymbolError }),
 						durationMs: expansion.durationMs,
 						budgetMs: EXPANSION_BUDGET_MS,
 					},
@@ -1244,7 +1282,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		const lineHashes = readScan?.hashes(effectiveReadOffset, deliveredLimit);
 		logToolReadGuardEvent({
 			event: "read_pattern",
-			sessionId: runtime.telemetrySessionId,
+			sessionId: callSessionId,
 			filePath,
 			requestedOffset: requestedReadOffset,
 			requestedLimit: requestedReadLimit ?? deliveredLimit,
@@ -1262,7 +1300,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				expandedByTs: enclosingSymbol !== undefined,
 			},
 		});
-		runtime.readGuard.recordRead(
+		runtime.readGuardFor(deps.sessionId).recordRead(
 			{
 				filePath,
 				requestedOffset: requestedReadOffset,
@@ -1297,7 +1335,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 	// produce a baseline never loads the analyzer graph. This await used to sit
 	// above them and fire on EVERY tool_call — a bash command, a grep, a read
 	// of a vendored file, a second read of an already-baselined file all paid
-	// the seventeen-module load.
+	// the analyzer-module load.
 	//
 	// `isComplexitySupportedFile` is the LAST of those guards and the one that
 	// matters most in a real repo: complexity has node mappings for six
@@ -1361,6 +1399,21 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			subject: "complexity",
 			reason: "skipped (disabled by config)",
 		});
+	} else if (
+		!getFlag("no-complexity") &&
+		!isExternalOrVendor &&
+		filePath &&
+		!isComplexitySupportedFile(filePath)
+	) {
+		const kind = detectFileKind(filePath);
+		if (kind && CODE_KINDS.has(kind)) {
+			const language = resolveTreeSitterLanguage(filePath) ?? kind;
+			recordDegradationOnce({
+				kind: "function-metrics-language-unsupported",
+				subject: language,
+				reason: `no function-metrics table for ${language}`,
+			});
+		}
 	}
 
 	// --- Read-Before-Edit Guard: check edits ---
@@ -1378,12 +1431,14 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 		filePath &&
 		!getFlag("no-read-guard")
 	) {
-		runtime.readGuard.noteCreatedFile(
-			filePath,
-			runtime.turnIndex,
-			runtime.peekWriteIndex(),
-			resolveReadEvidenceCorrelationId(event),
-		);
+		runtime
+			.readGuardFor(deps.sessionId)
+			.noteCreatedFile(
+				filePath,
+				runtime.turnIndex,
+				runtime.peekWriteIndex(),
+				resolveReadEvidenceCorrelationId(event),
+			);
 	}
 
 	// --- Indentation mismatch correction ---
@@ -1468,7 +1523,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				entry.value = escaped;
 				logToolReadGuardEvent({
 					event: "oldtext_escape_autopatched",
-					sessionId: runtime.telemetrySessionId,
+					sessionId: callSessionId,
 					filePath,
 					metadata: { tool: "edit", label: entry.label },
 				});
@@ -1499,7 +1554,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				}
 				logToolReadGuardEvent({
 					event: "oldtext_trailing_ws_autopatched",
-					sessionId: runtime.telemetrySessionId,
+					sessionId: callSessionId,
 					filePath,
 					metadata: {
 						tool: "edit",
@@ -1515,13 +1570,13 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				// reflects real content at the matched span. Register a
 				// synthetic read covering it so the read-guard downstream
 				// doesn't fire a zero_read block after the verification.
-				if (matchNormalizedContent !== undefined && runtime.readGuard) {
+				if (matchNormalizedContent !== undefined) {
 					const range = findUniqueMatchLineRange(
 						matchNormalizedContent,
 						patch.oldText,
 					);
 					if (range) {
-						runtime.readGuard.recordRead({
+						runtime.readGuardFor(deps.sessionId).recordRead({
 							filePath,
 							requestedOffset: range.startLine,
 							requestedLimit: range.endLine - range.startLine + 1,
@@ -1619,7 +1674,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				}
 				logToolReadGuardEvent({
 					event: "oldtext_indent_autopatched",
-					sessionId: runtime.telemetrySessionId,
+					sessionId: callSessionId,
 					filePath,
 					metadata: {
 						tool: "edit",
@@ -1632,10 +1687,10 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				// reflects real content at this span. Register a synthetic read
 				// for the matched range so a zero_read block downstream isn't
 				// thrown after the autopatch already verified the content.
-				if (matchNormalizedContent !== undefined && runtime.readGuard) {
+				if (matchNormalizedContent !== undefined) {
 					const range = matchedRange;
 					if (range) {
-						runtime.readGuard.recordRead({
+						runtime.readGuardFor(deps.sessionId).recordRead({
 							filePath,
 							requestedOffset: range.startLine,
 							requestedLimit: range.endLine - range.startLine + 1,
@@ -1651,157 +1706,98 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 			}
 		}
 	}
-	if (isEditOnly && filePath && !getFlag("no-read-guard")) {
-		const readGuard = runtime.readGuard;
+	// #5160: a provider's replay (`isProviderReplayCall`) is a card for work
+	// that ran before it arrived, built-in `edit` replays included, so the
+	// guard has nothing left to protect and its refusal only reddens the card.
+	if (
+		isEditOnly &&
+		filePath &&
+		!getFlag("no-read-guard") &&
+		!isProviderReplayCall(event)
+	) {
+		const readGuard = runtime.readGuardFor(deps.sessionId);
 		const isExistingFile =
 			typeof readGuard?.isNewFile !== "function" ||
 			!readGuard.isNewFile(filePath);
 		if (readGuard && isExistingFile && !isExternalOrVendor) {
+			const guardArgs = [
+				filePath,
+				callSessionId,
+				readGuardCorrelationId,
+				runtime.partialApplyRecords,
+				readGuard.contentMatchesLastRead(filePath),
+			] as const;
+			let guardLines = getTouchedLinesForGuard(event, ...guardArgs);
 			const {
-				touchedLines,
-				editRanges,
 				preflightError,
 				preflightDetails,
 				alreadyAppliedEdits,
 				partiallyApplicable,
-				contentMatchValidated,
 				editBatchSummary,
-			} = getTouchedLinesForGuard(
-				event,
-				filePath,
-				runtime.telemetrySessionId,
-				readGuardCorrelationId,
-				runtime.partialApplyRecords,
-				readGuard.contentMatchesLastRead(filePath),
-			);
+			} = guardLines;
 			if (preflightError) {
-				if (partiallyApplicable && partiallyApplicable.length > 0) {
-					// #3525: the same fresh-at-check rule as a whole edit.
-					const partialStamp = {
-						stampFileTime: readGuard.fileTimeMoved?.(filePath) !== true,
-					};
-					try {
-						const partial = await applyPartiallyApplicableEdits({
-							filePath,
-							edits: partiallyApplicable,
-							summary: editBatchSummary,
-							correlationId: readGuardCorrelationId,
-							recordStore: runtime.partialApplyRecords,
-							afterWrite: async () => {
-								const {
-									biomeClient,
-									ruffClient,
-									metricsClient,
-									agentBehaviorClient,
-								} = await loadBootstrapClients();
-								const result = await handleToolResult({
-									signal: deps.ctx.signal,
-									event: {
-										toolName: "write",
-										input: { path: filePath },
-										details: {
-											piLensPartialApply: true,
-											readGuardCorrelationId,
-										},
-										content: [],
-										// #1655 item 2: `provider`/`model`/`sessionId`/`session`
-										// used to be forwarded here from the tool_call event.
-										// pi builds a `tool_call` with exactly
-										// `type`/`toolName`/`toolCallId`/`input`
-										// (`@earendil-works/pi-coding-agent/dist/core/agent-session.js:230-234`,
-										// source `src/core/agent-session.ts:~228-236`), so all
-										// four were always `undefined` and the tool_result
-										// branch they fed was unreachable.
-									},
-									getFlag: (name: string) => getFlag(name),
-									dbg,
-									runtime,
-									cacheManager,
-									biomeClient,
-									ruffClient,
-									metricsClient,
-									resetLSPService,
-									readGuard: runtime.readGuard,
-									sessionId: deps.sessionId,
-									_ownWriteStamp: partialStamp,
-									agentBehaviorRecord: (toolName, analyzedPath) =>
-										agentBehaviorClient.recordToolCall(toolName, analyzedPath),
-									formatBehaviorWarnings: (warnings) =>
-										agentBehaviorClient.formatWarnings(warnings as any),
-								});
-								if (result?.isError) {
-									throw new Error(
-										"post-edit pipeline rejected synthetic partial apply",
-									);
-								}
-								return result?.content
-									?.map((item) => item.text)
-									.filter((text): text is string => !!text)
-									.join("\n\n");
-							},
-						});
-						if (partial.rejected) {
-							// Nothing was written and no post-edit dispatch ran. The
-							// preflight verdict still describes the whole batch; append
-							// the structured rejection so the agent rebuilds from a
-							// fresh read instead of retrying the stale payload.
-							if (!editBatchSummary) logBlockedEditSummary("preflight");
-							return {
-								block: true,
-								reason: `${preflightError}\n\n🛑 Batch not applied: ${partial.rejected.detail}`,
-							};
-						}
-						if (partial.postEditStatus === "failed") {
-							// The commit stands; the post-edit analysis does not. The
-							// committed bytes must never be re-labelled by the preflight
-							// header (a RETRYABLE/RE-READ line here sends the agent into
-							// the #2402 retry loop against already-applied edits).
-							return {
-								block: true,
-								reason: composePartialApplyReason({
-									appliedCount: partial.appliedCount,
-									appliedIndices: partial.appliedIndices,
-									postEditStatus: "failed",
-									preflightDetails,
-									alreadyAppliedEdits,
-								}),
-							};
-						}
-						if (partial.appliedCount > 0) {
-							logToolReadGuardEvent({
-								event: "edit_partial_apply",
-								sessionId: runtime.telemetrySessionId,
-								filePath,
-								metadata: {
-									appliedCount: partial.appliedCount,
-									appliedTotal: partial.appliedTotal,
-									appliedIndices: partial.appliedIndices,
-									editBatchSummary: partial.summary,
-									routedThroughPostEditPipeline: true,
-								},
-							});
-							return {
-								block: true,
-								reason: composePartialApplyReason({
-									appliedCount: partial.appliedCount,
-									appliedIndices: partial.appliedIndices,
-									postEditStatus: "succeeded",
-									postEditOutput: partial.postEditOutput,
-									preflightDetails,
-									alreadyAppliedEdits,
-								}),
-							};
-						}
-					} catch {
-						// commit write failure — fall through to the full preflight block
-					}
+				// #5120: a partial apply never writes from tool_call. It hands the
+				// host edit the matched subset, at the exact span bytes, so every
+				// later tool_call handler sees what will be written and can refuse
+				// it; the tool_result, found by the call's own input, tells the
+				// agent what applied. `partiallyApplicable` is never empty: the
+				// preflight returns it only when an edit passed.
+				if (!partiallyApplicable) {
+					if (!editBatchSummary) logBlockedEditSummary("preflight");
+					return { block: true, reason: preflightError };
 				}
-				if (!editBatchSummary) logBlockedEditSummary("preflight");
-				return { block: true, reason: preflightError };
+				const input = (event as { input?: unknown }).input as {
+					edits?: unknown;
+				};
+				// Recorded before the rewrite: a throw after it reaches the outer
+				// catch, which lets the call run, and its tool_result must still
+				// report what the host edit did.
+				runtime.markToolCallPartialApply(input, {
+					applied: partiallyApplicable.map((edit) => ({
+						oldText: edit.oldText,
+						newText: edit.newText,
+						originalIndex: edit.originalIndex,
+					})),
+					preflightError,
+					...(preflightDetails && { preflightDetails }),
+					...(alreadyAppliedEdits && { alreadyAppliedEdits }),
+					...(editBatchSummary && { summary: editBatchSummary }),
+				});
+				input.edits = partiallyApplicable.map((edit) => ({
+					oldText: edit.appliedSpanText,
+					newText: edit.newText ?? "",
+				}));
+				// The subset is now an ordinary edit: the checks below judge it,
+				// and the in-flight expectation names what it will write. Each
+				// `oldText` is the exact bytes of a span that matched once, so it
+				// re-resolves; were it not to, the host edit refuses the batch
+				// whole and the tool_result reports "Batch not applied".
+				guardLines = getTouchedLinesForGuard(event, ...guardArgs);
+				noteAgentCallStart(
+					toolCallId,
+					filePath,
+					expectationFromToolInput(input, "edit"),
+				);
+				logToolReadGuardEvent({
+					event: "edit_partial_apply",
+					sessionId: callSessionId,
+					filePath,
+					metadata: {
+						appliedCount: partiallyApplicable.length,
+						appliedIndices: formatBoundedEditIndexes(
+							boundedEditIndexes(
+								partiallyApplicable.map((edit) => edit.originalIndex),
+							),
+						),
+						requestedTotal: requestedEditTotal,
+						rewrittenForHostEdit: true,
+					},
+				});
 			}
+			const { touchedLines, editRanges, contentMatchValidated } = guardLines;
 			logToolReadGuardEvent({
 				event: "edit_check_started",
-				sessionId: runtime.telemetrySessionId,
+				sessionId: callSessionId,
 				filePath,
 				metadata: {
 					tool: mutation?.kind ?? "edit",
@@ -1835,7 +1831,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 				);
 				if (relocated) {
 					const [toStart, toEnd] = verdict.relocation.to;
-					runtime.readGuard?.recordRead({
+					runtime.readGuardFor(deps.sessionId).recordRead({
 						filePath,
 						requestedOffset: toStart,
 						requestedLimit: toEnd - toStart + 1,
@@ -1848,7 +1844,7 @@ async function handleToolCallImpl(deps: ToolCallDeps): Promise<ToolCallResult> {
 					});
 					logToolReadGuardEvent({
 						event: "edit_range_relocated",
-						sessionId: runtime.telemetrySessionId,
+						sessionId: callSessionId,
 						filePath,
 						metadata: {
 							tool: "edit",

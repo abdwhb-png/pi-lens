@@ -15,7 +15,7 @@ respawned server reports every finding it reported before eviction; the
 content-bound coverage check the auxiliary freeze depends on. A server that
 cannot demonstrate it is never proposed for eviction on perf grounds alone.
 
-_Last generated: 2026-10-25 on linux; 49 registry servers: 33 eligible, 0 vetoed, 2 inconclusive, 14 unavailable (0 not reached: budget)._
+_Last generated: 2026-11-04 on linux; 51 registry servers: 34 eligible, 0 vetoed, 2 inconclusive, 15 unavailable (0 not reached: budget)._
 
 ## Per-server rows
 
@@ -46,13 +46,15 @@ step log only, because it flaps.
 | dart | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | deno | primary | transparent | eligible | · | ok | preserved |
 | docker | primary | transparent | eligible | · | ok | preserved |
-| docker-official | primary | unmeasured | eligible | · | ok | preserved |
+| docker-official | primary | transparent | eligible | · | ok | preserved |
 | elixir | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | expert | primary | unmeasured | eligible | · | ok | preserved |
+| fallow | auxiliary | unmeasured | eligible | · | ok | preserved |
 | fish | primary | transparent | eligible | · | ok | preserved |
 | fsharp | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | gleam | primary | unmeasured | eligible | · | ok | preserved |
 | go | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
+| groovy | primary | unmeasured | unavailable | no-fixture | n/a | n/a |
 | haskell | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
 | html | primary | transparent | eligible | · | ok | preserved |
 | java | primary | unmeasured | unavailable | tool-unavailable | n/a | n/a |
@@ -83,7 +85,7 @@ step log only, because it flaps.
 | vue | primary | unmeasured | inconclusive | no-baseline | n/a | unproven |
 | yaml | primary | transparent | eligible | · | ok | preserved |
 | zig | primary | unmeasured | eligible | · | ok | preserved |
-| zizmor | auxiliary | unmeasured | eligible | · | ok | preserved |
+| zizmor | auxiliary | transparent | eligible | · | ok | preserved |
 
 ## Declared versus measured
 
@@ -93,8 +95,8 @@ nothing.
 
 - **ast-grep** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **cue** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **docker-official** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **expert** [proposal] declared unmeasured but eviction and respawn preserved its findings
+- **fallow** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **gleam** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **kotlin** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **lua** [proposal] declared unmeasured but eviction and respawn preserved its findings
@@ -106,7 +108,6 @@ nothing.
 - **toml** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **typos** [proposal] declared unmeasured but eviction and respawn preserved its findings
 - **zig** [proposal] declared unmeasured but eviction and respawn preserved its findings
-- **zizmor** [proposal] declared unmeasured but eviction and respawn preserved its findings
 
 ## Reasons
 

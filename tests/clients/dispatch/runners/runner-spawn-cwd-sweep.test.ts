@@ -155,7 +155,12 @@ const EXPECTED_FILES = 79;
 // 133 -> 134 (#4765): `validateOpengrepPack` runs the installed `opengrep`
 // `scan --validate --config <candidate>` before the cached registry pack is
 // swapped in, through this seam. (#4776 landed first and moved the base to 133.)
-const EXPECTED_DIRECT_SITES = 134;
+// 134 -> 131 (#5247): the four temp-scan spawn sites in `SgRunner`
+// (`tempScanDetailedAsync` and the three passes of `tempScanWithFixAsync`) are
+// one `spawnResolved`, the seam that takes a `ResolvedSgCommand`.
+// 131 -> 129 (#5289): `safeSpawnBatch` and the sync `isCommandAvailable` had no
+// caller; each held one direct spawn site, and both are deleted.
+const EXPECTED_DIRECT_SITES = 129;
 /**
  * Every same-file spawn-routing wrapper call site the scan discovers. Pinned
  * as a LIST, not a count, because the list is the part round 2 got wrong: it
@@ -359,20 +364,12 @@ const NO_CWD_EXEMPTION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"`taskkill /F /T /PID <pid>` — kills a process tree by pid on Windows; it touches no file",
 	],
 	[
-		"clients/safe-spawn.ts#safeSpawnBatch:921a571e",
-		"safeSpawnBatch forwards each command's own `options` object unchanged, so the cwd belongs to whoever built that batch entry",
-	],
-	[
 		"clients/safe-spawn.ts#isCommandAvailableAsync:45a177c3",
 		"`which`/`where <command>` PATH lookup (async form)",
 	],
 	[
 		"clients/safe-spawn.ts#findCommandAsync:45a177c3",
 		"`which`/`where <command>` PATH lookup that returns the resolved path",
-	],
-	[
-		"clients/safe-spawn.ts#isCommandAvailable:acf75340",
-		"`which`/`where <command>` PATH lookup (deprecated sync form)",
 	],
 	[
 		"clients/safe-spawn.ts#findCommand:e3470221",
@@ -399,20 +396,8 @@ const NO_CWD_EXEMPTION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"the scoped cache-only `npx --package @ast-grep/cli -- ast-grep --version` candidate probe: same pi-lens-owned neutral cwd supplied by `...getIsolatedNpxSpawnOptions()`, which the scan cannot follow through a call spread",
 	],
 	[
-		"clients/sg-runner.ts#SgRunner.tempScanDetailedAsync:e70984d6",
-		"`ast-grep scan --config <temp rule file> --json … <dir>`: both the rule file and the scan root are absolute arguments on dispatch (#4233 V3-HIGH-01), and when the module-level command is npx the options spread supplies the pi-lens-owned neutral cwd (#4233 V3-HIGH-02) the scan cannot follow through a call spread",
-	],
-	[
-		"clients/sg-runner.ts#SgRunner.tempScanWithFixAsync:23665a2b",
-		"the match-only pass of the same temp-rule scan, with the same absolute --config and target arguments",
-	],
-	[
-		"clients/sg-runner.ts#SgRunner.tempScanWithFixAsync:0a5b6a4d",
-		"the count-first JSON pass before --update-all, same absolute arguments",
-	],
-	[
-		"clients/sg-runner.ts#SgRunner.tempScanWithFixAsync:ed556eb8",
-		"the --update-all apply pass, same absolute arguments",
+		"clients/sg-runner.ts#SgRunner.spawnResolved:82ea3b08",
+		"the one spawn for `ast-grep scan --config <temp rule file> …` (#5247): `--config` and the scan target are absolute arguments the caller built (#4233 V3-HIGH-01), and when the resolved command is the scoped npx fallback `...this.sgSpawnOptions` supplies the pi-lens-owned neutral cwd (#4233 V3-HIGH-02) the scan cannot follow through a class-field spread",
 	],
 	[
 		"clients/test-runner-client.ts#TestRunnerClient.detectRunner:4411bf71",
@@ -429,7 +414,7 @@ const NO_CWD_EXEMPTION_ROWS: ReadonlyArray<readonly [string, string]> = [
 ];
 const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 	[
-		"clients/safe-spawn.ts#safeSpawn:ad6fe3ed~49fcf1a1",
+		"clients/safe-spawn.ts#safeSpawn:ad6fe3ed~be4673bc",
 		"the synchronous safe-spawn path derives its cwd from its own compatibility options, not the dispatch resolveToolCwd seam",
 	],
 	[
@@ -601,8 +586,8 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"passes `targetDir` = path.resolve(cwd) from the scan API's own argument; the security clients are driven by the MCP surface, not by dispatch",
 	],
 	[
-		"clients/gitleaks-client.ts#GitleaksClient.runScan:94ae6442~353ea442",
-		"cwd is runScan's own `cwd` parameter, and the scoped gitleaks config is written against it",
+		"clients/gitleaks-client.ts#GitleaksClient.runScan.spawn:937d6f21~353ea442",
+		"cwd is runScan's own `cwd` parameter, captured by the spawn callback it hands the report-scan seam, and the scoped gitleaks config is written against it",
 	],
 	[
 		"clients/govulncheck-client.ts#GovulncheckClient.analyze:c23b1b18~4bd5cc03",
@@ -713,7 +698,7 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"analysePipeline forwards its language `cwd` into runAutofix and separately passes the authoritative session root for adopted-writer admission (#4309)",
 	],
 	[
-		"clients/safe-spawn.ts#safeSpawnAsync:f7eca8ca~dd6a6e98",
+		"clients/safe-spawn.ts#safeSpawnAsync:f7eca8ca~e39f490b",
 		"this IS the spawn seam: `spawnCwd` is the cwd its own caller passed in options, so the origin rule applies to the callers, not here",
 	],
 	[
@@ -725,7 +710,7 @@ const ORIGIN_ADMISSION_ROWS: ReadonlyArray<readonly [string, string]> = [
 		"passes `targetDir` = path.resolve(cwd) from the scan API's own argument",
 	],
 	[
-		"clients/trivy-client.ts#TrivyClient.runScan:e9ed392e~353ea442",
+		"clients/trivy-client.ts#TrivyClient.runScan.spawn:89fa15ad~353ea442",
 		"cwd is runScan's own `cwd` parameter, the directory `trivy fs` is pointed at",
 	],
 ];

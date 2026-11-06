@@ -39,7 +39,9 @@ import {
 	recordProjectCommandRefusal,
 	sessionRepositoryJudge,
 } from "./session-repository.js";
+import { windowsExe } from "./process-snapshot.js";
 import { startSpawnUsageSampler } from "./resource-sampler.js";
+import { isToolInstallDisabled } from "./env-utils.js";
 import { DEFAULT_MAX_OUTPUT_BYTES } from "./spawn-output-cap.js";
 import { compareOrdinal } from "./string-utils.js";
 
@@ -658,7 +660,7 @@ export function isOwnLiveChild(
 function killPidTreeSync(pid: number): void {
 	if (process.platform === "win32") {
 		try {
-			const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
+			const taskkill = windowsExe("taskkill.exe");
 			spawnSync(taskkill, ["/F", "/T", "/PID", String(pid)], {
 				shell: false,
 				windowsHide: true,
@@ -812,7 +814,7 @@ export function buildWindowsShellCommand(
 	command: string,
 	args: string[],
 ): string {
-	const chcp = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\chcp.com`;
+	const chcp = windowsExe("chcp.com");
 	return `${chcp} 65001 >nul 2>&1 & ${[command, ...args].map(cmdEscapeArg).join(" ")}`;
 }
 
@@ -1329,15 +1331,42 @@ function resolveWindowsCommand(
 	return resolveWindowsCommandForEnvironment(command, cwd, env);
 }
 
+/**
+ * Whether `command` is the npm package runner. By basename, so a managed or
+ * absolute `npx`, `npx.cmd` and `NPX.EXE` all count.
+ */
+function isNpxCommand(command: string): boolean {
+	const base = command.split(/[\\/]/).pop() ?? command;
+	return /^npx(?:\.(?:cmd|exe|bat))?$/i.test(base);
+}
+
 function getSpawnEnvironment(
+	command: string,
 	overrides: NodeJS.ProcessEnv | undefined,
 	stripNpmConfig: boolean | undefined,
 ): NodeJS.ProcessEnv {
+	// #4930: `git status` writes a refreshed index back under `index.lock`, and a
+	// read killed mid-write orphans the lock. The seam, not each caller, opts out
+	// of that optional write. Ambient does not win (the guarantee is that pi-lens
+	// never takes the lock); a caller override does.
+	const ambient = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
 	const merged =
 		process.platform === "win32"
-			? mergeWindowsEnvironment(process.env, overrides)
-			: { ...process.env, ...overrides };
-	if (!stripNpmConfig) return merged;
+			? mergeWindowsEnvironment(ambient, overrides)
+			: { ...ambient, ...overrides };
+	// #5231: a package runner downloads whatever it cannot find, which is an
+	// install the kill switch must stop. The seam holds every spawn's command,
+	// so it is the one place that covers a caller passing no options (the
+	// presence probes). `npm_config_offline` makes npx use its cache or fail
+	// with ENOTCACHED, never a request. It is set after the strip: the strip
+	// removes every `npm_config_*` and must not remove this one. bunx ignores
+	// the variable (probed: one registry hit with it set), but the tree never
+	// spawns it; the install census flags a new literal runner.
+	const offline = isToolInstallDisabled() && isNpxCommand(command);
+	if (!stripNpmConfig) {
+		if (offline) merged.npm_config_offline = "true";
+		return merged;
+	}
 	// A copy loop rather than `Object.fromEntries(…filter(…))`: `filter` is a
 	// retired glossary identifier and a new use would move the census. This runs
 	// only on the flagged cache-only package-runner spawns, never the hot
@@ -1346,6 +1375,7 @@ function getSpawnEnvironment(
 	for (const [key, value] of Object.entries(merged)) {
 		if (!/^npm_config_/i.test(key)) stripped[key] = value;
 	}
+	if (offline) stripped.npm_config_offline = "true";
 	return stripped;
 }
 
@@ -1600,7 +1630,7 @@ function ensureUtf8ConsoleCodePageOnce(): void {
 	if (utf8ConsoleCodePageApplied) return;
 	utf8ConsoleCodePageApplied = true;
 	try {
-		const cmdExe = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`;
+		const cmdExe = windowsExe("cmd.exe");
 		spawnSync(cmdExe, ["/d", "/s", "/c", "chcp 65001 >nul 2>&1"], {
 			shell: false,
 			windowsHide: true,
@@ -1629,6 +1659,9 @@ function ensureUtf8ConsoleCodePageOnce(): void {
  * without reaching into the module; it was dropped once as unrelated scope
  * creep in an earlier #1199 revision and restored on review. Do not read the
  * export as evidence of existing coverage (#1201).
+ *
+ * @public — kept by review (#1201) as this test-only seam; knip cannot see the
+ * future Windows-only test that would call it.
  */
 export function resetUtf8ConsoleCodePageStateForTests(): void {
 	utf8ConsoleCodePageApplied = false;
@@ -1979,7 +2012,7 @@ export async function safeSpawnAsync(
 		const admission = admitSpawn(
 			command,
 			options?.cwd,
-			getSpawnEnvironment(options?.env, options?.stripNpmConfig),
+			getSpawnEnvironment(command, options?.env, options?.stripNpmConfig),
 		);
 		// #4530: the chokepoint runs once the environment is effective and
 		// before anything resolves or starts, so no later branch can reach
@@ -2039,7 +2072,7 @@ export async function safeSpawnAsync(
 				} else {
 					// Pin the interpreter — never trust ComSpec/COMSPEC (#18): an
 					// env-controlled ComSpec could point anywhere.
-					spawnCmd = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`;
+					spawnCmd = windowsExe("cmd.exe");
 					spawnArgs = [
 						"/d",
 						"/s",
@@ -2220,7 +2253,7 @@ export async function safeSpawnAsync(
 		// as an orphan. Use taskkill /F /T to kill the full process tree instead.
 		const killTree = async (phase: KillPhase): Promise<void> => {
 			if (isWindows && child.pid && child.pid > 0) {
-				const taskkill = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\taskkill.exe`;
+				const taskkill = windowsExe("taskkill.exe");
 				try {
 					await new Promise<void>((done) => {
 						const killer = spawn(
@@ -2780,42 +2813,6 @@ export async function safeSpawnAsync(
 }
 
 /**
- * Run multiple commands concurrently with limited concurrency.
- *
- * This prevents resource contention when running many linters.
- * Uses async spawn with concurrency limiting built-in.
- *
- * @example
- * const results = await safeSpawnBatch([
- *   { command: "biome", args: ["check", "file.ts"] },
- *   { command: "ruff", args: ["check", "file.py"] },
- * ], 3); // Max 3 concurrent
- */
-export async function safeSpawnBatch(
-	commands: Array<{
-		command: string;
-		args: string[];
-		options?: SafeSpawnOptions;
-	}>,
-	concurrency = 3,
-): Promise<SpawnResult[]> {
-	const results: SpawnResult[] = [];
-
-	// Process in batches to limit concurrent processes
-	for (let i = 0; i < commands.length; i += concurrency) {
-		const batch = commands.slice(i, i + concurrency);
-		const batchResults = await Promise.all(
-			batch.map(({ command, args, options }) =>
-				safeSpawnAsync(command, args, options),
-			),
-		);
-		results.push(...batchResults);
-	}
-
-	return results;
-}
-
-/**
  * Check if a command is available in PATH (async version)
  */
 export async function isCommandAvailableAsync(
@@ -2875,7 +2872,7 @@ export function safeSpawn(
 	const admission = admitSpawn(
 		command,
 		options?.cwd,
-		getSpawnEnvironment(options?.env, options?.stripNpmConfig),
+		getSpawnEnvironment(command, options?.env, options?.stripNpmConfig),
 	);
 	if (!admission.admitted)
 		return trustRefusalResult(command, admission.executable);
@@ -2935,7 +2932,7 @@ export function safeSpawn(
 					}),
 				};
 			}
-			spawnCmd = `${process.env.SystemRoot ?? "C:\\Windows"}\\System32\\cmd.exe`;
+			spawnCmd = windowsExe("cmd.exe");
 			spawnArgs = [
 				"/d",
 				"/s",
@@ -2995,19 +2992,6 @@ export function safeSpawn(
 		error: result.error,
 		...(spawnFailure ? { failure: "spawn" as const, spawnFailure } : {}),
 	};
-}
-
-/**
- * Check if a command is available in PATH (sync version - deprecated)
- * @deprecated Use isCommandAvailableAsync
- */
-export function isCommandAvailable(command: string): boolean {
-	const result = safeSpawn(
-		process.platform === "win32" ? "where" : "which",
-		[command],
-		{ timeout: 5000 },
-	);
-	return result.status === 0;
 }
 
 /**

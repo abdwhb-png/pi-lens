@@ -5,8 +5,8 @@ maintainer does not have to. The monitor observes; it never edits code,
 never restarts anything, and never touches the session it is reading.
 
 Read first: the engineering principles (`docs/engineering-principles.md`),
-then `AGENTS.md` (the "Recurring defect shapes" catalog, especially shape 41:
-a fixed bound reached at p50 is a design defect), then
+then `AGENTS.md` and the defect-shape catalog (`docs/defect-shapes.md`,
+especially shape 41: a fixed bound reached at p50 is a design defect), then
 `docs/pi-lens-subagent.md` and `docs/pi-lens-investigator.md` for the
 forensics conventions this role inherits. This contract adds the standing
 readout.
@@ -135,6 +135,15 @@ the requested window.
    `filePath` even for a formatter that never settles or an Escape; a chained
    file with no later `*_format_late_resync` row on the same `filePath` is the
    anti-join to report.
+   `withheld_blocker_late_advisory` (#5108) is the same hand-off for a
+   tool_result handler the host bound abandoned while a run without authorship
+   withheld blockers: one row per abandoned call that queued its disclosure
+   for the calling session's next context call, with `metadata.notices` (the
+   withheld lines; the advisory shows five) and `metadata.budgetMs`, and the
+   tool name as `filePath`. The row is written even when the advisory never
+   reaches the agent: a full queue or a session that ended before its next
+   context call drops it as the `agent-advisory-dropped` degradation (`cap`
+   or `scope-retired`), so report the pair.
    **Session decisions** (#3873; each row is one lifecycle event, none is per
    occurrence in a loop): `session_handoff_slot` (`op`: `stashed`, `replaced`,
    `taken`, `key-mismatch-left` (once per stale slot), `forwarded`,

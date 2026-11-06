@@ -12,6 +12,7 @@
  *   7. Cascade diagnostics (other files with errors, LSP only)
  */
 
+import { resolveLensToolName, type LensToolHost } from "./tool-config.js";
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import type { PiLensFlagSource } from "./lens-config.js";
@@ -25,6 +26,7 @@ import {
 } from "./path-utils.js";
 import {
 	inlineBlockerLines,
+	inlineBlockerPlacement,
 	inlineBlockerSources,
 } from "./inline-blocker-fields.js";
 import {
@@ -75,11 +77,13 @@ import {
 } from "./dispatch/runners/utils/runner-helpers.js";
 import { findDetektConfig } from "./dispatch/runners/detekt.js";
 import {
+	verdictRunnerIds,
 	checkedWholeFile,
 	type Diagnostic,
 	type InconclusiveSources,
 	type PiAgentAPI,
 	spanOverlapsModifiedRanges,
+	widgetUncheckedReason,
 } from "./dispatch/types.js";
 import {
 	formatDiagnostics,
@@ -105,7 +109,6 @@ import {
 	type PilensDiagnosticEntry,
 } from "./diagnostics-publish.js";
 import { loadLspService } from "./lsp-lazy.js";
-import type { MetricsClient } from "./metrics-client.js";
 import { clearGraphCache } from "./review-graph/builder.js";
 import { classifyTreeSitterWasmError } from "./tree-sitter-client.js";
 import { BoundedLruCache } from "./bounded-cache.js";
@@ -339,6 +342,8 @@ export interface PipelineContext {
 	 * through keep passing unchanged).
 	 */
 	getFlagSource?: (name: string, filePath?: string) => PiLensFlagSource;
+	/** #5165: live hook-delivery state, read when findings are logged. */
+	inlineDeliveryAvailable?: () => boolean;
 	/** Debug logger */
 	dbg: (msg: string) => void;
 	/**
@@ -387,7 +392,6 @@ export interface PipelineContext {
 export interface PipelineDeps {
 	biomeClient: BiomeClient;
 	ruffClient: RuffClient;
-	metricsClient: MetricsClient;
 	getFormatService: () => FormatService;
 	fixedThisTurn: PathSetLike;
 }
@@ -411,7 +415,7 @@ export interface PipelineResult {
 	fileModified: boolean;
 	/**
 	 * True only when this run's whole delivery is the `✓ <lang> clean` line, a
-	 * language server answered for the file (`DispatchResult.primaryLspChecked`)
+	 * language server answered for the file (`DispatchResult.verdict` holds `lsp`)
 	 * and the run recorded no finding for it (#4734 r3 state table, row 14).
 	 * False on every other path: a finding, a fix, a format notice, an error, a
 	 * non-blocking finding behind the clean line, a run no language server
@@ -479,6 +483,15 @@ export interface PipelineResult {
 	 */
 	currentBlockerCount?: number;
 	/**
+	 * #5108: the one line a run without authorship (#3226) ends with when it
+	 * holds blockers it withheld from the STOP block and the record: names the
+	 * file and the count, directs no edit. `output` carries the same line, so
+	 * the all-clear never renders over a blocker; this copy is what a host that
+	 * abandoned the handler (`index.ts`' tool_result bound) queues for the
+	 * agent's next context. Absent when nothing was withheld.
+	 */
+	withheldBlockerLine?: string;
+	/**
 	 * #4733 r5 G3: how many blocking findings the observation still holds that
 	 * the #4483 seed called pre-existing (`DispatchResult.preExisting`). Absent
 	 * when there are none. Not part of `currentBlockerCount`, which governs this
@@ -493,6 +506,13 @@ export interface PipelineResult {
 	 * drop another session's section for it only on such a run.
 	 */
 	fileVerdictComplete?: true;
+	/**
+	 * #5020: the runners that reached a verdict on this run's bytes
+	 * (`verdictRunnerIds`). A row of another file's record that names THIS file
+	 * is retired only by a runner in this list, so a skipped, failed or
+	 * inconclusive one cannot speak for it.
+	 */
+	verdictRunnerIds?: string[];
 	/**
 	 * #4484 round 3: the anchor the inline verdict this run hands on is about
 	 * (the analysed bytes' line hashes and the lines still owed). The caller
@@ -1678,8 +1698,10 @@ type DispatchResult = Awaited<
 /**
  * The line a write with nothing else to say ends with. #4403: "clean" only
  * when the file's primary group checked it; otherwise one line naming why not
- * (`DispatchResult.unconfirmedStatus`), so a write after the once-only
- * coverage notice does not read as a clean result.
+ * (`DispatchResult.verdict`), so a write after the once-only coverage notice
+ * does not read as a clean result. #5258: `checked` is the only way to the
+ * clean line; a file with no kind is unchecked too, so the label falls back to
+ * the extension (or the name) instead of dropping out of the line.
  */
 function buildAllClearOutput(
 	dispatchResult: DispatchResult,
@@ -1687,55 +1709,109 @@ function buildAllClearOutput(
 	filePath: string,
 ): string {
 	const kind = detectFileKind(filePath);
-	const langLabel = kind ? getFileKindLabel(kind) : path.extname(filePath);
-	if (kind && dispatchResult.unconfirmedStatus !== undefined) {
-		return `\u26a0 ${langLabel} unconfirmed — ${dispatchResult.unconfirmedStatus} · ${elapsed}ms`;
-	}
+	const langLabel = kind
+		? getFileKindLabel(kind)
+		: path.extname(filePath) || path.basename(filePath);
+	const { verdict } = dispatchResult;
+	// #5258 r2: a slow primary's line already printed for this file; stay quiet.
+	if (!verdict.checked && verdict.repeat) return "";
+	return verdict.checked
+		? `\u2713 ${langLabel} clean · ${elapsed}ms`
+		: `\u26a0 ${langLabel} unconfirmed — ${verdict.reason} · ${elapsed}ms`;
+}
+
+/**
+ * #5008: the bounded place list both delta lines end with. `total` is the whole
+ * blocker population (what the record and the commit gate count), and every one
+ * of them is accounted for exactly once: a shown place, the `+N more`
+ * remainder, or one of the two counted causes `inlineBlockerPlacement` names.
+ * At most five places are shown.
+ */
+function formatBlockerPlaces(
+	blockers: readonly Diagnostic[],
+	filePath: string,
+): string {
+	const { places, unplaced } = inlineBlockerPlacement(blockers, filePath);
+	const shown = places
+		.slice(0, 5)
+		.map((place) => `L${place.line} ${shortBlockerRule(place.rule)}`);
+	const more = places.length - shown.length;
+	if (more > 0) shown.push(`+${more} more`);
 	const parts: string[] = [];
+	if (shown.length > 0) parts.push(` (${shown.join(", ")})`);
+	// Review r2 (CodeRabbit PRRT_kwDORt8rec6x4fNi): the count names its SCOPE.
+	// Review r3 (F6): and each cause gets its own clause, because they disagree
+	// about whether this file has a line at all. A same-file stale carry has one
+	// (from older bytes), so counting it as "no line in this file" denied what
+	// the row holds; another file's row and a line-less blocker have none here.
+	// Verify r4: positionStale only says the carry could not re-place the row in
+	// these bytes (the line may be unchanged, e.g. past the hash cap), so the
+	// clause claims that and not a move.
+	if (unplaced.movedLine > 0)
+		parts.push(
+			`; ${unplaced.movedLine} whose line could not be re-placed in these bytes`,
+		);
+	if (unplaced.noLineInThisFile > 0)
+		parts.push(`; ${unplaced.noLineInThisFile} with no line in this file`);
+	return parts.join("");
+}
 
-	if (kind) {
-		parts.push(`${langLabel} clean`);
-	}
+/** Longest rule id rendered beside a place, so five places stay one line. */
+const MAX_SHOWN_RULE_CHARS = 32;
 
-	parts.push(`${elapsed}ms`);
-	return `checkmark ${parts.join(" · ")}`.replace("checkmark", "\u2713");
+/** #5008: the rule id beside a place, bounded so five places fit one line. */
+function shortBlockerRule(rule: string): string {
+	return rule.length > MAX_SHOWN_RULE_CHARS
+		? `${rule.slice(0, MAX_SHOWN_RULE_CHARS - 1)}\u2026`
+		: rule;
 }
 
 /**
  * #4484: the one line a write gets for blockers that are still on the file
- * but not new to it (the delta held them back). Bounded: at most five line
- * numbers, then a count.
+ * but not new to it (the delta held them back). Bounded: at most five places,
+ * then a count. #5008: each place carries its rule id, and a blocker the count
+ * includes but these bytes cannot place is named rather than dropped.
  */
 function formatStillUnfixedLine(
 	blockers: readonly Diagnostic[],
 	filePath: string,
 ): string {
-	const lines = [...new Set(inlineBlockerLines(blockers, filePath))];
-	const shown = lines.slice(0, 5).map((line) => `L${line}`);
-	if (lines.length > shown.length)
-		shown.push(`+${lines.length - shown.length} more`);
-	const where = shown.length > 0 ? ` (${shown.join(", ")})` : "";
 	const count = blockers.length;
-	return `🔴 Still unfixed: ${count} blocker${count === 1 ? "" : "s"} reported earlier${where}.`;
+	return `🔴 Still unfixed: ${count} blocker${count === 1 ? "" : "s"} reported earlier${formatBlockerPlaces(blockers, filePath)}.`;
+}
+
+/**
+ * #5108: the line a run without authorship (#3226) gets for blockers it
+ * withheld. The STOP block and the commit gate stay off for bytes pi-lens
+ * cannot prove the agent wrote, but the agent is told the blockers exist, so a
+ * withheld verdict never reads as the all-clear (defect shape 10). It states a
+ * fact and names where the findings are; it asks for no edit.
+ */
+export function formatWithheldBlockerLine(
+	count: number,
+	display: string,
+	host: LensToolHost = "pi",
+): string {
+	// #2535 F3: a host with no such tool gets no pointer, never a dead name.
+	const diagnosticsTool = resolveLensToolName("lens_diagnostics", host);
+	const pointer = diagnosticsTool
+		? ` ${diagnosticsTool} mode=all lists ${count === 1 ? "it" : "them"}.`
+		: "";
+	return `\u26a0 ${count} blocking finding${count === 1 ? "" : "s"} in ${display} withheld: the file was changed by a script, so pi-lens cannot tell it was your edit and shows no fix prompt.${pointer}`;
 }
 
 /**
  * #4483: the one line a write gets for linter errors the file already held
  * before its first edit this session (`DispatchResult.preExisting`). They do
- * not stop the agent or shut the commit gate. Bounded like the still-unfixed
- * line: at most five line numbers, then a count.
+ * not stop the agent or shut the commit gate. Bounded and counted the same way
+ * as the still-unfixed line (#5008).
  */
 function formatPreExistingLine(
 	findings: readonly Diagnostic[],
 	filePath: string,
 ): string {
-	const lines = [...new Set(inlineBlockerLines(findings, filePath))];
-	const shown = lines.slice(0, 5).map((line) => `L${line}`);
-	if (lines.length > shown.length)
-		shown.push(`+${lines.length - shown.length} more`);
-	const where = shown.length > 0 ? ` (${shown.join(", ")})` : "";
 	const count = findings.length;
-	return `ℹ Pre-existing: ${count} linter error${count === 1 ? "" : "s"} already in this file before its first edit this session${where}; not blocking.`;
+	return `ℹ Pre-existing: ${count} linter error${count === 1 ? "" : "s"} already in this file before its first edit this session${formatBlockerPlaces(findings, filePath)}; not blocking.`;
 }
 
 export interface FormatPhaseResult {
@@ -2575,6 +2651,8 @@ async function analysePipeline(
 		storedDiagnostics,
 		widgetOrder(),
 		analysisReadAtMs,
+		// #5258: the footer reads the same verdict as the write's line.
+		widgetUncheckedReason(dispatchResult.verdict),
 	);
 	// #502: emit the write batch's FINAL diagnostic state immediately after
 	// recordDiagnostics commits it — this call site runs after format,
@@ -2694,7 +2772,7 @@ async function analysePipeline(
 					turnIndex: ctx.telemetry?.turnIndex ?? 0,
 					writeIndex: ctx.telemetry?.writeIndex ?? 0,
 				},
-				inlineKeys.has(toKey(d)),
+				(ctx.inlineDeliveryAvailable?.() ?? true) && inlineKeys.has(toKey(d)),
 			);
 		}
 	}
@@ -2743,6 +2821,21 @@ async function analysePipeline(
 	}
 	if (preExisting.length > 0) {
 		output += `\n\n${formatPreExistingLine(preExisting, filePath)}`;
+	}
+	// #5108: a run without authorship records and delivers no blocker, but the
+	// ones it withheld are still on the file. Say so before the all-clear below
+	// can render over them.
+	const withheldBlockerLine =
+		!allowAutonomousWriters && liveBlockers.length > 0
+			? formatWithheldBlockerLine(
+					liveBlockers.length,
+					toRunnerDisplayPath(cwd, filePath),
+				)
+			: undefined;
+	if (withheldBlockerLine) {
+		output = output
+			? `${output}\n\n${withheldBlockerLine}`
+			: withheldBlockerLine;
 	}
 	if (fixedCount > 0) {
 		const detail =
@@ -2847,7 +2940,8 @@ async function analysePipeline(
 		// (a warning renders no text) and no blocker it keeps (a held-back one
 		// renders none in a run without authorship).
 		checkedClean =
-			dispatchResult.primaryLspChecked === true &&
+			dispatchResult.verdict.checked &&
+			dispatchResult.verdict.runnerIds.includes("lsp") &&
 			storedDiagnostics.length === 0;
 	}
 
@@ -2962,11 +3056,13 @@ async function analysePipeline(
 				: undefined,
 		// #4484: what a clear must find empty, whatever the authorship.
 		currentBlockerCount: liveBlockers.length,
+		...(withheldBlockerLine !== undefined && { withheldBlockerLine }),
 		...(preExisting.length > 0 && {
 			preExistingBlockerCount: preExisting.length,
 		}),
 		...(checkedWholeFile(dispatchResult) && {
 			fileVerdictComplete: true as const,
 		}),
+		verdictRunnerIds: verdictRunnerIds(dispatchResult),
 	};
 }

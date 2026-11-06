@@ -1,5 +1,56 @@
 # HISTORY
 
+## 2026-11-04 — generated proof line for a step that did not run (shape 90)
+
+The nightly LSP refresh composer (#5062, PR #5243) wrote a Tests section saying
+the flips were classified against master, also on the branch where the flip
+check had failed; the same body's Notes said the check could not run. The PR's
+lint test passed because it checked section presence, not the text. Review r1
+caught it; round 2 renders "could not run" on that branch and pins the text.
+The same session also recorded: a dropped false notice that turned an
+unchecked file "clean" (#5238, shape 10), npm logs written to the real home
+by two probes (shape 82), and a docs line that missed the enabled axis (#5242,
+shape 84). State-table rounds on `unmodelled` seams now add a TLA+ family
+(rule idea #4835).
+
+## 2026-11-02 — serial await of independent work on a hot path (shape 89)
+
+#2540: a cold first edit blocked ~7 s because the edit hook spawned the file's
+LSP servers one after another; #1409: the word-index rebuild walked its files
+with one `stat` at a time, 8 s on a slow filesystem. Both were fixed by
+overlapping the calls. A hot-path audit (2026-11-02) found one more candidate,
+the neighbour cascade's serial `references()` calls (#5174), and refuted its
+own top finding: dispatch groups already run in parallel and every
+`mode:"all"` group holds one runner. #5174 is measure-first because
+typescript-language-server answers one request at a time.
+
+## 2026-11-01 — learned attribution keyed on a name alone (shape 88)
+
+#4139: `lsp_navigation` mixes a write (`rename`) with read-only operations, and
+tier-4 learning classified the whole tool as an edit after two observed
+renames, so a plain hover on an unread file was refused. The fix exempted the
+registry names. #5160: pi-cursor-sdk replays Cursor's native edits as
+display-only `cursor` calls (`cursor-replay-` ids) after the file is written;
+Cursor's write landing in a replay's window taught the net `cursor`, and every
+later replay was refused "Edit without read". The fix keys on the id prefix
+(`isProviderReplayCall`), which also skips the read guard for built-in `edit`
+replays. Two carve-outs now: a third triggers the fail-closed redesign.
+The replays' write credits were shape 65 instances too (#5162 r3): a replayed
+`edit` or `write` re-baselined an existing authorship over another writer's
+bytes, and a replayed `bash` credited a first one from its window's git diff.
+
+## 2026-10-27 — factory-time read of a host value set later (shape 87)
+
+#4913: `pi --no-lens` still started language servers and ran the write-time
+runners. pi applies an extension flag's command-line value after every factory
+has run (`agent-session-services.js` `applyExtensionFlagValues`), and
+`index.ts` read `no-lens`, `no-lens-context`, `lens-compact-tool-line` and
+`--no-tool` inside the factory, where `pi.getFlag` answers the registered
+default. The pi double (`tests/support/pi-mock.ts`) applied flag values before
+the factory, so no test saw it (#4632). The four reads now happen in
+`session_start`; `tests/config/factory-flag-read-sweep.test.ts` refuses a new
+one, and `tests/index-4913-cli-flag-timing.test.ts` drives the real host order.
+
 ## 2026-10-25 — turn-count wait for real I/O (shape 86)
 
 Two tests waited for real I/O by counting event-loop turns. #4850 waited for the loss-notice bound in `tests/clients/fix-run-restore.test.ts`. #4830 did the same in `tests/index-3521-fork-tree-witness.test.ts`. Both went red on loaded CI runners, and #4852 moved both onto `waitFor`'s real-clock deadline. Master run 40191426869 went red on the #4850 cell before #4852 landed. The detector is tracked in #4865.
@@ -1241,7 +1292,7 @@ Diagnostics have one model-facing surface, `lens_diagnostics`; `source` selects 
 - **Map blast radius for every code PR.** Before and after editing, use `module_report` on each touched production module with `blastRadius: true`; inspect `callbacks[]`, closures, `usedBy`, entry points, and risk flags, then use `read_symbol`/`read_enclosing` for relevant bodies. The PR must state affected dependents, callbacks/entry points, and the verification plan—or explicitly record that the blast radius is empty/unavailable and why. Re-run this map after conflict resolution or architectural changes. If the change touches a hot path (per-spawn, per-file, per-render), MEASURE the cost delta and state the number. Silent per-call taxes ship otherwise: #1673 added 100 ms to every spawn across 118 call sites, #1687 multiplied a per-file budget, and #1701 cost 14x on the background scan. Every one was caught by a reviewer's measurement. None was stated by its author. `module_report` is a navigable structural/dependent view, not a complete function-level call graph; for call-graph work reuse `clients/call-graph.ts` or LSP incoming/outgoing-call navigation instead of inferring completeness from `usedBy` or `blastRadius`.
 - **Describe every test in the PR body.** The PR body (or a review-prompt appendix) carries a section naming each NEW test file/case and each EDIT of an existing test, with one line on what it pins and why it exists — a regression proof, a contract seam, an occupancy budget. A reviewer who cannot see what changed about the tests cannot review the change: silently swapping a real coordinator for a fake runtime inside an existing test is exactly the edit this section exists to expose.
 
-**PR body structure is advisory-linted.** Keep `Summary`, `Tests`, `Blast radius`, `Class sweep`, and `Observability` populated — plus `Test assessment` whenever the PR touches `tests/` (see "Test assessment and removal" under Test requirements); `scripts/check-pr-body.mjs` also checks runtime diff observability when its local range is available, so reviewers still judge the answers.
+**PR body structure is advisory-linted.** Keep `Summary`, `Tests`, `Blast radius`, `Class sweep`, and `Observability` populated — plus `Test assessment` whenever the PR touches `tests/` (see "Test assessment and removal" under Test requirements); `scripts/check-pr-body.mjs` also checks runtime diff observability when its local range is available, so reviewers still judge the answers. *(2026-10-31, #5003: the gate now reads the template's `Summary`, `Notes for the reviewer`, `Change outline` and `Proof and checks`, with `Tests`, `Class sweep`, `Observability` and `Fold check` inside the last; `Blast radius` is conditional and `Test assessment` is retired. The paragraph above stays as the 2026-09 record.)*
 
 **Draw the blast radius as a call-tree diff (optional, text only; 2026-09-06).** Prose blast radius keeps missing callers. When a change touches a shared seam, the `Blast radius` section may carry a call-tree diff: the changed symbol, its callers above, its callees below, with `+`/`-` on the lines that moved (`resyncLspFile` / `  touchFile` / `+ getAuxiliaryClientsForFile`). A fix round that changes ordering or control flow shows the before/after as a flow diff of the same shape. The reviewer verifies the tree against grep, which is what the reviewer playbook's neighbourhood rule asks for. Never HTML, Mermaid, or diagrams for their own sake — the smallest text view that makes the reviewer's check mechanical.
 
@@ -4622,7 +4673,7 @@ A 2026 audit against `@earendil-works/pi-coding-agent` confirmed a few places wh
 The sync→async spawn migration is complete; the patterns above (`safeSpawnAsync`, ambient abort signal, async-only `createAvailabilityChecker`, per-client `*Async` probes) are the steady state. What's intentionally left sync, by design — do **not** "fix" this without a real reason:
 
 - `TestRunnerClient.detectRunner`'s `which pytest` probe — cached per `(cwd, runner)`, fires once for a Python project with no config-file runner; converting it would ripple async through five methods (`findTestFile`/`getTestRunTarget`/`suggestTestFiles`/…) into the per-edit turn path for a one-time stutter.
-- The deprecated `safeSpawn`/`isCommandAvailable`/`findCommand` exports in `clients/safe-spawn.ts` stay only for the two cases above.
+- The deprecated `safeSpawn`/`findCommand` exports in `clients/safe-spawn.ts` stay only for the two cases above.
 
 For new runner tests, mock `safeSpawnAsync` (async); only mock the sync `safeSpawn` when testing one of the two legacy callers above.
 
@@ -4685,7 +4736,7 @@ When changing a serialized cache that feeds this pipeline (e.g. `clients/cache/r
 
 pi-lens's first `pi.events` broadcast surface: `clients/bus-publish.ts` exports `publishFilesTouched({ reason: "autofix" | "format", paths, cwd, origin? })`, fire-and-forget over `pi.events.emit` (wired once at extension factory time in `index.ts` via `wireBusEmitter`; null-safe when unwired, e.g. unit tests and the MCP server path with no pi host). Payload is frozen-additive (`{ v: 1, source: "pi-lens", reason, paths, cwd }`; bump `v` on a breaking change), one event per logical write batch. Wired at every seam where pi-lens writes project source autonomously: `runPipeline`'s immediate-format and autofix phases, `handleAgentEnd`'s deferred-format loop, and the actionable-warnings conservative LSP autofix — NOT at seams where pi-lens replays the agent's own edit content (partial-edit-apply preflight, ast-grep/lsp-navigation agent tool calls with `apply:true`) since the host already knows about agent-authored writes. `origin: "bus"` is a structural loop guard for a future bus-consuming feature (pi-lens consumes nothing today). Kill switch `PI_LENS_BUS_PUBLISH=0`. Full contract: `docs/features.md` ("Bus Events"); env var: `docs/environment-variables.md`. Refs `#478` (planned `pilens:rpc:*` query surface, same versioning discipline).
 
-**First-class seam census (pinned by `tests/config/files-touched-bus-conformance.test.ts`).** The two publisher modules are `clients/pipeline.ts` (immediate format and synchronous autofix) and `clients/runtime-agent-end.ts` (deferred autofix, deferred format, and actionable-warning LSP autofix). The one subscriber is `clients/agent-nudge.ts`, which listens through `pi.events.on` and filters paths against read-guard history before batching a context nudge. `clients/lsp-mutation.ts` has an unwired optional `publishFilesTouched?: (paths: string[]) => void` injection point; it is not a publisher unless someone wires that callback. A new publisher or subscriber MUST update that declared list and state why `pilens:files:touched` applies at the new seam; the conformance test fails otherwise. The publisher list names modules, not individual call sites: each listed module may have multiple logically distinct write completions, but every publication remains one event per logical write batch.
+**First-class seam census (pinned by `tests/config/files-touched-bus-conformance.test.ts`, deleted under #3995).** The two publisher modules are `clients/pipeline.ts` (immediate format and synchronous autofix) and `clients/runtime-agent-end.ts` (deferred autofix, deferred format, and actionable-warning LSP autofix). The one subscriber is `clients/agent-nudge.ts`, which listens through `pi.events.on` and filters paths against read-guard history before batching a context nudge. `clients/lsp-mutation.ts` has an unwired optional `publishFilesTouched?: (paths: string[]) => void` injection point; it is not a publisher unless someone wires that callback. A new publisher or subscriber MUST update that declared list and state why `pilens:files:touched` applies at the new seam; the conformance test fails otherwise. The publisher list names modules, not individual call sites: each listed module may have multiple logically distinct write completions, but every publication remains one event per logical write batch.
 
 **Observability.** A publish does leave an outcome record today: `clients/bus-publish.ts` writes bounded `emitted`/failure or structural-skip outcomes to `bus-events.log`, and emitted activity rolls up once per session in `latency.log`. It deliberately does not persist a second copy of every path-bearing payload: writes are high-frequency, `recent-touches` is the separate bounded cross-process aggregate, and the subscriber receives the in-process payload directly. Keep outcome-level records and the session aggregate; adding one durable record per file or per payload would duplicate data and add hot-path noise.
 
@@ -4995,16 +5046,22 @@ Eleven screens. The first six were distilled from nine adversarially reviewed PR
 
 ### Test assessment and removal (value discipline)
 
+> 2026-10-31, #5003: the PR template no longer has a `### Test assessment`
+> clause and the lint no longer gates it. The per-file proof lives in
+> `### Tests` (a red-first transcript or a `Control:` line). The removal rules
+> below still bind.
+
 The screens above catch tests that are broken; this section addresses tests
 that are merely worthless — redundant sibling pins, characterization tests
 that outlived their purpose, load-heavy files pinning one behavior three
 ways. That weight is what the suite pays for in runtime, OOM pressure, and
 contention flakes.
 
-- **Every PR that touches a test file carries a Test assessment** (the PR
-  template's `### Test assessment` clause): per touched test FILE, one line
-  on what behavior it uniquely pins, plus any test the PR makes redundant.
-  Scope is the touched files only — never the whole suite.
+- **Retired 2026-10-31 (#5003): the PR template's `### Test assessment`
+  clause.** Until then every PR that touched a test file carried one line per
+  touched test FILE on what behavior it uniquely pins, plus any test the PR
+  made redundant. The proof now lives in `### Tests`. Scope stays the touched
+  files only — never the whole suite.
 - **Removal requires proof, not judgment.** A test may be removed only when
   a NAMED surviving test reds on the same mutations the removed test would
   have redded on. Run the mutations and quote the surviving red. "Low value"
@@ -5017,7 +5074,7 @@ contention flakes.
   re-asserts a sibling's exact assertions on the same fixture is weight with
   no guard behind it. Fixers are EXPECTED to delete these while working in a
   file — quote the mutation sweep that shows nothing reds, list each deleted
-  case in `Test assessment`, and move on. Deferring an obvious deletion to
+  case in `### Tests`, and move on. Deferring an obvious deletion to
   the ledger is the failure mode, not the safe choice (maintainer, 2026-09-03).
 - **Removal candidates you identify but do not delete go to the corpus
   value ledger issue** (deferral hygiene: the candidate is recorded with the
@@ -5368,17 +5425,20 @@ A fix on `clients/lsp/`, the read guard, tool registration, or session lifecycle
   row↔probe tie test cannot see a row that never passes (#2893).
 - Before handoff, run `npm run preflight` last and paste its table in
   `PR_BODY.md` — a handoff without it is incomplete.
-- One set of template headings per PR. A fix round APPENDS `## Round N` and
-  edits the existing `## Observability` / `## Tests` sections in place; it
+- One set of template headings per PR. A fix round edits the existing
+  sections in place and never appends a `## Round N` section (#5026); it
   never adds a second `## Observability` (the lint reads the first one, and a
   stale first section was the most common `PR body` red on 2026-09-10). Lint
   the FULL body you will publish (`gh pr view <n> --json body -q .body` plus
   your round), against the real `origin/master...HEAD` diff (fetch first),
   not a hand-shaped diff.
 - `PR_BODY.md` passes `node scripts/check-pr-body.mjs --lint-local PR_BODY.md`
-  before handoff. The gate requires the headings `## Summary`, `## Tests`,
-  `## Blast radius`, `## Class sweep`, `## Observability`, and
-  `## Test assessment` whenever the diff touches `tests/`; Observability
+  before handoff. The gate requires the headings `## Summary`,
+  `## Notes for the reviewer`, `## Change outline` and `## Proof and checks`,
+  and inside the last `### Tests`, `### Class sweep`, `### Observability` and
+  `### Fold check` (2026-10-31, #5003; before that the gate required
+  `## Blast radius` and, for a diff touching `tests/`, `## Test assessment`);
+  Observability
   names a record literal that appears in the runtime diff, and may say
   exactly "No new failure path; no record added." only when the diff adds no
   failure path (no new catch, fallback or degradation branch). Record: on

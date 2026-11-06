@@ -7,8 +7,9 @@
  * runs seven detectors over every `tests/**\/*.test.ts` file —
  *
  * 1. `real-process-spawn` — a real child process (`child_process` import,
- *    `execFileSync`/`spawnSync`/`execSync`, a support spawn-helper call, or a
- *    spawn whose argv mentions `vitest`).
+ *    `execFileSync`/`spawnSync`/`execSync`, a support spawn-helper call, a
+ *    spawning kit helper in a file that names its kit (#3801), or a spawn
+ *    whose argv mentions `vitest`).
  * 2. `elapsed-time-assertion` — a DELTA of two clock reads flowing into a
  *    numeric matcher (`toBeLessThan`/`toBeGreaterThan`/…).
  * 3. `raw-timer-wait` — a raw `setTimeout`/`setInterval` wait outside a
@@ -77,6 +78,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 
 import vitestConfig, { realHarnessInclude } from "../../vitest.config.ts";
 import {
+	AST_GREP_SPAWN_EXEMPTIONS,
 	admissionHeader,
 	countsByDetector,
 	type DetectorName,
@@ -136,7 +138,7 @@ const FROZEN_BASELINE_PATH = "tests/support/flake-shape-baseline-frozen.json";
 
 /** sha256 of the mint's canonical JSON (formatting and line endings do not count). */
 const FROZEN_BASELINE_DIGEST =
-	"db2450d7da2f0123a5bd4d366156598e709aea5a356073095ccc27ce0c9afbc2";
+	"406a80c14aa52bfc18be6170e013e4bee876c9058e40f059cd1073e55cee5ce5";
 
 const FROZEN_BASELINE_SOURCE = fs.readFileSync(
 	path.join(repoRoot, FROZEN_BASELINE_PATH),
@@ -218,6 +220,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the defect is wall-clock only (super-linear ast-grep rule YAML language extraction); a fake clock measures nothing",
 	},
+	"elapsed-time-assertion:clients/lsp/partial-message-timer.test.ts": {
+		detector: "elapsed-time-assertion",
+		reason:
+			"#5173 must distinguish natural host exit within 3 seconds from the dependency’s pending 10-second tick; fake clocks cannot measure another process’s exit",
+	},
 	// 2026-09-11 (#2886 round 2): the /lens-perf occupancy row keeps one
 	// real-clock sampler assertion alongside its deterministic yield count —
 	// event-loop occupancy has no deterministic proxy; the yield count is
@@ -264,6 +271,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 			reason:
 				"the defect is wall-clock only (2^N globstar backtracking); a fake clock measures nothing",
 		},
+	// 2026-10-29 (#4965 round 1): the cache observability's session state moved
+	// onto the session's scope; the summary and baseline rows are only visible in
+	// the logLatency call, as in cache-observability.test.ts.
+	"in-process-mock:clients/cache-observability-session-scope.test.ts::clients/latency-logger":
+		{
+			detector: "in-process-mock",
+			reason:
+				"the cache_usage_summary and baseline rows go through logLatency and test mode skips the file sink, so a passed-through spy is the only reader; the scope store under test is real",
+		},
 	// 2026-10-15 (#1712/#4485): the cascade's live twin over a real classic
 	// TypeScript server. Installation is the external tool boundary: the stub
 	// hands the real wrapper and a classic compiler to the real launcher.
@@ -273,6 +289,33 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 			reason:
 				"tool installation and discovery are the host boundary; the stub hands the real typescript-language-server wrapper and a classic compiler to the real launcher, service, client and cascade",
 		},
+	// 2026-10-30 (#5040): the acceptance cell drives the REAL cascade and the
+	// REAL touchFile, so only the language-server client, the graph edges it
+	// walks, the logger it writes and the quiet-window scheduler stand in.
+	"in-process-mock:clients/cascade-pre-edit-answer-5040.test.ts::clients/cascade-logger":
+		{
+			detector: "in-process-mock",
+			reason:
+				"the cell asserts the neighbour_touch row that records WHY a neighbour is unconfirmed; test mode skips the file sink, so the call itself is the only read-back",
+		},
+	"in-process-mock:clients/cascade-pre-edit-answer-5040.test.ts::clients/lsp/client":
+		{
+			detector: "in-process-mock",
+			reason:
+				"a language server is a spawned process; the subject is a push-only server that publishes an importer once and then stays silent, which no real server can be asked to do on demand. Everything above the client — the service, the notify-skip gate, the merge — is real",
+		},
+	"in-process-mock:clients/cascade-pre-edit-answer-5040.test.ts::clients/quiet-window":
+		{
+			detector: "in-process-mock",
+			reason:
+				"the quiet window is a session scheduler the unit lane must not arm; the cell's claim is the run verdict, not the sweep",
+		},
+	"in-process-mock:clients/cascade-pre-edit-answer-5040.test.ts::clients/review-graph/service":
+		{
+			detector: "in-process-mock",
+			reason:
+				"the review graph is a separate subsystem with its own suite; its file-level edges are the fixture here, and the cascade's own neighbour walk is what the cell proves",
+		},
 	// 2026-10-16 (#4495 round 3): the cascade's pending gate runs the shared
 	// freshness gate quiet; whether its rows were written is only visible in
 	// the logLatency call, since turn_end overruns the five-phase ring.
@@ -281,6 +324,16 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 			detector: "in-process-mock",
 			reason:
 				"the freshness gate writes its rows through logLatency; turn_end logs more phases after the gate than the five the getRecentLoggedPhases ring keeps, and test mode skips the file sink, so a passed-through spy is the only reader",
+		},
+	// 2026-10-29 (#4990): the demoted channel's policy pass writes its
+	// inline_blocker_policy row through logLatency; turn_end logs more phases
+	// after it than the five-phase ring keeps, and test mode skips the file
+	// sink, so a passed-through spy is the only reader.
+	"in-process-mock:clients/demoted-finding-4990.test.ts::clients/latency-logger":
+		{
+			detector: "in-process-mock",
+			reason:
+				"the inline_blocker_policy row goes through logLatency; turn_end logs more phases after it than the five the getRecentLoggedPhases ring keeps, and test mode skips the file sink, so a passed-through spy is the only reader",
 		},
 	// 2026-10-21 (#4638 review): the behaviour under test is the post-write
 	// runner admission of a server answer, so the capability seam hands it a
@@ -294,7 +347,7 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	// 2026-10-16 (#4476): the same fake auxiliary, seen from the role lookup
 	// the registry's dependency restart asks; getServerById knows only the
 	// built-in catalog, so the auxiliary added above answers there too.
-	"in-process-mock:clients/head-move-resync-4493.test.ts::clients/lsp/server": {
+	"in-process-mock:clients/head-move-resync-4476.test.ts::clients/lsp/server": {
 		detector: "in-process-mock",
 		reason:
 			"getServerById reads only the built-in catalog, so the auxiliary fake the config lookup adds is answered there too; the restart then keeps it, and every server is still a real child process",
@@ -335,6 +388,31 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 			reason:
 				"tool installation and discovery are the host boundary; the stub hands the real typescript-language-server wrapper and a classic compiler to the real launcher, service, client and rename/watched-files paths",
 		},
+	// 2026-11-01 (#5127): the custom-server cells drive the real config loader,
+	// registry compile and the registered server's own spawn; the launcher is
+	// the child-process boundary, and its call arguments are what the contract
+	// (program, then tail, then args) is asserted on.
+	"in-process-mock:clients/lsp/custom-server-command-array.test.ts::clients/lsp/launch":
+		{
+			detector: "in-process-mock",
+			reason:
+				"the launcher is the child-process boundary; the loader, registry compile and the server's own spawn are real and the asserted effect is the program and argv handed to it",
+		},
+	// 2026-10-27 (#4914): the effect-tsgo selection cells drive the real
+	// TypeScriptServer.spawn and the real project-trust gate; the installer is
+	// the host boundary and the launcher the child-process boundary, so nothing
+	// here starts a language server.
+	"in-process-mock:clients/lsp/effect-tsgo-lsp.test.ts::clients/installer/index":
+		{
+			detector: "in-process-mock",
+			reason:
+				"tool installation and discovery are the host boundary; the stub answers no managed tool so the selection under test comes only from the fixture node_modules tree",
+		},
+	"in-process-mock:clients/lsp/effect-tsgo-lsp.test.ts::clients/lsp/launch": {
+		detector: "in-process-mock",
+		reason:
+			"launchLSP is the child-process boundary and records which command and arguments the production spawn chose; the trust gate beside it in the same module is the real one",
+	},
 	// 2026-10-14 (#4346): the ast-grep native addon's load is the host
 	// boundary, and `loadAstGrepNapiSync` is its only seam; no host lane
 	// lacks the addon, so the fail-closed record has no real driver.
@@ -360,6 +438,27 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 			detector: "in-process-mock",
 			reason:
 				"the lsp_aux_wait_outcome and lsp_rules_refreshed rows are outside the getRecentLoggedPhases ring (LAST_PHASE_EXCLUDED) and test mode skips the file sink, so a passed-through logLatency spy is the only reader of the per-touch published counts and held-publish counter (#4763)",
+		},
+	// 2026-10-28 (#4929): the fallow opt-in cells drive the real registry, config
+	// selection, trust gate and LSPService acquisition; the launcher, the
+	// transport and the installer are the process and network boundaries.
+	"in-process-mock:clients/lsp/opt-in-auxiliary-4929.test.ts::clients/installer/index":
+		{
+			detector: "in-process-mock",
+			reason:
+				"tool installation and discovery are the host boundary; the stub records whether the opt-in server's install was reached and never downloads",
+		},
+	"in-process-mock:clients/lsp/opt-in-auxiliary-4929.test.ts::clients/lsp/client":
+		{
+			detector: "in-process-mock",
+			reason:
+				"createLSPClient is the JSON-RPC transport boundary; the acquisition, selection and trust gate around it are the real ones",
+		},
+	"in-process-mock:clients/lsp/opt-in-auxiliary-4929.test.ts::clients/lsp/launch":
+		{
+			detector: "in-process-mock",
+			reason:
+				"launchLSP is the child-process boundary and records which command and arguments the production spawn chose; the trust gate beside it in the same module is the real one",
 		},
 	// 2026-10-23 (#4785 F4): the touch's verdict over the real wait, publish
 	// handler and clear; only the client factory, which spawns the server, is
@@ -398,6 +497,21 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 			detector: "in-process-mock",
 			reason:
 				"two activations in one process each assert their own module-level resetLSPService spy, and the singleton lifecycle holds one beforeReset at a time, so the seam cannot tell the activations apart; the stand-in spawns no language server",
+		},
+	// 2026-11-01 (#5108 remainder): delays the REAL pipeline to stand in for a
+	// cold analyzer that outruns the inner 10 s bound.
+	"in-process-mock:index-5108-opaque-blocker-disclosure-witness.test.ts::clients/pipeline":
+		{
+			detector: "in-process-mock",
+			reason:
+				"a pass-through wrapper delays the real runPipeline past the 10 s inner bound (a cold analyzer stand-in) and then runs it unchanged; dispatch, advisory queue and the pi session stay real, and no installed analyzer is slow on demand",
+		},
+	// 2026-10-31 (#5108): pass-through wrapper that holds the real handler open.
+	"in-process-mock:index-5108-opaque-blocker-disclosure-witness.test.ts::clients/runtime-tool-result":
+		{
+			detector: "in-process-mock",
+			reason:
+				"a pass-through wrapper holds the real handler open past the host bound and records its return value; dispatch, pipeline, advisory queue and the pi session stay real (precedent: index-2939-tool-result-budget-witness.test.ts)",
 		},
 	// 2026-10-21 (#4675 r2): the format smoke runs the REAL FormatService and
 	// formatter selection; installation is the network boundary, so the stub
@@ -473,6 +587,39 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 			reason:
 				"a cancelled timer produces no event to await; a bounded real window observes the absence, and every assertion is a count, never elapsed ms",
 		},
+	// 2026-11-03 (#5159): the census warms the real MCP child's background
+	// review-graph build before it classifies the project_report JSON cell; the
+	// build is the contention model and a fake clock cannot advance that child.
+	"raw-timer-wait:config/result-contract-governance.test.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"the census polls the real MCP child's background review-graph build before classifying the project_report JSON cell; a fake clock cannot advance that child's build",
+	},
+	// 2026-10-31 (#5108): the read-only bound is a live wall deadline.
+	"raw-timer-wait:index-5108-opaque-blocker-disclosure-witness.test.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"the read-only host bound is a live wall deadline racing a held handler; the inner pipeline-bound unit witness uses fake timers, so it adds no real wait",
+	},
+	// #5150 R2: the parity smoke waits for the real MCP child's background
+	// review-graph build before it can compare the two surfaces' text; the wait
+	// is a poll of that live child's own build, not a fixed sleep.
+	"raw-timer-wait:mcp/project-report-text-parity.smoke.test.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"the real MCP child builds its own review graph in the background; a fake clock cannot advance that child's build, so the parity compare polls until it serves",
+	},
+	// #5159: the stale-cell smoke bumps the stamp file's mtime and settles
+	// before the next tools/call; the wait is a real clock in the spawned
+	// child's own process, which a fake clock here cannot advance. #5221 fold:
+	// the project_report JSON case also polls that child's background
+	// review-graph build (the second hit), the same admission the census and
+	// parity smoke carry for their graph-build polls.
+	"raw-timer-wait:mcp/stale-json-advisory.smoke.test.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"the spawned MCP child re-stats the real stamp file and builds its review graph in the background; a fake clock in this process cannot advance either, so the settle and the bounded poll of that build are real timers",
+	},
 	// 2026-09-15 (#2042 cheapest probe): the sample-tail file is written by the
 	// wrapper's own real setInterval loop in a separate process; a poll waits
 	// for that file's first write rather than a fixed sleep, and one case kills
@@ -492,6 +639,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"fault injection must model real timer and child teardown timing; fake timers cannot reproduce the boundary",
 	},
+	// 2026-10-27 (#4913): a spawn by the loaded extension copy, or its absence
+	// over a bounded window, is joinable only by polling the file the real
+	// child writes.
+	"raw-timer-wait:support/marker-lsp-project.ts": {
+		detector: "raw-timer-wait",
+		reason:
+			"the marker server is a real child the extension spawns on its own schedule, so a spawn or its absence over a bounded window is joinable only by polling the file it writes",
+	},
 	"raw-timer-wait:support/real-pi-harness.ts": {
 		detector: "raw-timer-wait",
 		reason:
@@ -510,6 +665,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"real git worktree metadata is written and registered by Git; an in-process double cannot prove linked-worktree ownership",
+	},
+	"real-process-spawn:clients/ast-grep-replace-descendant-kind.e2e.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real sg execution proves CLI match behavior; a runner stub cannot exercise the binary.",
 	},
 	// 2026-10-21 (#4713 R11): real `bash -c` is the oracle for which
 	// directory each generated spelling enters and where its redirect lands;
@@ -574,12 +734,33 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"real bash decides which generated spelling runs git commit or git push; a stubbed shell decodes no word",
 	},
+	// 2026-10-27 (#4930): the child's own environment and a real git's write to
+	// .git/index are the observations; the lock lives ~40 ms, so the witness
+	// reads the index a stat-dirty `git status` would rewrite.
+	"real-process-spawn:clients/git-optional-locks-4930.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"a real git decides whether a stat-dirty index is rewritten and a real child reads its environment; a stub sees neither",
+	},
 	"real-process-spawn:clients/git-tracked-ignore.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"real git children decide tracked-versus-ignored files from index state no stub reproduces",
 	},
+	// #3801 (review F2): split out of head-move-resync-4493; its spawns run through the kit.
+	"real-process-spawn:clients/head-move-resync-4476.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"a clean-tree HEAD move only exists in a real repository that git checks out, rebases or resets; a stubbed git cannot rewrite the files the server holds",
+	},
+	// #3801 (review F2): the head-move driver's real git, now read through the kit.
 	"real-process-spawn:clients/head-move-resync-4493.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"a clean-tree HEAD move only exists in a real repository that git checks out, rebases or resets; a stubbed git cannot rewrite the files the server holds",
+	},
+	// #3801 (review F2): split out of head-move-resync-4493; its spawns run through the kit.
+	"real-process-spawn:clients/head-move-resync-4507.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"a clean-tree HEAD move only exists in a real repository that git checks out, rebases or resets; a stubbed git cannot rewrite the files the server holds",
@@ -630,10 +811,56 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"six real Node writers must rendezvous on an OS barrier and contend through the production cross-process lock; an in-process double cannot reproduce the race",
 	},
+	"real-process-spawn:clients/lsp/client-crash-logging.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/client-exit-cause-ledger.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/client-retention-process-scope.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/config-section-answers-4758.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/crash-respawn-debounce-wire.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/did-save-notification.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	["real-process-spawn:clients/lsp/fake-lsp-" +
+	"server-parent-watchdog.test.ts"]: {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
 	"real-process-spawn:clients/lsp/headless-tool-call-keepalive.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"a real child's exit code is the observation; no in-process double can watch an event loop decide to drain",
+	},
+	"real-process-spawn:clients/lsp/initialize-timeout-backstop.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/integration.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
 	},
 	"real-process-spawn:clients/lsp/kill-process-tree-real-child.test.ts": {
 		detector: "real-process-spawn",
@@ -645,16 +872,127 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"real Lean elaboration and diagnostic publication require Lake and elan across the child-process boundary; the serialized wall-clock lane isolates the handshake and diagnostic wait",
 	},
+	"real-process-spawn:clients/lsp/liveness-probe-capability-gate.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/navigation-timeout.integration.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/opengrep-late-empty-4786.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/opengrep-new-file-4787.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/opengrep-offline-config-failure.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/partial-message-timer.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"#5169 requires natural exit of a separate Node host after a real LSP truncated message",
+	},
+	"real-process-spawn:clients/lsp/powershell-bom-wire-5151.integration.test.ts":
+		{
+			detector: "real-process-spawn",
+			reason:
+				"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+		},
+	"real-process-spawn:clients/lsp/refresh-and-sync-kind.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/service-notify-cpu-liveness.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/service-notify-inflight-throttle-real-stream.test.ts":
+		{
+			detector: "real-process-spawn",
+			reason:
+				"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+		},
+	"real-process-spawn:clients/lsp/service-rename-file.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/shutdown-live-wedged-process.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/teardown-logging.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
 	"real-process-spawn:clients/lsp/unheld-module-pyright-4742.integration.test.ts":
 		{
 			detector: "real-process-spawn",
 			reason:
 				"a clean-tree HEAD move needs a real git checkout and a closed module's stale bytes live only in a real pyright-langserver child; no double reproduces what the server kept",
 		},
+	"real-process-spawn:clients/lsp/watched-clear-5131.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/watched-files-created-4320.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/lsp/workspace-diagnostics-sweep-attribution.integration.test.ts":
+		{
+			detector: "real-process-spawn",
+			reason:
+				"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+		},
+	// 2026-10-31 (#5119): markdownlint-cli2's own directory-config merge and fix
+	// pass are the behaviour under test (`"fix": true` made a lint run write the
+	// file); the real module's bytes are the witness and its CLI is the parity
+	// reference; serialized in the wall-clock lane.
+	// 2026-11-01 (#5119 review r1): the no-fix wrapper runs cli2's `main` in a
+	// child so the spawn budget can kill a spinning rule; the kill, the late-throw
+	// exit and the fresh import of an edited config are properties of a real
+	// node process, driven through the runner's own spawn seam.
+	"real-process-spawn:clients/markdownlint-api.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"a spinning rule is killed at the budget, a late throw ends only the child and an edited config is imported fresh; each exists only in a real node child",
+	},
+	"real-process-spawn:clients/markdownlint-no-fix-real.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"markdownlint-cli2's config merge and fix pass decide whether a lint run writes; a fake module would encode the guess that no option was missing",
+	},
 	"real-process-spawn:clients/mcp/review-rebuild.test.ts": {
 		detector: "real-process-spawn",
 		reason:
 			"the resolver verdict runRebuild acts on comes from the real package-manager lookup spawning the real which and executable stand-in managers on PATH; a doubled resolver hands each case the manager it then asserts on",
+	},
+	"real-process-spawn:clients/memory-sampler-root-discriminator.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
+	"real-process-spawn:clients/memory-sampler.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
 	},
 	"real-process-spawn:clients/metrics-history-stderr.test.ts": {
 		detector: "real-process-spawn",
@@ -668,6 +1006,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"the subject is the real git status children a captured tool call spawns, counted at the spawn boundary; a stubbed git answers only the count it was given",
+	},
+	"real-process-spawn:clients/opaque-mutation-scan.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
 	},
 	"real-process-spawn:clients/project-data-dir-slug.test.ts": {
 		detector: "real-process-spawn",
@@ -702,6 +1045,13 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"a real child reads stdin bytes through the pipe that safeSpawnAsync must close correctly",
 	},
+	// #5064: the ownership guard reads the live child's /proc ppid, so the
+	// child is real; the mock beside it on the same module would hide it.
+	"real-process-spawn:clients/safe-spawn-kill-ownership.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the kill-ownership cases need a real live child of this process: the ownership guard reads its /proc ppid, which no double carries; the child starts through vi.importActual beside the file's own child_process mock",
+	},
 	"real-process-spawn:clients/safe-spawn-resource-usage.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -728,6 +1078,13 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"real git children expose shared-checkout branch-switch races that an in-process model cannot reach",
+	},
+	// #5064: taskkill's pid is the real child this file starts through
+	// vi.importActual beside its own child_process mock, so the census reads it.
+	"real-process-spawn:clients/system32-exe-seam-fold.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the taskkill tree-kill case needs a real live child of this process: safeSpawnAsync's ownership guard reads its /proc ppid, which no double carries; the child starts through vi.importActual beside the file's own child_process mock",
 	},
 	"real-process-spawn:clients/test-runner-resolve-exec.test.ts": {
 		detector: "real-process-spawn",
@@ -788,6 +1145,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the subject is what a real non-bash tool writes into a real git checkout, detected by git's own status; a stubbed git answers only what it was told",
 	},
+	// 2026-10-31 (#5108): a script-written file's blocker must reach the model
+	// through a real bash tool call, and the abandonment is a real 500 ms wall
+	// bound racing a handler held open past it.
+	"real-process-spawn:index-5108-opaque-blocker-disclosure-witness.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the subject is what a real bash tool call writes into a real git checkout and what the model receives for it, detected by git's own status; a stubbed shell answers only what it was told",
+	},
 	// 2026-09-03: the published-manifest guard must run the real `npm pack`
 	// (prepack/postpack are npm lifecycle hooks); header on the file states why.
 	"real-process-spawn:packaging-pack-manifest.test.ts": {
@@ -830,6 +1195,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	// with the clean edit's mtime preserved (the edit-during-scan state), and
 	// the reporter's own two-WORKTREE configuration, which needs two roots
 	// under one home and therefore two more children.
+	"real-process-spawn:real-harness/clean-verdict.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the write's tool-result line is built by the real pi host's tool_result handler; no in-process double reaches the line a model reads (#5258)",
+	},
 	"real-process-spawn:real-harness/diagnostic-provenance.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -932,6 +1302,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the nightly CLI runs as a real child with PATH at a recorded gh stand-in; an in-process double would not prove its annotation escapes or exit codes",
 	},
+	// 2026-11-02 (#5207): the libc drift guard compares the working lock
+	// against HEAD's committed blob through real git in a fixture repository,
+	// so the split a reviewer sees is the split the guard refuses; a stub would
+	// restate the comparison.
+	"real-process-spawn:scripts/check-lockfile-sync.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the libc drift guard reads HEAD's committed lock through a real git child in a fixture repository; a stub would restate the comparison instead of proving the committed-versus-working split",
+	},
 	"real-process-spawn:scripts/check-pr-body.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -1003,9 +1382,19 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"gitignore/tracked-vs-untracked resolution is the mechanism under test; no mock reproduces git's own resolution faithfully",
 	},
-	// #4047: the CLI's verdict and exit code are what a delegated lane acts on;
-	// they come from parsing the real selector, red-on-base and vitest
-	// transcripts over a real Git fixture, which an in-process stub restates.
+	// #3801 (review F2): split out of lane-check.test.ts; the CLI runs through the kit.
+	"real-process-spawn:scripts/lane-check-lock.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the CLI's verdict and exit code are parsed from the real selector, red-on-base and vitest transcripts over a real Git fixture; an in-process stub restates the transcript instead of proving the parse",
+	},
+	// #3801 (review F2): split out of lane-check.test.ts; the CLI runs through the kit.
+	"real-process-spawn:scripts/lane-check-secondary.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the CLI's verdict and exit code are parsed from the real selector, red-on-base and vitest transcripts over a real Git fixture; an in-process stub restates the transcript instead of proving the parse",
+	},
+	// #4047: the CLI's verdict and exit code, read through the lane-check kit (#3801 F2).
 	"real-process-spawn:scripts/lane-check.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -1020,6 +1409,15 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"resolves oxlint's real --print-config for lint:js and lint:js:advisory; no in-process double is faithful",
+	},
+	// #5249: the Lint prose selection diffs real fixture repos through real `git`
+	// (a shallow clone's unreadable base, git's quoted path names), and the step
+	// case runs the workflow's own run block under real `bash` and `node`; no
+	// in-process double reproduces those boundaries or the step's exit wiring.
+	"real-process-spawn:scripts/lint-prose-files.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the prose selection and the Lint prose run block are the subject; they read real git diffs of fixture repos and the step's exit status under real bash and node, which an in-process double cannot prove",
 	},
 	"real-process-spawn:scripts/lockfile-completeness.test.ts": {
 		detector: "real-process-spawn",
@@ -1096,6 +1494,13 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the real hook pipes git through xargs into the pinned oxfmt; the exit-123 refusal and handoff refusal are process-boundary facts",
 	},
+	// #3801: the lock-admission cases split out of pre-push-targeted-tests.test.ts;
+	// the same real hook chain (`.husky/pre-push` -> selector -> lock wrapper).
+	"real-process-spawn:scripts/pre-push-lock-admission.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the cases drive the real pre-push hook chain over a git fixture and read its exit status and the lock wrapper's timeout line; an in-process call cannot see either",
+	},
 	"real-process-spawn:scripts/pre-push-targeted-tests.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -1141,6 +1546,14 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "real-process-spawn",
 		reason:
 			"what a spawned child inherits (HOME, USERPROFILE, XDG dirs) is only observable in the child process",
+	},
+	// 2026-11-03 (#4096 fold): whether each script's main runs when node starts
+	// it, through a symlinked path, or on a bare import is decided from the
+	// real argv[1] and module URL of a real node process.
+	"real-process-spawn:scripts/script-entry-gate-cells.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"a script's entry decision reads the real process.argv[1] and module URL, which an in-process call of isMainModule cannot show every script routes through",
 	},
 	// #3401: the seed script's default git argv (depth-2 fetch, refspec, blob
 	// specs) only means something against a real repo and a depth-1 clone.
@@ -1212,6 +1625,19 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the record's landing spot is decided by a child's own env-pinned os.homedir() fallback; unobservable in-process",
 	},
+	// #5111: the worktree-removal helper's decision over a real git fixture --
+	// the worktree registry, the on-disk node_modules symlink-or-directory
+	// state, and the unlink-before-remove ordering decide the run.
+	"real-process-spawn:scripts/worktree-remove.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the helper's real git fixture, node_modules symlink state, and unlink-before-remove ordering are the subject; an in-process double restates none of them",
+	},
+	["real-process-spawn:support/fake-lsp-" + "server.test.ts"]: {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
 	"real-process-spawn:support/fault-injection.test.ts": {
 		detector: "real-process-spawn",
 		reason:
@@ -1232,6 +1658,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"the stub exists so production lookups spawn real executable stand-ins; its fidelity (hermetic PATH, the served query, restore) is only observable through a real child",
 	},
+	"real-process-spawn:support/pi-mock.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"the root afterEach's failing exit status is only observable from a separate Vitest process that deliberately leaks a session",
+	},
 	// 2026-09-17 (#3179): the race is cross-process by construction —
 	// readdirSync/statSync inside node's own recursive-watch polyfill are
 	// blocking syscalls on one thread, so only a separately spawned process
@@ -1246,6 +1677,16 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"#3617: the subject is Vitest's own fork teardown (the pool SIGTERMs the worker after the shared afterAll); no in-process double reproduces that kill or a hook timeout",
 	},
+	"real-process-spawn:tools/ast-grep-outline.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real sg execution proves CLI match behavior; a runner stub cannot exercise the binary.",
+	},
+	"real-process-spawn:tools/lsp-navigation-rename-first-open.test.ts": {
+		detector: "real-process-spawn",
+		reason:
+			"Real child transport and lifecycle are the subject; a process stub cannot exercise the wire and teardown behavior.",
+	},
 	// 2026-10-15 (#4485): the cascade's silent-push wait, turn_end's registry
 	// peek and the expiry read each read a language-server client's publish
 	// state; a real server cannot be made to publish or stay silent on demand.
@@ -1254,6 +1695,12 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		reason:
 			"a language-server client is a spawned process; the cascade's silent-push wait is driven by its per-file publish version and its wait, which a real server cannot be made to answer or leave silent on demand",
 	},
+	"service-double:clients/cascade-pre-edit-answer-5040.test.ts::LSPClientInfo":
+		{
+			detector: "service-double",
+			reason:
+				"a language-server client is a spawned process; the cell drives the real touchFile's reuse decision, which reads the client's per-file publish stamp and its wait, and needs a server that answers once and then never again",
+		},
 	"service-double:clients/cascade-turn-merge.test.ts::LSPClientInfo": {
 		detector: "service-double",
 		reason:
@@ -1271,6 +1718,11 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "service-double",
 		reason:
 			"a language-server client is a spawned process; the registry's lease, capacity and idle paths are driven by its liveness and busy answers",
+	},
+	"service-double:clients/lsp/opt-in-auxiliary-4929.test.ts::LSPClientInfo": {
+		detector: "service-double",
+		reason:
+			"the transport double hands back a client that stands in for a running language server; which ids start, and whether an untrusted project may, is decided by the real acquisition",
 	},
 	// 2026-10-23 (#4785 F4): see the in-process-mock entry for this file.
 	"service-double:clients/lsp/touch-cleared-deferred-wait-4785.test.ts::LSPClientInfo":
@@ -1292,7 +1744,7 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 	// 2026-10-16 (#4528 r1 F3): the spawn-gate window of a dependency restart
 	// exists only between real server processes, and the tool_call hook bounds
 	// its look, so the restart finishes after the hook returns.
-	"ungoverned-wait-for:clients/head-move-resync-4493.test.ts": {
+	"ungoverned-wait-for:clients/head-move-resync-4476.test.ts": {
 		detector: "ungoverned-wait-for",
 		reason:
 			"the restart's spawn-gate window is between real server processes: one server's shutdown, the cache clock, and a restart that ends after the bounded tool_call hook returns expose no awaitable, so vi.waitFor joins them",
@@ -1326,6 +1778,21 @@ const ADMITTED_AFTER_BASELINE: Readonly<
 		detector: "ungoverned-wait-for",
 		reason:
 			"the session-start LSP warm is a fire-and-forget promise inside the loaded extension copy and exposes no awaitable, so vi.waitFor joins the record it writes",
+	},
+	// 2026-10-28 (#4943): a collect-later runner's answer settles inside the
+	// loaded extension copy; the dispatcher logs a row when it lands.
+	"ungoverned-wait-for:index-4943-telemetry-session-stamp.test.ts": {
+		detector: "ungoverned-wait-for",
+		reason:
+			"a collect-later runner answer settles inside the loaded extension copy and exposes no awaitable, so vi.waitFor joins the latency row the dispatcher logs when it lands",
+	},
+	// 2026-11-01 (#5146): the fast POSIX shutdown returns before its ast-grep
+	// child exits, and that exit exposes no awaitable, so the shared session
+	// teardown polls /proc.
+	"ungoverned-wait-for:support/mock-session-teardown.ts": {
+		detector: "ungoverned-wait-for",
+		reason:
+			"the fast POSIX shutdown sends SIGTERM and returns without awaiting the child's exit, and that exit exposes no awaitable, so vi.waitFor polls /proc for the owned child to leave",
 	},
 	"ungoverned-wait-for:tools/symbol-search.test.ts": {
 		detector: "ungoverned-wait-for",
@@ -2216,12 +2683,311 @@ describe("flake-shape scan — real-process-spawn", () => {
 		expect(scanRealProcessSpawn("fixture.test.ts", source)).toEqual([]);
 	});
 
+	it("ATTACK (#5064): vi.importActual of child_process behind a same-file mock is a real spawn", () => {
+		// Recurrence: the system32 seam fold's taskkill case started a real node
+		// child through vi.importActual("node:child_process") beside a
+		// vi.doMock of the same module, and the census counted nothing for it.
+		const source = [
+			'vi.doMock("node:child_process", () => ({ spawn: vi.fn() }));',
+			'it("kills a real child", async () => {',
+			'\tconst { spawn: realSpawn } = await vi.importActual<typeof import("node:child_process")>(',
+			'\t\t"node:child_process",',
+			"\t);",
+			'\trealSpawn(process.execPath, ["-e", "0"]);',
+			"});",
+		].join("\n");
+		const hits = scanRealProcessSpawn("fixture.test.ts", source);
+		expect(hits.map((h) => h.line)).toEqual([3]);
+		expect(hits[0]?.reason).toBe(
+			"importActual( reaches the real child_process module",
+		);
+	});
+
+	it("ATTACK (#5064): importActual with a non-literal specifier is read; a literal other module is not", () => {
+		// A variable specifier is refused, not passed: the census cannot prove the
+		// module is not child_process. A literal naming another module is proven.
+		const variable = [
+			'vi.mock("node:child_process");',
+			'const name = "node:child_process";',
+			"const cp = await vi.importActual(name);",
+		].join("\n");
+		expect(
+			scanRealProcessSpawn("fixture.test.ts", variable).map((h) => h.line),
+		).toEqual([3]);
+
+		const otherModule = [
+			'vi.mock("node:child_process");',
+			'const os = await vi.importActual<typeof import("node:os")>("node:os");',
+		].join("\n");
+		expect(scanRealProcessSpawn("fixture.test.ts", otherModule)).toEqual([]);
+	});
+
+	it("ATTACK (#5064 r3): importActual spelled as a literal prefix plus concatenation is read", () => {
+		// Recurrence: PRRT_kwDORt8rec6yQNSu (Greptile) and PRRT_kwDORt8rec6yQOAE
+		// (CodeRabbit). The reader took the first string literal as the whole
+		// specifier, so "node:" in `"node:" + "child_process"` named another module.
+		const source = [
+			'vi.mock("node:child_process");',
+			'const cp = await vi.importActual("node:" + "child_process");',
+		].join("\n");
+		expect(
+			scanRealProcessSpawn("fixture.test.ts", source).map((h) => h.line),
+		).toEqual([2]);
+	});
+
+	it("ATTACK (#5064 r3): importActual spelled by concatenation with the split inside the name is read", () => {
+		// Recurrence: PRRT_kwDORt8rec6yQNSu and PRRT_kwDORt8rec6yQOAE. The reader
+		// saw only the first literal, "node:child_", and passed it as another module.
+		const source = [
+			'vi.mock("node:child_process");',
+			'const cp = await vi.importActual("node:child_" + "process");',
+		].join("\n");
+		expect(
+			scanRealProcessSpawn("fixture.test.ts", source).map((h) => h.line),
+		).toEqual([2]);
+	});
+
+	it("ATTACK (#5064 r3): importActual of a template literal with an interpolation is read", () => {
+		// Recurrence: PRRT_kwDORt8rec6yQOAE's template case. The reader matched the
+		// template text "node:${n}" as the specifier, so an interpolated module name
+		// named no child_process and the real child was not counted.
+		const source = [
+			'vi.mock("node:child_process");',
+			'const n = "child_process";',
+			"const cp = await vi.importActual(`node:${n}`);",
+		].join("\n");
+		expect(
+			scanRealProcessSpawn("fixture.test.ts", source).map((h) => h.line),
+		).toEqual([3]);
+	});
+
+	it("ATTACK (#5064 r3): importActual of an escaped literal is read", () => {
+		// Recurrence: an escape spells the module name without the literal text
+		// child_process. The reader cannot prove it is another module, so it reads
+		// the call (fail closed on an unplanned spelling).
+		const source = [
+			'vi.mock("node:child_process");',
+			'const cp = await vi.importActual("node:child\\u005fprocess");',
+		].join("\n");
+		expect(
+			scanRealProcessSpawn("fixture.test.ts", source).map((h) => h.line),
+		).toEqual([2]);
+	});
+
+	it("does not read a zero-argument importActual() of another module beside a child_process mock (#5064)", () => {
+		// Recurrence: tests/clients/lsp/windows-startup-repair.test.ts calls
+		// importActual<...>() with no argument inside a package-manager mock factory
+		// in a file that also mocks child_process; that is the mocked module's own
+		// original, not a child_process reach.
+		const source = [
+			'vi.mock("node:child_process", () => ({ spawn: vi.fn() }));',
+			'vi.doMock("../../../clients/package-manager.js", async (importActual) => ({',
+			'\t...(await importActual<typeof import("../../../clients/package-manager.js")>()),',
+			"}));",
+		].join("\n");
+		expect(scanRealProcessSpawn("fixture.test.ts", source)).toEqual([]);
+	});
+
+	it("does not read a child_process string passed to an ordinary call (#5064 over-read)", () => {
+		// Recurrence: the first draft of the #5064 read flagged any call whose first
+		// argument was the child_process specifier, which fired on
+		// JSON.stringify("node:child_process") and includes("child_process") in
+		// runner-spawn-cwd-sweep and spawn-chokepoint-sweep. Only importActual reads
+		// the real module.
+		const source = [
+			'vi.mock("node:child_process");',
+			'const literal = JSON.stringify("node:child_process");',
+			'if (text.includes("child_process")) run(literal);',
+		].join("\n");
+		expect(scanRealProcessSpawn("fixture.test.ts", source)).toEqual([]);
+	});
+
 	it("keeps helper calls when an unrelated module is mocked", () => {
 		const source = [
 			'vi.mock("../../clients/unrelated.js");',
 			"await safeSpawnAsync(command, args);",
 		].join("\n");
 		expect(scanRealProcessSpawn("fixture.test.ts", source)).toHaveLength(1);
+	});
+});
+
+describe("#5100 known real-spawn routes", () => {
+	const fakeModule = ["fake", "lsp", "server"].join("-");
+	// Census keys are relative to tests/, including exemption identities.
+	it("uses tests-relative exemption keys with a checked reason", () => {
+		for (const [file, reason] of Object.entries(AST_GREP_SPAWN_EXEMPTIONS)) {
+			expect(file.startsWith("tests/")).toBe(false);
+			expect(reason.length).toBeGreaterThan(15);
+			const source = fs.readFileSync(
+				path.join(repoRoot, "tests", file),
+				"utf8",
+			);
+			expect(
+				scanRealProcessSpawn("unexempted.test.ts", source).some((hit) =>
+					hit.reason.includes("AstGrepClient"),
+				),
+			).toBe(true);
+			expect(
+				scanRealProcessSpawn(file, source).some((hit) =>
+					hit.reason.includes("AstGrepClient"),
+				),
+			).toBe(false);
+		}
+	});
+	it("flags an unfamiliar client use at construction", () => {
+		expect(
+			scanRealProcessSpawn(
+				"new.test.ts",
+				"new AstGrepClient().futureMethod();",
+			),
+		).toHaveLength(1);
+	});
+	// Recurrence (#5227 r1 F1): a blanket early return for exempt files kept all
+	// 131 ratchet tests green. An exemption must suppress only the construction.
+	it("an exempt file still counts another spawn spelling beside its construction", () => {
+		const exempt = "clients/ast-grep-client-replace.test.ts";
+		expect(Object.hasOwn(AST_GREP_SPAWN_EXEMPTIONS, exempt)).toBe(true);
+		const hits = scanRealProcessSpawn(
+			exempt,
+			[
+				`import { AstGrepClient } from "../../clients/ast-grep-client.js";`,
+				`import { spawnFakeLspServer } from "../support/${fakeModule}.js";`,
+				"new AstGrepClient().formatDiagnostics([]);",
+				"spawnFakeLspServer();",
+			].join("\n"),
+		);
+		const reasons = hits.map((hit) => hit.reason);
+		expect(reasons.some((reason) => reason.includes("AstGrepClient"))).toBe(
+			false,
+		);
+		expect(reasons.some((reason) => reason.includes(fakeModule))).toBe(true);
+	});
+	it.each([
+		`import { spawnFakeLspServer as launch } from "../support/${fakeModule}.js"; launch();`,
+		`import * as server from "../support/${fakeModule}.js"; Reflect.apply(server.spawnFakeLspServer, null, []);`,
+		`import { spawnFakeLspServer } from "../support/${fakeModule}.js"; const launch = spawnFakeLspServer; launch();`,
+	])("flags the fake-server import through another spelling: %s", (source) => {
+		expect(scanRealProcessSpawn("new.test.ts", source).length).toBeGreaterThan(
+			0,
+		);
+	});
+	it("ignores prose and a mocked fake-server module", () => {
+		expect(
+			scanRealProcessSpawn(
+				"new.test.ts",
+				"// new AstGrepClient(); spawnFakeLspServer();",
+			),
+		).toEqual([]);
+		expect(
+			scanRealProcessSpawn(
+				"new.test.ts",
+				`vi.mock("../support/${fakeModule}.js"); import { spawnFakeLspServer } from "../support/${fakeModule}.js"; spawnFakeLspServer();`,
+			),
+		).toEqual([]);
+	});
+
+	// Recurrence: the static census missed these real child routes entirely.
+	it.each([
+		"clients/lsp/navigation-timeout.integration.test.ts",
+		"tools/ast-grep-outline.test.ts",
+	])("detects the repository caller %s", (file) => {
+		const source = fs.readFileSync(path.join(repoRoot, "tests", file), "utf8");
+		expect(scanRealProcessSpawn(file, source).length).toBeGreaterThan(0);
+	});
+});
+
+describe("flake-shape scan — real-process-spawn, kit helpers (#3801 F2)", () => {
+	// Recurrence (#3801 review F2): the lane-check and head-move cuts moved their
+	// real `runLane` / `runGit` / `makeRepo` spawns into tests/support kits. The
+	// detector read none of them, so six files lost their admission and baseline
+	// row with no red. The kit names are generic (`git`, `makeRepo` are local
+	// helpers in other files), so a call counts only in a file that names its kit.
+
+	it("ATTACK kit call: a named kit import and each kit call are real-spawn hits", () => {
+		const source = [
+			'import { runLane } from "../support/lane-check-kit.js";',
+			"",
+			'it("runs the lane-check CLI", () => {',
+			'\trunLane(lane, {}, ["--json"]);',
+			"});",
+		].join("\n");
+		expect(
+			scanRealProcessSpawn("fixture.test.ts", source).map((h) => h.reason),
+		).toEqual([
+			"lane-check-kit import (its helpers spawn real children)",
+			"runLane( kit spawn helper (lane-check-kit)",
+		]);
+	});
+
+	it("ATTACK aliased kit import: the alias is still a hit on the import line", () => {
+		const source = [
+			'import { runLane as run } from "../support/lane-check-kit.js";',
+			'it("aliases the helper", () => {',
+			"\trun(lane);",
+			"});",
+		].join("\n");
+		expect(
+			scanRealProcessSpawn("fixture.test.ts", source).map((h) => h.reason),
+		).toEqual(["lane-check-kit import (its helpers spawn real children)"]);
+	});
+
+	it("ATTACK dynamic import: a kit reached only through import() is a hit", () => {
+		const source = [
+			'it("loads the kit late", async () => {',
+			'\tconst kit = await import("../support/head-move-resync-kit.js");',
+			"\tawait kit.makeRepo({}, {});",
+			"});",
+		].join("\n");
+		expect(
+			scanRealProcessSpawn("fixture.test.ts", source).map((h) => h.reason),
+		).toEqual([
+			"head-move-resync-kit import (its helpers spawn real children)",
+			"makeRepo( kit spawn helper (head-move-resync-kit)",
+		]);
+	});
+
+	it("ATTACK barrel: a helper imported by name from another module names its kit", () => {
+		const source = [
+			'import { runLane } from "../support/lane-check-barrel.js";',
+			'it("reaches the kit through a barrel", () => {',
+			"\trunLane(lane);",
+			"});",
+		].join("\n");
+		expect(
+			scanRealProcessSpawn("fixture.test.ts", source).map((h) => h.reason),
+		).toEqual([
+			"lane-check-kit import (its helpers spawn real children)",
+			"runLane( kit spawn helper (lane-check-kit)",
+		]);
+	});
+
+	it("keeps a same-named local helper uncounted in a file that names no kit", () => {
+		const source = [
+			"const git = (dir: string, ...args: string[]) => dir + args.join(' ');",
+			'it("uses a local helper", () => {',
+			'\texpect(git("repo", "status")).toContain("status");',
+			"});",
+		].join("\n");
+		expect(scanRealProcessSpawn("fixture.test.ts", source)).toEqual([]);
+	});
+
+	it("a dynamically imported kit whose module is mocked gets no kit hits", () => {
+		const source = [
+			'vi.mock("../support/head-move-resync-kit.js", () => ({ makeRepo: async () => ({}) }));',
+			'it("uses the fake", async () => {',
+			'\tconst kit = await import("../support/head-move-resync-kit.js");',
+			"\tawait kit.makeRepo({}, {});",
+			"});",
+		].join("\n");
+		expect(scanRealProcessSpawn("fixture.test.ts", source)).toEqual([]);
+	});
+
+	it("names no kit from a string key that only mentions its path", () => {
+		const source = [
+			'const KEYS = { "tests/support/lane-check-kit.ts#runLane:f2fe9f48#PATH": "spread-override" };',
+			'it("keys", () => { expect(Object.keys(KEYS)).toHaveLength(1); });',
+		].join("\n");
+		expect(scanRealProcessSpawn("fixture.test.ts", source)).toEqual([]);
 	});
 });
 

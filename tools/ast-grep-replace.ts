@@ -29,7 +29,11 @@ function errorTextWithHint(raw: string): string {
 	const hint = astGrepRemediationHint(classifyAstGrepError(raw));
 	return hint ? `Error: ${raw}\n\n${hint}` : `Error: ${raw}`;
 }
-import { readAstGrepLang, resolveAstGrepPaths } from "./shared.js";
+import {
+	defaultedCwdHomeRefusal,
+	readAstGrepLang,
+	readPathsArgument,
+} from "./shared.js";
 
 function lineCount(value: string): number {
 	if (!value) return 0;
@@ -122,9 +126,15 @@ export function createAstGrepReplaceTool(
 			params: Record<string, unknown>,
 			_signal: AbortSignal,
 			_onUpdate: unknown,
-			ctx: { cwd?: string; resultMaxItems?: number },
+			ctx: {
+				cwd?: string;
+				resultMaxItems?: number;
+				sessionManager?: { getSessionId?: () => string };
+			},
 		) {
 			const lineage = captureLineage?.();
+			// #4943: the calling session owns the deferred pass of the apply.
+			const sessionId = ctx.sessionManager?.getSessionId?.();
 			const startedAt = Date.now();
 			const {
 				pattern,
@@ -201,6 +211,22 @@ export function createAstGrepReplaceTool(
 					details: {},
 				};
 			}
+			// #5041: replace used to forward `paths` unchecked, so a non-string
+			// entry, a blank entry or an over-cap list reached the CLI as argv.
+			const pathsRead = readPathsArgument(paths, {
+				cwd: ctx.cwd,
+				absent: "cwd",
+			});
+			if (pathsRead.refusal) {
+				logOutcome("error", { errorRaw: pathsRead.refusal });
+				return {
+					content: [
+						{ type: "text" as const, text: `Error: ${pathsRead.refusal}` },
+					],
+					isError: true,
+					details: {},
+				};
+			}
 			if (!(await astGrepClient.ensureAvailable())) {
 				logOutcome("error", { errorRaw: "ast-grep CLI not found" });
 				return {
@@ -214,7 +240,24 @@ export function createAstGrepReplaceTool(
 					details: {},
 				};
 			}
-			const searchPaths = resolveAstGrepPaths(paths, ctx.cwd);
+			// #5039: a write tool needs the home ceiling more than a read tool does.
+			// Decided before any target is resolved, so it covers the dry run and the
+			// apply alike (`apply` only flips a flag on this same dispatch), through
+			// the seam #747/#250's guard became when it was lifted out of
+			// ast_grep_search. It runs AFTER the `paths` reader above: an empty list
+			// (`paths: []`) is the reader's refusal even at home, and only an absent
+			// `paths` reaches this ceiling (keyed on the raw argument, not on
+			// `pathsRead.entries`, which `absent: "cwd"` always fills).
+			const homeRefusal = defaultedCwdHomeRefusal(paths, ctx.cwd);
+			if (homeRefusal) {
+				logOutcome("error", { errorRaw: homeRefusal.reason });
+				return {
+					content: [{ type: "text" as const, text: homeRefusal.text }],
+					isError: true,
+					details: {},
+				};
+			}
+			const searchPaths = pathsRead.entries;
 
 			// Phase 3: structural-intent params → synthesize YAML with fix: field
 			if (
@@ -255,7 +298,7 @@ export function createAstGrepReplaceTool(
 					ruleYaml,
 					searchPaths,
 					applyFlag,
-					{ lineage, toolCallId: _toolCallId },
+					{ lineage, toolCallId: _toolCallId, sessionId },
 				);
 				if (ruleResult.stalePreview) {
 					logOutcome("error", { errorRaw: "stale_preview" });
@@ -267,7 +310,11 @@ export function createAstGrepReplaceTool(
 							},
 						],
 						isError: true,
-						details: { stalePreview: true },
+						// #5244 r4: files an earlier path already rewrote still dispatch.
+						details: {
+							stalePreview: true,
+							appliedFiles: ruleResult.appliedFiles ?? [],
+						},
 					};
 				}
 				if (ruleResult.error) {
@@ -280,7 +327,7 @@ export function createAstGrepReplaceTool(
 							},
 						],
 						isError: true,
-						details: {},
+						details: { appliedFiles: ruleResult.appliedFiles ?? [] },
 					};
 				}
 				const output = astGrepClient.formatMatches(
@@ -297,6 +344,9 @@ export function createAstGrepReplaceTool(
 					details: {
 						matchCount: ruleResult.matches.length,
 						applied: applyFlag,
+						// #5239: the files the apply rewrote, for the `tool_result`
+						// handler's dispatch.
+						appliedFiles: ruleResult.appliedFiles ?? [],
 					},
 				};
 			}
@@ -307,7 +357,7 @@ export function createAstGrepReplaceTool(
 				lang,
 				searchPaths,
 				applyFlag,
-				{ strictness, lineage, toolCallId: _toolCallId },
+				{ strictness, lineage, toolCallId: _toolCallId, sessionId },
 			);
 
 			if (result.stalePreview) {
@@ -355,6 +405,9 @@ export function createAstGrepReplaceTool(
 					totalMatches: result.totalMatches,
 					truncated: result.truncated,
 					applied: applyFlag,
+					// #5239: the files the apply rewrote, for the `tool_result`
+					// handler's dispatch.
+					appliedFiles: result.appliedFiles ?? [],
 				},
 			};
 		},

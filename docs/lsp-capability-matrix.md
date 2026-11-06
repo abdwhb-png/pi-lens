@@ -45,6 +45,29 @@ anything). The native TS7 launch variant (`typescript7`/`typescript7-clean`,
 #524/#526) is deliberately excluded from comparison against classic's marker —
 they share a server id but not a verified clean-signal behavior.
 
+The `typescript` row has three launch variants, chosen in
+`TypeScriptServer.spawn` (`clients/lsp/server.ts`). The project's own
+TypeScript 7+ decides first: with `@effect/tsgo` installed beside it (the same
+`node_modules` level, with a readable manifest version and an existing
+`.bin/effect-tsgo` path) the launch is `effect-tsgo tsc --lsp --stdio`
+(`launchVariant: "effect-tsgo"`, #4914); otherwise the native `tsc --lsp --stdio`
+(`"native-ts7"`); with TypeScript 6 or older, or none, the classic
+`typescript-language-server` (`"classic"`). Installing `@effect/tsgo` is the
+only opt-in. pi-lens never installs it, adds no setting for it, and runs the
+binary only when pi trusts the project, like the project's compiler. A
+malformed `@effect/tsgo` install keeps the native launch and never takes an
+ancestor's. So does an install the finder admits but the launcher cannot start
+(no exec bit, a directory at the bin path): the failure records one
+`lsp-registry-decision` row per root per generation and the native launch
+follows. A process that starts and then fails `initialize` is not covered.
+`effect-tsgo` wraps the same typescript-go server, so it uses the
+native variant's wait strategy and cascade tier (`isTsgoLaunchVariant`,
+`clients/lsp/server-traits.ts`) and is excluded from classic's marker the same
+way; its own clean-signal behavior is not measured separately. The nightly
+`effect-tsgo` smoke row (`scripts/smoke-tools.mjs`, pinned
+`@effect/tsgo@0.62.0` on `typescript@7.0.2`) requires the `effect-tsgo` variant
+and a published type error.
+
 What IS gated is the pair of COMMITTED sources:
 `tests/config/lsp-clean-behavior-census.test.ts` (#3347) compares the
 `clean-behavior` column below against the `silentOnClean` markers in both
@@ -106,7 +129,8 @@ belonged to another live client of the same server id became `typescript`'s
 | **2 — push, publishes-versioned** | `publishDiagnostics([])` **with version** on every scan, incl. clean→clean | YES, currency-proven via version | ast-grep |
 | **2\* — push, publishes-unversioned** | re-publishes on a clean scan but **version-less** — the wait still early-returns (the client accepts a version-less publish as fresh: it can't be proven stale), but currency is only *temporally correlated*, not proven. Since #3484 the client fences a server measured to answer a `documentSymbol` fence before it publishes (`diagnosticsFence: "reply-first"`: yaml, intelephense): a pre-edit publish is dropped until the fence's reply. Every other 2\* server (docker publishes before answering; prisma, taplo, zls, dart, gleam, clojure unmarked) keeps this behaviour | YES at runtime, with a staleness-risk caveat (not a latency cost) | opengrep |
 | **3 — push, silent on clean** | server publishes nothing when nothing changed | **NO** — budget-wait floor (safe; a timeout is *not* a false clean). **This tier is #458's learned-deadline target set.** | typescript-language-server |
-| **Navigation-only — custom, no evidence** | custom `lsp.servers.*` entry has no pull provider and has not published in this session | **NO** — diagnostics are unsupported; skip the wait and report navigation-only | Dexter |
+| **Unconfirmed — custom, no evidence** | custom `lsp.servers.*` entry has no pull provider and has not published in this session | **NO** — diagnostics are unconfirmed (reported `inconclusive`, never `unsupported`); skip the wait until the server publishes | Dexter, groovy-language-server |
+| **Unmarked push — built-in, unmeasured** | built-in push-only row with no `silentOnClean` marker and no measured row | **NO** — the full push budget runs on every touch; a timeout with no publish is `inconclusive`, never clean | groovy-language-server (built-in `groovy` row) |
 
 Detection is **cached** at `initialize` (`detectWorkspaceDiagnosticsSupport` →
 `state.workspaceDiagnosticsSupport.mode`, upgraded on `client/registerCapability`),
@@ -116,8 +140,41 @@ Custom servers without a pull provider begin with one bounded first-contact
 probe. The probe uses the smaller of the server's push-wait budget and the live
 hook deadline. If the hook cuts it off first, the result remains unconfirmed and
 the next touch probes again. Only silence through the full push budget latches
-that server id as navigation-only for the service session. A publish upgrades it
-to the ordinary push-wait policy.
+that server id for the service session: the latch skips the wait and the file
+reads **unconfirmed** (`inconclusive` in a batch outcome, "not the same as 0
+diagnostics" in a single-file result), never `unsupported` and never clean. Any
+publish, however late and whatever file it is for, clears the latch (#5128), and
+the server returns to the ordinary push-wait policy. A server that publishes
+only for files with errors (groovy-language-server sends nothing for a file that
+compiles) therefore reads unconfirmed on clean files, and its findings arrive as
+soon as it publishes them. A publish that lands while the first-contact wait is
+still in flight prevents the latch.
+
+The built-in `groovy` row (#5123) takes the other branch. It has no
+`silentOnClean` marker, because nothing has measured the real server (it
+publishes no release, so no nightly job can install it), and the marker would
+make a quiet touch count as clean. It therefore pays the full push budget on
+every touch of a file it stays silent for, and that file reads `inconclusive`
+by the timeout, where a custom entry skips the wait after its first-contact
+latch. Two of the custom behaviours are declared on the row instead of read
+from `custom`: `echoesOwnNotice: true` holds the empty publish the server
+sends after pi-lens's own first-open watched-files notice (#5131), so an
+`unable to resolve class` error is not erased 5 ms after it is published. The
+row's hand-added line in the matrix below stays `unknown` until a run observes
+the server. It launches a `groovy-language-server` on PATH, else
+`java -jar $GROOVY_LANGUAGE_SERVER_JAR`, on a JDK 17+ found the way jdtls finds
+one; `.groovy`, `.gvy`, `.gy` and `.gsh` only (add `.gradle` or `Jenkinsfile`
+through `lsp.servers` if the build classpath is worth the unresolved-class
+noise). The row has no file kind, so only the explicit probes reach it
+(`lens_diagnostics` with `source: "lsp"`, `lsp_navigation`), not the write-time
+dispatch.
+
+The first-contact budget on the per-edit path is the strategy's
+`aggregateWaitMs` (1500 ms). It is a cost, not a verdict: the latch is
+recoverable, so a server slower than the budget pays 1.5 s once and reads
+unconfirmed until its first publish, instead of being lost for the session.
+Raising it would charge up to the larger budget on the first edit of every
+custom server that never publishes for a clean file.
 
 ## Matrix (dev box + CI nightly; mode last refreshed 2026-06-17 from run 27713958681, clean-behavior probed in run 35914033696 — #460)
 
@@ -135,17 +192,23 @@ Merges never blank a prior good value, so a CI non-result leaves the dev
 classification standing.
 
 Two bounded guards keep that preservation from hiding a dead instrument
-(#3401). A `direct` `first-publish` cell whose axis the nightly probe does not
-re-observe is stamped once with the date of its first miss and degrades to
-`unknown` once five calendar days have elapsed since it (skipped nights do not
-stall it, and a re-observation clears the stamp). `empty-first` cells are never
-expired: they back the live `emptyFirstPublish` markers (php) and
-expiring one would erase the measurement behind a marker. That exception is
-bounded too (#4615): the refresh stamps the FIRST night it does not re-observe an
-`empty-first` cell, and the first-publish census reds once that stamp is five
-days old, so the cell+marker pair cannot outlive the instrument that produced it
-— a cell with no live measurement behind it is no longer indistinguishable from
-a healthy one. A `clean-behavior`/`tier` change is written only after two
+(#3401, #4512). A measured `first-publish` or `clean-behavior` cell the nightly
+probe does not re-observe keeps its last known value and is marked in the
+`stale` column with the date of the first miss (`since YYYY-MM-DD`). The refresh
+never rewrites it to `unknown`: before #4512 a `direct` cell degraded to
+`unknown` after five days, which erased five measured values in the #4338
+refresh with nothing raised. The streak of consecutive nightly misses is kept
+per lang and per axis in the refresh state below, so a `clean-behavior` miss one
+night and a `first-publish` miss the next are two first misses; a cell whose
+axis has missed two consecutive nights is
+raised on one tracking issue (`nightly: LSP capability probe missed (stale
+matrix cells)`), and an observation clears both the mark and the streak.
+`empty-first` cells back the live `emptyFirstPublish` markers and are stamped
+the same way (#4615): the refresh stamps the FIRST night it does not re-observe
+one, and the first-publish census reds once that stamp is five days old, so the
+cell+marker pair cannot outlive the instrument that produced it — a cell with
+no live measurement behind it is no longer indistinguishable from a healthy
+one. A `clean-behavior`/`tier` change is written only after two
 consecutive nightly runs observe the same new value, so one flapping nightly
 (ast-grep went 2 → 2* → 3 → 2* across four runs) cannot rewrite a cell; a night
 that measured nothing for the lang resets the hold. A subset probe (`probe-clean-signal.mjs <langs>`) leaves the
@@ -160,6 +223,20 @@ master's doc otherwise (branch absent, squash-merged, or master edited the doc
 since). Closing the bot PR unmerged does not reset the bookkeeping: the branch
 is kept and keeps seeding, so only deleting `bot/lsp-docs-refresh` resets it.
 
+The `version` and `install` columns (#4512) record what the nightly ran: the
+first version token of the server's own version command (the `checkArgs` its
+installer entry registers, `--version` by default, read within that entry's
+verification timeout) and the installer route that resolved it (`global-path`, `npm-global`, `pip-user`, `pi-lens-auto`,
+`github-release`, `maven-jar`, `archive-dist`). `characterize-lsp.mjs` writes
+them from the installer's resolution for the one tool a fixture names; a fixture
+that names none or several, a server the installer cannot find, or a launcher
+that answers every argument by starting a JVM (`tree-manifest`) records nothing,
+and the cell keeps its last known value or `—`. They record the installer's
+resolution, not the path the LSP launch finally spawned, so a PATH binary that
+shadows a managed one reads as `global-path`. A change in `version` or `install`
+is not a capability flip: the refresh PR's landing check ignores those columns
+and `stale`.
+
 `vue`'s `clean-behavior` was hand-reset to `unknown` (#3390): its
 `publishes-unversioned` cell came from 58/45 publishes that the shared
 `extension.log` window had attributed to vue but that belonged to `tinymist`.
@@ -169,37 +246,38 @@ to be cleared by hand. It stays `unknown` until a run observes
 `@vue/language-server` publish; `tests/config/lsp-clean-behavior-census.test.ts`
 carries the named admission until then.
 
-| lang | server | mode | clean-behavior | first-publish | tier | src |
-|---|---|---|---|---|---|---|
-| json | vscode-json-language-server | pull | — | n/a (pull) | 1 | dev+ci |
-| css | vscode-css-language-server | pull | — | n/a (pull) | 1 | dev+ci |
-| html | vscode-html-language-server | pull | — | n/a (pull) | 1 | dev+ci |
-| rust | rust-analyzer | pull | — | n/a (pull) | 1 | dev+ci |
-| svelte | svelte-language-server | pull | — | n/a (pull) | 1 | dev+ci |
-| deno | deno (alt of typescript) | pull | — | n/a (pull) | 1 | dev+ci |
-| ruby | ruby-lsp | pull | — | n/a (pull) | 1 | ci |
-| csharp | csharp-ls | pull | — | n/a (pull) | 1 | ci |
-| typescript | typescript-language-server | push-only | silent | direct | 3 | dev+ci |
-| markdown | marksman | push-only | silent | direct | 3 | ci |
-| lua | lua-language-server | push-only | silent | direct | 3 | dev+ci |
-| python | pyright | push-only | publishes-versioned | direct | 2 | dev+ci |
-| jedi | jedi-language-server (alt of python) | push-only | publishes-versioned | direct | 2 | ci |
-| yaml | yaml-language-server | push-only | publishes-unversioned | direct | 2* | dev+ci |
-| shell | bash-language-server | push-only | publishes-versioned | direct | 2 | dev+ci |
-| dockerfile | docker-langserver | push-only | publishes-unversioned | direct | 2* | dev+ci |
-| dockerfile-official | docker-language-server (official) | push-only | publishes-versioned | direct | 2 | dev+ci |
-| toml | taplo | push-only | publishes-unversioned | direct | 2* | dev+ci |
-| terraform | terraform-ls | push-only | publishes-unversioned | direct | 2* | dev+ci |
-| prisma | @prisma/language-server | push-only | publishes-unversioned | direct | 2* | dev+ci |
-| php | intelephense | push-only | publishes-unversioned | empty-first | 2* | dev+ci |
-| zig | zls | push-only | publishes-unversioned | direct | 2* | dev+ci |
-| vue | @vue/language-server | push-only | unknown | unknown | 2/3? | dev+ci |
-| dart | dart language-server | push-only | publishes-unversioned | direct | 2* | ci |
-| gleam | gleam lsp | push-only | publishes-unversioned | direct | 2* | ci |
-| clojure | clojure-lsp | push-only | publishes-unversioned | direct | 2* | ci |
-| opengrep | opengrep (aux) | push-only | publishes-unversioned | direct | 2* | dev+ci |
-| ast-grep | ast-grep (aux) | push-only | publishes-versioned | direct | 2 | dev+ci |
-| cue | CUE Language Server (cue lsp serve) | push-only | publishes-versioned | direct | 2 | dev+ci |
+| lang | server | mode | clean-behavior | first-publish | tier | src | version | install | stale |
+|---|---|---|---|---|---|---|---|---|---|
+| json | vscode-json-language-server | pull | — | n/a (pull) | 1 | dev+ci | — | pi-lens-auto | — |
+| css | vscode-css-language-server | pull | — | n/a (pull) | 1 | dev+ci | — | pi-lens-auto | — |
+| html | vscode-html-language-server | pull | — | n/a (pull) | 1 | dev+ci | — | pi-lens-auto | — |
+| rust | rust-analyzer | pull | — | n/a (pull) | 1 | dev+ci | 0.3.3105-standalone | global-path | — |
+| svelte | svelte-language-server | pull | — | n/a (pull) | 1 | dev+ci | — | pi-lens-auto | — |
+| deno | deno (alt of typescript) | pull | — | n/a (pull) | 1 | dev+ci | 2.9.8 | global-path | — |
+| ruby | ruby-lsp | pull | — | n/a (pull) | 1 | ci | — | — | — |
+| csharp | csharp-ls | pull | — | n/a (pull) | 1 | ci | — | — | — |
+| typescript | typescript-language-server | push-only | silent | direct | 3 | dev+ci | 5.3.0 | pi-lens-auto | — |
+| markdown | marksman | push-only | silent | direct | 3 | ci | — | global-path | — |
+| lua | lua-language-server | push-only | silent | direct | 3 | dev+ci | — | archive-dist | — |
+| python | pyright | push-only | publishes-versioned | direct | 2 | dev+ci | 1.1.414 | pi-lens-auto | — |
+| jedi | jedi-language-server (alt of python) | push-only | publishes-versioned | direct | 2 | ci | 0.47.0 | global-path | — |
+| yaml | yaml-language-server | push-only | publishes-unversioned | direct | 2* | dev+ci | 2.0.0 | pi-lens-auto | — |
+| shell | bash-language-server | push-only | publishes-versioned | direct | 2 | dev+ci | 5.8.1 | pi-lens-auto | — |
+| dockerfile | docker-langserver | push-only | publishes-unversioned | direct | 2* | dev+ci | — | pi-lens-auto | — |
+| dockerfile-official | docker-language-server (official) | push-only | publishes-versioned | direct | 2 | dev+ci | — | — | — |
+| toml | taplo | push-only | publishes-unversioned | direct | 2* | dev+ci | 0.10.0 | global-path | — |
+| terraform | terraform-ls | push-only | publishes-unversioned | direct | 2* | dev+ci | 0.39.1 | global-path | — |
+| prisma | @prisma/language-server | push-only | publishes-unversioned | direct | 2* | dev+ci | — | pi-lens-auto | — |
+| php | intelephense | push-only | publishes-unversioned | empty-first | 2* | dev+ci | — | pi-lens-auto | — |
+| zig | zls | push-only | publishes-unversioned | direct | 2* | dev+ci | 0.17.0 | global-path | — |
+| vue | @vue/language-server | push-only | unknown | unknown | 2/3? | dev+ci | 3.3.14 | pi-lens-auto | — |
+| groovy | groovy-language-server (built-in, no fixture) | push-only | unknown | unknown | 3? | — | — | — | — |
+| dart | dart language-server | push-only | publishes-unversioned | direct | 2* | ci | — | — | — |
+| gleam | gleam lsp | push-only | publishes-unversioned | direct | 2* | ci | 1.19.2 | global-path | — |
+| clojure | clojure-lsp | push-only | publishes-unversioned | direct | 2* | ci | 2026.10.15-11.42.38 | global-path | — |
+| opengrep | opengrep (aux) | push-only | publishes-unversioned | direct | 2* | dev+ci | — | global-path | — |
+| ast-grep | ast-grep (aux) | push-only | publishes-versioned | direct | 2 | dev+ci | — | — | — |
+| cue | CUE Language Server (cue lsp serve) | push-only | publishes-versioned | direct | 2 | dev+ci | 0.17.1 | global-path | — |
 
 **Unknown — fixture exists, mode not yet captured.** The toolchain-gated family
 (no auto-install today; tracked in #241) — `go` (gopls), `java` (jdtls),
@@ -285,55 +363,121 @@ and were characterized `push-only` in the run above).
 
 Population: every server that declares `textDocumentSync.save` in
 `docs/servercapabilities.md` (15 `save`, 5 `save+text`), plus zizmor, which
-registers `textDocument/didSave` dynamically. Verdicts are moved from the #4768
-PR body (merged as 11cf30f8d) and re-read on origin/master d21f7d267: each
-server's registry entry is in `clients/lsp/server.ts`, and each save declaration
-matches `docs/servercapabilities.md`. `publishes after save only` is `no` when
-the server publishes without a save, `yes` when only a save publishes, and
-`unknown` when nothing was measured. A `source` row cites an external
-repository at the pinned commit; those commits were not re-fetched here.
+registers `textDocument/didSave` dynamically and therefore never receives one
+from pi-lens (its `didSave` registration is dynamic and pi-lens maps only the
+static `initialize` reply). The `server` column is the registry id in
+`clients/lsp/server.ts`, so a row can be matched against the capability
+inventory mechanically.
+
+`publishes after save only` states whether only a save makes the server answer:
+
+| value | meaning |
+|---|---|
+| `no` | the seeded finding arrived without a save |
+| `no (pull)` | pull mode: the `textDocument/diagnostic` request answered without a save, so no publish is involved |
+| `yes` | the same bytes produced the finding only after a save |
+| `yes (saved write)` | only a diagnostic-neutral edit plus a save produced it |
+| `inconclusive` | no arm produced the finding, or the answer landed in the untriggered window between two arms and so belongs to no arm |
+| `cannot measure` | no runner can install the server; the reason follows |
+| `unknown` | no run has measured this row yet |
+
+Regenerate it with
+
+```text
+node scripts/probe-save-verdict.mjs [lang ...] [--install] [--wait-ms <ms>] [--doc <path>]
+```
+
+The nightly `tool-smoke.yml` step "LSP save verdict (#3405)" runs it with
+`--install` on the tool-smoke fixtures, so the measurement columns self-populate
+through the same docs-refresh PR as `mode` and `clean-behavior` (#390). The probe
+drives the real client and reports four arms of equal length: the seeded bytes
+with `saved: false` (didOpen/didChange only), an untriggered window of the same
+length, the SAME bytes with `saved: true` (so a publish has the save as its only
+new input), and, only when nothing else answered, a diagnostic-neutral edit
+plus a save. `scripts/lib/save-verdict.mjs` owns the classification, the wording
+and the merge guard; a run rewrites the three measurement columns of the rows it
+reached and copies every other row verbatim, so a runner that could not install a
+server never blanks a measured cell.
+
+A night that could not tell never erases an answer (#5060). A row that holds a
+settled answer (`no`, `no (pull)`, `yes`, `yes (saved write)`) keeps it, with its
+evidence, when the run measures `inconclusive` or `cannot measure`; only a
+settled answer replaces a settled one, and a `yes` to `no` change stays a visible
+flip. This table has no column for a night a row was not answered, so the held
+night goes to the run log (`save-verdict: held back <server>`), to one
+`::warning::` annotation per held server under GitHub Actions, and to the
+`--summary` JSON (`heldBack`). No counter or issue tracks consecutive held
+nights.
+
+A pull-mode server answers a `textDocument/diagnostic` request rather than
+publishing, so no arm of its run has the save as its only new input: it reads
+`no (pull)` when the request answered without a save and `inconclusive`
+otherwise, never `yes`.
+
+The cells carry what a run OBSERVED, never when or where: each arm's elapsed time
+and the `src` token that says CI or a dev box go to the run log, so a
+re-measurement that changes only those is not a capability flip and the refresh PR
+stays armed for auto-merge (#4512).
+
+A row whose evidence names this command is a measurement by it. A row that names
+a prior probe, a workflow run or a source commit instead is provenance from
+before the command existed (or from a server no local run could reach), and the
+dispatched nightly replaces it on the first night that reaches the server.
 
 | server | save as declared | publishes after save only | verdict | evidence |
 |---|---|---|---|---|
-| expert | `save` | no | Measured: answers with no `didSave` once the seed is under `lib/`. Gated (`lspGate: true`). | #4768 arms A, B, C; nightly run 39852672584 (answered on call 6, 10955 ms); `tests/fixtures/nightly-floors/expert-readiness.json` |
-| cpp (clangd 22.1.0) | `save` | no | Measured: publishes on `didOpen` alone (97 ms, 3 diagnostics). Gated. Open conflict with #4527, see note 2. | #4768 local probe; #4527 wire scenario (issue comment) |
-| lua | `save` | no | Measured: the first publish carries 6 diagnostics at 135 ms; a save adds a late republish at 3.7 s. Gated. | #4768 local probe |
-| python-jedi | `save` | no | Measured: publishes on `didOpen` alone (about 1 s). Gated. | #4768 local probe; `clients/python-environment.ts:421` (id) |
-| opengrep (aux) | `save` | no | Measured: a save rescans and republishes (#3482); it also publishes on open once its rules load. Auxiliary, not gated. | `clients/lsp/wait-policy/strategies.ts:100`; Key findings above (#4763) |
-| gleam | `save` | no | Source: a save only marks the project changed and drops the in-memory cache; the publish comes from `CompilePlease`. Gated. | gleam-lang/gleam `0d9fa18ddb69`, `language-server/src/server.rs` (`SourceFileSaved`, `discard_in_memory_cache`, `compile_please`) |
-| go (gopls) | `save` | no | Source: `DidSave` calls `didModifyFiles`, the path a change takes. Gated. | golang/tools `02c9e4cb4c2f`, `gopls/internal/server/text_synchronization.go` |
-| zig (zls) | `save` | no | Source: a save runs the build-on-save watch update and autofix; ast-check diagnostics come from changes. Gated. | zigtools/zls `82ba5351ca8a`, `src/Server.zig` (`saveDocumentHandler`) |
-| rust (rust-analyzer) | `save` | no | Source: a save starts flycheck (`cargo check`); native diagnostics come from pull mode and do not wait for it. Exempt: runner availability. | rust-lang/rust-analyzer `0c4d74686b21`, `crates/rust-analyzer/src/handlers/notification.rs` (`handle_did_save_text_document`); matrix tier 1 |
-| terraform | `save` | no | Source: `terraform validate` runs on save only with the experimental `ValidateOnSave`, off by default. Gated. | hashicorp/terraform-ls `3dbe85a2b4e1`, `internal/langserver/handlers/did_save.go` |
+| expert | `save` | no | Prior measurement: answers with no `didSave` once the seed is under `lib/`. Gated. | #4768 arms A, B, C; nightly run 39852672584 (answered on call 6, 10955 ms); `tests/fixtures/nightly-floors/expert-readiness.json` |
+| cpp | `save` | no | Measured: answers without a save (1 publish event on didOpen); a later save alone: silent (6000 ms). Gated. | `node scripts/probe-save-verdict.mjs` (fixture cpp) |
+| lua | `save` | no | Measured: answers without a save (2 publish events on didOpen); a later save alone: silent (6000 ms). Gated. | `node scripts/probe-save-verdict.mjs` (fixture lua) |
+| python-jedi | `save` | no | Measured: answers without a save (1 publish event on didOpen); a later save alone: silent (6000 ms). Gated. | `node scripts/probe-save-verdict.mjs` (fixture jedi) |
+| opengrep | `save` | no | Measured: answers without a save (1 publish event on didOpen); a later save alone: 2 publish events. Auxiliary, not gated. | `node scripts/probe-save-verdict.mjs` (fixture opengrep) |
+| gleam | `save` | no | Measured: answers without a save (1 publish event on didOpen); a later save alone: silent (6000 ms). Gated. | `node scripts/probe-save-verdict.mjs` (fixture gleam) |
+| go | `save` | no | Measured: answers without a save (1 publish event on didOpen); a later save alone: silent (6000 ms). Gated. | `node scripts/probe-save-verdict.mjs` (fixture go) |
+| zig | `save` | no | Measured: answers without a save (1 publish event on didOpen); a later save alone: 1 publish event. Gated. | `node scripts/probe-save-verdict.mjs` (fixture zig) |
+| rust | `save` | inconclusive | Measured: inconclusive — pull mode: every arm is a textDocument/diagnostic request, so no arm has the save as its only new input (arms: no-save silent (6000 ms), save alone 1 diagnostic, saved write silent (6000 ms)). Exempt from the clean gate. | `node scripts/probe-save-verdict.mjs` (fixture rust) |
+| terraform | `save` | no | Measured: answers without a save (2 publish events on didOpen); a later save alone: 1 publish event. Gated. | `node scripts/probe-save-verdict.mjs` (fixture terraform) |
 | fsharp | `save+text` | no | Source: a save holds the source and refreshes code lenses; diagnostics come from open and change checks. Exempt: 0 findings in every run. | ionide/FsAutoComplete `8f011f1395a4`, `src/FsAutoComplete/LspServers/AdaptiveFSharpLspServer.fs` (`TextDocumentDidSave`); nightly run 39845687189 |
-| zizmor (dynamic) | not declared (`textDocumentSync` only) | no | Source: `didSave` is registered dynamically and pi-lens does not map that registration, so no save is sent. Auxiliary. | zizmor `crates/zizmor/src/lsp.rs` (`initialized`); `clients/lsp/wait-policy/strategies.ts:400-410` (#3548) |
-| clojure | `save+text` | unknown | Unverified: not measured. Gated; one save per write. | none |
-| fish | `save+text` | unknown | Unverified: not measured. Gated; one save per write. | none |
-| tinymist | `save` | unknown | Unverified: not measured. Gated (typst fixture); one save per write. | none |
-| cue | `save` | unknown | Unverified: not measured. Gated; one save per write. | none |
-| csharp | `save+text` | unknown | Unverified: not measured. Pull mode, so diagnostics are requested and a save is unlikely to be the only trigger. Gated. | matrix row (csharp-ls, tier 1) |
-| deno | `save` | unknown | Unverified: not measured. Pull mode. Gated. | matrix row (deno, tier 1) |
-| svelte | `save` | unknown | Unverified: not measured. Pull mode. Gated. | matrix row (svelte-language-server, tier 1) |
-| powershell | `save+text` | unknown | Unverified: not measured. Exempt: intermittent. | none |
-| cmake | `save` | unknown | Unverified: the local probe published nothing in either arm (12 s each) with an `if(` seed, so inconclusive. Exempt: upstream documents no diagnostics. | #4768 local probe (no named command) |
+| zizmor | · (registered dynamically) | no | Source: `didSave` is registered dynamically and pi-lens does not map that registration, so no save is sent. Auxiliary, not gated. | zizmor `crates/zizmor/src/lsp.rs` (`initialized`); `clients/lsp/wait-policy/strategies.ts:400-410` (#3548) |
+| clojure | `save+text` | no | Measured: answers without a save (1 publish event on didOpen); a later save alone: 2 publish events. Gated. | `node scripts/probe-save-verdict.mjs` (fixture clojure) |
+| fish | `save+text` | no | Measured: answers without a save (1 publish event on didOpen); a later save alone: silent (6000 ms). Gated. | `node scripts/probe-save-verdict.mjs` (fixture fish) |
+| tinymist | `save` | no | Measured: answers without a save (1 publish event on didOpen); a later save alone: 1 publish event. Gated. | `node scripts/probe-save-verdict.mjs` (fixture typst) |
+| cue | `save` | no | Measured: answers without a save (1 publish event on didOpen); a later save alone: 1 publish event. Gated. | `node scripts/probe-save-verdict.mjs` (fixture cue) |
+| csharp | `save+text` | no (pull) | Measured: pull mode — no save needed; a later save+request answered: 1 diagnostic. Gated. | `node scripts/probe-save-verdict.mjs` (fixture csharp) |
+| deno | `save` | no (pull) | Measured: pull mode — no save needed; a later save+request answered: 1 diagnostic. Gated. | `node scripts/probe-save-verdict.mjs` (fixture deno) |
+| svelte | `save` | no (pull) | Measured: pull mode — no save needed; a later save+request answered: 2 diagnostics. Gated. | `node scripts/probe-save-verdict.mjs` (fixture svelte) |
+| powershell | `save+text` | no | Measured: answers without a save (1 publish event on didOpen); a later save alone: silent (6000 ms). Exempt from the clean gate. | `node scripts/probe-save-verdict.mjs` (fixture powershell) |
+| cmake | `save` | inconclusive | Measured: inconclusive — no arm published, so this fixture does not distinguish a save-triggered server from one that never diagnoses it (arms: no-save silent (6000 ms), save alone silent (6000 ms), saved write silent (6000 ms)). Exempt from the clean gate. | `node scripts/probe-save-verdict.mjs` (fixture cmake) |
 
 Notes.
 
-1. Probe. The only command #4768 names is `node scripts/smoke-tools.mjs --lsp-gate`
-   (the nightly `tool-smoke.yml` step "LSP diagnostics clean-gate"). It runs
-   the gated fixture rows and does not write per-server save verdicts. The local
-   probes behind the cpp, lua, python-jedi and cmake rows, and the Expert arms
-   run outside CI, are not named in #4768's body, so no command regenerates this
-   table. Each row cites its own evidence instead.
-2. Open conflict, cpp. #4527 records a clangd 22.1.0 wire scenario in which the
-   save sender changes the outcome (base 1 of 5, head 5 of 5). #4768 records clangd
-   publishing on `didOpen` alone. The two records are not reconciled here; the row
-   keeps #4768's verdict.
+1. Probe. `node scripts/probe-save-verdict.mjs` is the command that produces this
+   table (see the paragraph above). It reuses the tool-smoke fixtures and the
+   nightly that already installs those servers, so it is one measurement path, not
+   a second driver. The only other command #4768 named is
+   `node scripts/smoke-tools.mjs --lsp-gate`; that step drives the clean gate and
+   writes no save verdict.
+2. clangd reconciled. #4527 recorded "base 1 of 5, head 5 of 5" and #4768 recorded
+   clangd publishing on `didOpen` alone; both hold, and they counted different
+   things. The 5 checks are the rows of the `lsp-did-save/analyze` verify scenario,
+   four of which require a `textDocument/didSave` on the wire, so its one passing
+   check on base is `control: clangd answered for a.c`: clangd published the
+   finding with `0 didSave(s)` captured. The sender was missing, not the
+   publish. The probe reproduces both arms with one seed and one window (6000 ms
+   each, one client): the no-save arm published on `didOpen`, and the save arm,
+   with the identical bytes and the save on the wire, published nothing, because
+   clangd does not republish identical bytes, the same property #4527 measured
+   when its own re-push left the cold query inconclusive. So #4768's verdict
+   stands, #4527's 1-of-5 → 5-of-5 is a sender measurement, and no clangd arm
+   reads `yes`.
 3. Citations corrected against master. #4768 cites `clients/lsp/client.ts:4410`
    for `sendDidSave`; it is at `clients/lsp/client.ts:4909`, with the save-capability
    gate at line 4917. The opengrep rescan claim is at
    `clients/lsp/wait-policy/strategies.ts:100`; line 345 is the
    `emptyUntilRulesRefreshed` hold.
+4. Clean-gate policy in a measured row is the fixture's own declaration, not
+   hand prose: `Gated.` is `lspGate: true`, `Auxiliary, not gated.` an auxiliary
+   scanner, and `Exempt from the clean gate.` a fixture whose `lspGateExempt`
+   reason lives in `scripts/smoke-tools.mjs`.
 
 ## Completing the matrix
 The fixtures (`tests/fixtures/tool-smoke/<lang>/`) are durable and cover every
@@ -368,13 +512,15 @@ marker; a mismatch means the marker may need a human update (#529). `unknown`
 observations are never compared (a slow/absent server is not evidence either way).
 
 - **[silent-not-marked]** observed silent on clean transitions but wait-policy/strategies.ts has no silentOnClean marker for "typescript7" — cascade is burning the full in-lane wait it could skip (the pre-#458 situation)
+- **[silent-not-marked]** observed silent on clean transitions but wait-policy/strategies.ts has no silentOnClean marker for "fallow" — cascade is burning the full in-lane wait it could skip (the pre-#458 situation)
 
 ## Capability matrix refresh state (nightly-generated)
 
 Bookkeeping for the two-run `first-publish`/`clean-behavior` hysteresis, the
-date-based `direct` expiry (#3401) and consecutive-night `idle-eviction`
-counts (#3989). Regenerated every run; never a measurement.
+first-miss stamps (#3401, #4615), the consecutive-night `missed-probe`
+streaks behind the `stale` column (#4512) and consecutive-night
+`idle-eviction` counts (#3989). Regenerated every run; never a measurement.
 
 ```json
-{"idle-eviction":{"docker-official":{"nights":[{"day":"2026-10-23","rssMb":62,"coldMs":883},{"day":"2026-10-24","rssMb":62,"coldMs":957}]},"kotlin":{"nights":[{"day":"2026-10-25","rssMb":270,"coldMs":2522}]},"powershell":{"nights":[{"day":"2026-10-25","rssMb":167,"coldMs":2967}]},"rust":{"nights":[{"day":"2026-10-25","rssMb":596,"coldMs":2927}]},"svelte":{"nights":[{"day":"2026-10-25","rssMb":232,"coldMs":2674}]},"zizmor":{"nights":[{"day":"2026-10-23","rssMb":55,"coldMs":1661},{"day":"2026-10-24","rssMb":57,"coldMs":1683}]}}}
+{"idle-eviction":{"svelte":{"nights":[{"day":"2026-11-03","rssMb":233,"coldMs":2987},{"day":"2026-11-04","rssMb":233,"coldMs":2944}]}}}
 ```

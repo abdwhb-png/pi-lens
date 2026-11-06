@@ -5,10 +5,8 @@
  * source the project loader's mixed-scope sub-key scan
  * (`clients/project-lens-config.ts`) derives its non-flag global-only
  * population from — the sibling, at KEY granularity, of the SECTION-level
- * registries `tests/config/pi-lens-config-schema.test.ts`'s "declares every
- * registry-derived section" already enforces. That section-level test has no
- * counterpart for `GLOBAL_ONLY_NON_FLAG_KEYS`: nothing verified a member is
- * actually global-only, so a wrongly-added entry naming a key the PROJECT
+ * registries. No test checks those section lists now. Nothing else verified a
+ * member is actually global-only, so a wrongly-added entry naming a key the PROJECT
  * loader genuinely honors too (e.g. `startup.mode`, parsed identically at
  * both scopes) would make the mixed-scope scan emit a false "global-only,
  * ignored" notice for a value that still takes effect — #3112 verbatim (a
@@ -54,6 +52,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	getGlobalActionableWarningMaxFixes,
 	getPiLensGlobalConfigPath,
+	loadPiLensGlobalConfig,
 	resetGlobalConfigWarnCache,
 } from "../../clients/lens-config.js";
 import { GLOBAL_ONLY_NON_FLAG_KEYS } from "../../clients/lens-flag-registry.js";
@@ -62,6 +61,7 @@ import {
 	resetProjectLensConfigCache,
 } from "../../clients/project-lens-config.js";
 import { removeTempDirSync } from "../clients/test-utils.js";
+import { useConfigPath } from "../support/global-config.js";
 
 // Same sink-forwarding shim `project-lens-config.test.ts` and
 // `lens-config.test.ts` each install — see either file's comment for why.
@@ -116,11 +116,23 @@ const GLOBAL_HONOR_CHECKS: ReadonlyMap<string, GlobalHonorCheck> = new Map([
 			read: (configPath) => getGlobalActionableWarningMaxFixes(configPath),
 		},
 	],
+	[
+		// `dispatch` is recognized at project scope for `dispatch.disabledRunners`,
+		// so this sibling needs the mixed-scope notice. Its reader
+		// (`getRunnerTimeoutFloorMs`) memoizes and merges an env var, so the
+		// proof reads the loader projection it is built from.
+		"dispatch.runnerTimeoutFloorMs",
+		{
+			value: 483_722,
+			read: (configPath) =>
+				loadPiLensGlobalConfig(configPath)?.dispatch?.runnerTimeoutFloorMs,
+		},
+	],
 ]);
 
 let tmpDirs: string[] = [];
 let projectDir: string;
-let previousConfigPath: string | undefined;
+const setConfigPath = useConfigPath();
 
 function makeTempHome(): string {
 	const dir = fs.mkdtempSync(
@@ -131,8 +143,7 @@ function makeTempHome(): string {
 }
 
 beforeEach(() => {
-	previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
-	delete process.env.PI_LENS_CONFIG_PATH;
+	setConfigPath(undefined);
 	projectDir = fs.mkdtempSync(
 		path.join(os.tmpdir(), "pi-lens-global-only-non-flag-project-"),
 	);
@@ -146,8 +157,6 @@ afterEach(() => {
 	vi.restoreAllMocks();
 	resetGlobalConfigWarnCache();
 	resetProjectLensConfigCache();
-	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 	for (const dir of tmpDirs.splice(0)) removeTempDirSync(dir);
 	tmpDirs = [];
 });

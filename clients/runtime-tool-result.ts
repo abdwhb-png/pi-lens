@@ -1,6 +1,7 @@
 import * as nodeFs from "node:fs";
 import * as path from "node:path";
 import {
+	buildWithheldAdvisory,
 	noteAuthoritativeContentAttachment,
 	queueAgentAdvisory,
 } from "./agent-nudge.js";
@@ -77,8 +78,10 @@ import { PathKeyedMap } from "./path-keyed-map.js";
 import { resolveLanguageRootForFile } from "./language-profile.js";
 import { logLatency } from "./latency-logger.js";
 import {
+	appliedFilesOfOwnTool,
 	classifyMutatingTool,
 	isBashDerivedReplay,
+	isProviderReplayCall,
 	readToolResultPathField,
 	PI_LENS_SYNTHETIC_MUTATION_FIELD,
 	type MutatingToolClassification,
@@ -100,11 +103,15 @@ import {
 	resolveToolCallCorrelationId,
 } from "./tool-event.js";
 import {
+	boundedEditIndexes,
 	boundedIndexesForCount,
 	createReadGuardEditBatchSummary,
+	formatBoundedEditIndexes,
 	getReadGuardCorrelationId,
 	logReadGuardEvent,
 } from "./read-guard-logger.js";
+import { formatAlreadyAppliedNotes } from "./read-guard-tool-lines.js";
+import type { PartialApplyPending } from "./partial-edit-apply.js";
 import type { PiLensFlagSource } from "./lens-config.js";
 import type { EditToolDetails } from "@earendil-works/pi-coding-agent";
 import type { LSPShutdownOptions } from "./lsp/client.js";
@@ -112,7 +119,6 @@ import {
 	notifyExternalFileChange,
 	peekLSPService,
 } from "./lsp/capabilities.js";
-import type { MetricsClient } from "./metrics-client.js";
 import { type PipelineResult, runPipeline } from "./pipeline.js";
 import {
 	type AuthoritativeAttachmentDecision,
@@ -128,7 +134,9 @@ import type {
 	RuntimeCoordinator,
 } from "./runtime-coordinator.js";
 import { EXPANSION_LIMIT_LINES } from "./read-expansion.js";
-import { syncGitGuardRecord } from "./git-guard.js";
+import { resyncGitGuardAfterRetire, syncGitGuardRecord } from "./git-guard.js";
+import { isCrossFileBlocker } from "./inline-blocker-fields.js";
+import { writeOrderToken } from "./write-ordering-guard.js";
 import { hashFileBytes } from "./content-stamp.js";
 import { scheduleWordIndexPersist } from "./word-index.js";
 import { RUNTIME_CONFIG } from "./runtime-config.js";
@@ -153,7 +161,10 @@ import {
 	readHeldDocumentsAnswer,
 	SAME_HEAD_DISCARD_SOURCE,
 } from "./disk-change-subscribers.js";
-import { lookForOutOfBandChanges } from "./out-of-band-changes.js";
+import {
+	lookForOutOfBandChanges,
+	oweDeclarationWalk,
+} from "./out-of-band-changes.js";
 import { HOOK_WALL_BUDGET_MS } from "./hook-budgets.js";
 import {
 	incrementDegradationCount,
@@ -307,6 +318,11 @@ export function resyncHeadMove(args: HeadLook): Promise<void> {
 	// `discarded`). Synchronous, so a joining caller's paths are in the
 	// accumulator before any drain that could owe them.
 	addHeadDiscards(args.key, args.discarded);
+	// #4532 gap 6: the same holds for this call's declaration walk. A bash
+	// result that joins a tool_call look runs the tool_call's closure, whose
+	// out-of-band look would not walk; the demand is owed to the root first, in
+	// the same synchronous step, and the out-of-band pass that runs next takes it.
+	oweDeclarationWalk(args.root, args.trigger);
 	return serializeHeadLook(args.key, async () => {
 		try {
 			await lookForOutOfBandChanges(args.root, args.trigger, args.runtime);
@@ -615,7 +631,10 @@ function mergeDispositions(
 interface ToolResultEvent {
 	toolName: string;
 	toolCallId?: string | number;
-	/** Parent codemode call whose transcript result contains nested calls. */
+	/**
+	 * Parent tool call whose transcript result contains nested calls. Any tool
+	 * that calls `ctx.executeTool` sets it; codemode is one example.
+	 */
 	parentToolCallId?: string | number;
 	/** Host tool_result status; distinct from pi-lens PipelineResult.isError. */
 	isError?: boolean;
@@ -639,7 +658,6 @@ interface ToolResultDeps {
 	cacheManager: CacheManager;
 	biomeClient?: BiomeClient;
 	ruffClient?: RuffClient;
-	metricsClient?: MetricsClient;
 	resetLSPService: (options?: LSPShutdownOptions) => void;
 	agentBehaviorRecord: (toolName: string, filePath?: string) => unknown[];
 	formatBehaviorWarnings: (warnings: unknown[]) => string;
@@ -654,6 +672,34 @@ interface ToolResultDeps {
 	sessionId?: string;
 	/** Role of the activation that owns this write. */
 	sessionRole?: "primary" | "secondary";
+	/**
+	 * #5108: the lines a run without authorship ended with for blockers it
+	 * withheld (`PipelineResult.withheldBlockerLine`), pushed as each dispatch
+	 * of this tool result finishes. The caller owns the array and reads it after
+	 * the handler settles: `index.ts`' tool_result bound abandons a slow handler
+	 * without cancelling it, and the tool result it then returns is never shown,
+	 * so these lines are the only copy of the disclosure the agent can still be
+	 * given. Absent when the caller has no such bound.
+	 */
+	withheldNotices?: string[];
+	/**
+	 * #5165 F1: the HOST's own liveness for this tool result, beside the
+	 * notices the same call collects. The host wall that abandons
+	 * `handleToolResult` is a second bound, and it can discard the returned
+	 * result while the dispatch inside is still inside its own 10 s bound, so
+	 * `delivery.abandoned` alone would let the findings row claim an inline
+	 * delivery the model never saw. The caller flips `abandoned` in the branch
+	 * where its own bound fired; absent means the caller has no such bound.
+	 */
+	hostDelivery?: { abandoned: boolean };
+	/**
+	 * #5108 F1: the session an agent advisory from this tool result is for,
+	 * captured by the caller at handler entry. The coordinator's own scope
+	 * (`writeSession`) is the primary's, while a concurrent secondary's
+	 * `context` drains its own member scope, so the caller resolves it the way
+	 * that drain does. Guarded writes keep `writeSession`. Absent: `writeSession`.
+	 */
+	advisoryScope?: LineageHandle;
 	/**
 	 * The host ctx's `cwd` for THIS tool_result — the same per-session field the
 	 * `tool_call` hook reads. The opaque prescan resolves its root through
@@ -671,6 +717,8 @@ interface ToolResultDeps {
 	_bypassDebounce?: boolean;
 	/** #2000: overrides the change-log source for this synthetic dispatch. */
 	_mutationSourceOverride?: ProjectChangeSource;
+	/** Internal (#5120): this call's partial apply, taken by the wrapper. */
+	_partialApply?: PartialApplyPending;
 	/** Internal bounded provenance carried through debounce/coalescing. */
 	_telemetryParticipantIds?: string[];
 	_telemetryParticipantTotal?: number;
@@ -728,12 +776,14 @@ type OwnWriteStamp = {
 	toolCallId?: string;
 	/** sha256 of the bytes this handler already read after the write (#2499). */
 	contentHash?: string;
+	/** `false` for a write no pre-write check guarded (a provider replay, #5160). */
+	advanceAuthorship?: false;
 };
 
 function ensureToolResultClients(
 	deps: ToolResultDeps,
 ): boolean | Promise<boolean> {
-	if (deps.biomeClient && deps.ruffClient && deps.metricsClient) return true;
+	if (deps.biomeClient && deps.ruffClient) return true;
 	const request = {
 		reason: "tool-result-analysis",
 		hook: "tool_result_edit" as const,
@@ -749,7 +799,6 @@ function ensureToolResultClients(
 		if (!clients) return false;
 		deps.biomeClient = clients.biomeClient;
 		deps.ruffClient = clients.ruffClient;
-		deps.metricsClient = clients.metricsClient;
 		return true;
 	});
 }
@@ -1171,14 +1220,7 @@ function getRequestedEditIndexes(
  */
 function sourceForMutation(
 	classification: MutatingToolClassification,
-	details?: unknown,
 ): ProjectChangeSource {
-	if (
-		(details as { piLensPartialApply?: unknown } | undefined)
-			?.piLensPartialApply
-	) {
-		return "partial-apply";
-	}
 	if (
 		classification.provenance === "builtin" ||
 		classification.provenance === "bash-derived"
@@ -1202,6 +1244,8 @@ export function recordProjectChange(args: {
 	changedRange?: ProjectChangeRange;
 	dbg: (msg: string) => void;
 	analysisRootMode: AnalysisRootMode;
+	/** #4943: the writing session, which the change-log row names. */
+	sessionId?: string | undefined;
 }): void {
 	if (!canWriteAnalysisRoot(args.analysisRootMode)) return;
 	// One mutation seam (#2000 phase 1): bump + receipt + change-log live in
@@ -1212,6 +1256,7 @@ export function recordProjectChange(args: {
 		source: args.source,
 		cwd: args.cwd,
 		changedRange: args.changedRange,
+		sessionId: args.sessionId,
 		onAppendError: (err) =>
 			args.dbg(`project change log append failed for ${args.filePath}: ${err}`),
 	});
@@ -1363,6 +1408,8 @@ function publishInlineVerdict(args: {
 	getFlag: ToolResultDeps["getFlag"];
 	turnStateCwd: string;
 	analysisRootMode: AnalysisRootMode;
+	/** #4921: the write's turn session, which owns the blocker it records. */
+	sessionId: string | undefined;
 }): void {
 	const {
 		runtime,
@@ -1376,6 +1423,7 @@ function publishInlineVerdict(args: {
 		getFlag,
 		turnStateCwd,
 		analysisRootMode,
+		sessionId,
 	} = args;
 	// #3596: a replaced session's handler latches nothing in the live session.
 	const resultLive = writeSession.guardedWrite(filePath, () => true) === true;
@@ -1407,6 +1455,7 @@ function publishInlineVerdict(args: {
 					result.orderTurn ?? writeOrderTurn,
 					// #3503: the freshness baseline is the analysis read.
 					result.analysisReadAtMs,
+					sessionId,
 				),
 			) !== undefined;
 	} else {
@@ -1443,9 +1492,50 @@ function publishInlineVerdict(args: {
 
 	// A superseded verdict must not latch the commit gate either (#3507).
 	if (resultLive) {
+		// #5020: this write's clean verdict on `filePath` also speaks for the rows
+		// OTHER files' records hold against it. A chart-wide runner reports
+		// `other-b.yaml` while `deploy-a.yaml` is written, so the row sits in
+		// `deploy-a.yaml`'s record, which no dispatch of `other-b.yaml` ever
+		// clears. Only an authored, applied run whose raising runner answered and
+		// holds no blocker of its own on this file may say so. There is no
+		// `isError` term: `PipelineResult.isError` is `false` from
+		// `analysePipeline`'s only return, so the branch could never be taken.
+		if (inlineVerdictApplied && authored) {
+			const verdict = new Set(result.verdictRunnerIds);
+			const stillReported = new Set(
+				(result.inlineBlockerDiagnostics ?? []).flatMap((d) =>
+					d.runnerId !== undefined && !isCrossFileBlocker(d, filePath)
+						? [d.runnerId]
+						: [],
+				),
+			);
+			for (const retired of runtime.retireForeignRows(
+				"cited-file-clean",
+				(row) =>
+					!isCrossFileBlocker(row, filePath) &&
+					row.runnerId !== undefined &&
+					verdict.has(row.runnerId) &&
+					!stillReported.has(row.runnerId),
+				writeOrderToken(
+					result.orderTurn ?? writeOrderTurn,
+					result.writeIndex ?? writeIndex,
+				),
+			)) {
+				resyncGitGuardAfterRetire({
+					runtime,
+					cacheManager,
+					cwd: turnStateCwd,
+					filePath: retired.filePath,
+					owner: retired.owner,
+					lensGuardEnabled: !!getFlag("lens-guard"),
+					analysisRootMode,
+				});
+			}
+		}
 		runtime.updateGitGuardStatus(
 			inlineVerdictApplied && result.hasBlockers,
 			result.output,
+			filePath,
 		);
 		if (getFlag("lens-guard")) {
 			// #4733 r1 F2: a clean verdict over the whole file, applied, with no
@@ -1471,6 +1561,7 @@ function publishInlineVerdict(args: {
 				wholeFileClean || ownBlockerRetired ? filePath : undefined,
 				analysisRootMode,
 				wholeFileClean,
+				sessionId,
 			);
 		}
 	}
@@ -1492,6 +1583,8 @@ function publishInlineVerdict(args: {
  * pipeline AND record" block could not express.
  */
 async function dispatchPipelineAnalysis(args: {
+	/** #5165: the caller stopped waiting; analysis still owns its verdict. */
+	delivery: { abandoned: boolean };
 	deps: ToolResultDeps;
 	runtime: RuntimeCoordinator;
 	filePath: string;
@@ -1507,7 +1600,8 @@ async function dispatchPipelineAnalysis(args: {
 	readGuardCorrelationId: string;
 	requestedEditIndexes: number[];
 	requestedEditTotal: number;
-	isPartialApplyResult: boolean;
+	/** #5120: the call's partial apply, whose commit summary names its own edits. */
+	partialApply?: PartialApplyPending;
 	participantIds: string[];
 	participantTotal: number;
 	toolResultStart: number;
@@ -1563,7 +1657,7 @@ async function dispatchPipelineAnalysis(args: {
 		readGuardCorrelationId,
 		requestedEditIndexes,
 		requestedEditTotal,
-		isPartialApplyResult,
+		partialApply,
 		toolResultStart,
 		nativeAppliedPairs,
 		allowAutonomousWriters,
@@ -1578,7 +1672,6 @@ async function dispatchPipelineAnalysis(args: {
 		dbg,
 		biomeClient,
 		ruffClient,
-		metricsClient,
 		resetLSPService,
 	} = deps;
 
@@ -1592,6 +1685,8 @@ async function dispatchPipelineAnalysis(args: {
 	const pipelinePromise = runPipeline(
 		{
 			signal: deps.signal,
+			inlineDeliveryAvailable: () =>
+				!args.delivery.abandoned && !deps.hostDelivery?.abandoned,
 			filePath,
 			cwd: dispatchCwd,
 			projectRoot: turnStateCwd,
@@ -1607,7 +1702,9 @@ async function dispatchPipelineAnalysis(args: {
 			priorAnalysisAnchor: () => runtime.getAnalysisAnchor(filePath),
 			telemetry: {
 				model: runtime.telemetryModel,
-				sessionId: runtime.telemetrySessionId,
+				// #4943: the writing session, which the log rows and a collect-later
+				// answer (`PendingRunnerFindings.sessionId`) are keyed by.
+				sessionId: deps.sessionId ?? runtime.telemetrySessionId,
 				turnIndex: runtime.turnIndex,
 				writeIndex,
 				orderTurn: writeOrderTurn,
@@ -1643,7 +1740,8 @@ async function dispatchPipelineAnalysis(args: {
 			sessionGeneration,
 			// #3830: a whole-package fixer's restore ends after this result, so its
 			// loss notice is queued for the session this dispatch belongs to.
-			onFixRunLoss: (notice) => queueAgentAdvisory(notice, sessionGeneration),
+			onFixRunLoss: (notice) =>
+				queueAgentAdvisory(notice, deps.advisoryScope ?? sessionGeneration),
 			// #3559: the re-token's turn, read when it is drawn.
 			nextWriteIndex: () => ({
 				turnIndex: runtime.turnIndex,
@@ -1654,7 +1752,6 @@ async function dispatchPipelineAnalysis(args: {
 		{
 			biomeClient: biomeClient!,
 			ruffClient: ruffClient!,
-			metricsClient: metricsClient!,
 			getFormatService,
 			fixedThisTurn,
 		},
@@ -1740,6 +1837,35 @@ async function dispatchPipelineAnalysis(args: {
 		});
 
 		const notice = runtime.formatPipelineCrashNotice(filePath, pipelineErr);
+		if (args.delivery.abandoned && !deps.signal?.aborted && notice) {
+			sessionGeneration.guardedWrite(filePath, () =>
+				queueAgentAdvisory(
+					buildWithheldAdvisory(
+						event.toolName,
+						HOOK_WALL_BUDGET_MS.tool_result_edit,
+						[notice],
+						"inner-analysis-bound",
+					),
+					deps.advisoryScope ?? sessionGeneration,
+				),
+			);
+			// #5165 F3: the late REJECTION discloses on the same surface as the
+			// late success, so a reader of this phase counts both populations.
+			// `crash` separates them without a second phase name.
+			logLatency({
+				type: "phase",
+				phase: "withheld_blocker_late_advisory",
+				filePath: event.toolName,
+				durationMs: 0,
+				metadata: {
+					notices: 1,
+					budgetMs: HOOK_WALL_BUDGET_MS.tool_result_edit,
+					late: "inner-bound",
+					crash: true,
+				},
+			});
+		}
+
 		return {
 			crashed: true,
 			response: {
@@ -1764,43 +1890,49 @@ async function dispatchPipelineAnalysis(args: {
 		);
 	}
 
-	if (!isPartialApplyResult) {
-		const postEditStatus = result.isError ? "failed" : "succeeded";
-		if (result.isError) {
-			logReadGuardEvent({
-				event: "edit_post_edit_pipeline_failed",
-				correlationId: readGuardCorrelationId,
-				filePath,
-				metadata: {
-					tool: event.toolName,
-					commitStatus: "committed",
-					reasonCode: "pipeline_failed",
-				},
-			});
-		}
+	const postEditStatus = result.isError ? "failed" : "succeeded";
+	if (result.isError) {
 		logReadGuardEvent({
-			event: "edit_batch_summary",
+			event: "edit_post_edit_pipeline_failed",
 			correlationId: readGuardCorrelationId,
 			filePath,
 			metadata: {
 				tool: event.toolName,
-				editBatchSummary: createReadGuardEditBatchSummary({
+				commitStatus: "committed",
+				reasonCode: "pipeline_failed",
+			},
+		});
+	}
+	// #5120: a partial apply's executed batch is renumbered; its summary is
+	// the preflight's, over the original batch, with the edits it applied.
+	const appliedIndexes = partialApply
+		? boundedEditIndexes(partialApply.applied.map((edit) => edit.originalIndex))
+		: requestedEditIndexes;
+	logReadGuardEvent({
+		event: "edit_batch_summary",
+		correlationId: readGuardCorrelationId,
+		filePath,
+		metadata: {
+			tool: event.toolName,
+			editBatchSummary: createReadGuardEditBatchSummary({
+				...(partialApply?.summary ?? {
 					requestedIndexes: requestedEditIndexes,
 					requestedTotal: requestedEditTotal,
 					resolvedIndexes: requestedEditIndexes,
 					resolvedTotal: requestedEditTotal,
-					appliedIndexes: requestedEditIndexes,
-					appliedTotal: requestedEditTotal,
-					participantIds: pipelineTelemetry.participantIds,
-					participantTotal: pipelineTelemetry.participantTotal,
-					commitStatus: "committed",
-					postEditStatus,
-					terminalStatus: postEditStatus === "failed" ? "failed" : "success",
-					durationMs: Date.now() - toolResultStart,
 				}),
-			},
-		});
-	}
+				appliedIndexes,
+				// The executed batch is exactly the applied edits.
+				appliedTotal: requestedEditTotal,
+				participantIds: pipelineTelemetry.participantIds,
+				participantTotal: pipelineTelemetry.participantTotal,
+				commitStatus: "committed",
+				postEditStatus,
+				terminalStatus: postEditStatus === "failed" ? "failed" : "success",
+				durationMs: Date.now() - toolResultStart,
+			}),
+		},
+	});
 
 	// ── Post-pipeline post-conditions (#2464 review round 2, S1) ───────────────
 	// These live INSIDE the helper rather than at its call sites so EVERY
@@ -1886,6 +2018,53 @@ async function dispatchPipelineAnalysis(args: {
 						}),
 				});
 			}
+		}
+	}
+
+	// #5165: bounded() abandons only the wait. Both authored callers still
+	// publish the ordered verdict and disclose the result to their own scope.
+	if (
+		args.delivery.abandoned &&
+		!deps.signal?.aborted &&
+		getFileStateHash(filePath) === finalStateHash &&
+		sessionGeneration.guardedWrite(filePath, () => true) === true
+	) {
+		publishInlineVerdict({
+			runtime,
+			cacheManager: deps.cacheManager,
+			filePath,
+			result,
+			writeSession: sessionGeneration,
+			writeIndex,
+			writeOrderTurn,
+			authored: allowAutonomousWriters,
+			getFlag,
+			turnStateCwd,
+			analysisRootMode,
+			sessionId: deps.sessionId,
+		});
+		const notice = result.inlineBlockerSummary || result.withheldBlockerLine;
+		if (notice) {
+			queueAgentAdvisory(
+				buildWithheldAdvisory(
+					event.toolName,
+					HOOK_WALL_BUDGET_MS.tool_result_edit,
+					[notice],
+					"inner-analysis-bound",
+				),
+				deps.advisoryScope ?? sessionGeneration,
+			);
+			logLatency({
+				type: "phase",
+				phase: "withheld_blocker_late_advisory",
+				filePath: event.toolName,
+				durationMs: 0,
+				metadata: {
+					notices: 1,
+					budgetMs: HOOK_WALL_BUDGET_MS.tool_result_edit,
+					late: "inner-bound",
+				},
+			});
 		}
 	}
 
@@ -2017,11 +2196,95 @@ export function handleToolExecutionEnd(
 		: false;
 }
 
-export async function handleToolResult(deps: ToolResultDeps): Promise<{
-	content: Array<{ type: string; text?: string }>;
-	isError?: boolean;
-	structuredContent?: unknown;
-} | void> {
+/**
+ * #5120: the agent-facing result of a partial apply. The host edit wrote the
+ * matched subset, so the edits that applied lead the message and the
+ * preflight's per-edit bodies follow unchanged: they describe exactly the
+ * edits that did not apply. The preflight header (🔄/🛑) is never reused for
+ * committed bytes; that relabelling is the #2402 retry loop. When the host
+ * refused the subset, nothing was written and the preflight verdict stands.
+ * Either way the call reports `isError`: the batch as submitted did not land.
+ */
+function composePartialApplyResult(
+	pending: PartialApplyPending,
+	event: ToolResultDeps["event"],
+	result: ToolResultReturn,
+): ToolResultReturn {
+	// pi's edit tool reports a refusal by throwing, which pi turns into an
+	// error result.
+	const hostRefused = event.isError === true;
+	const content = result ? result.content : event.content;
+	const structuredContent = result
+		? result.structuredContent
+		: event.structuredContent;
+	const readGuardCorrelationId = getReadGuardCorrelationId(event);
+	const filePath = readToolResultPathField(event) ?? "";
+	if (hostRefused) {
+		logReadGuardEvent({
+			event: "edit_partial_apply_rejected",
+			correlationId: readGuardCorrelationId,
+			filePath,
+			metadata: {
+				tool: event.toolName,
+				rejectionReason: "host_refused",
+				editCount: pending.applied.length,
+			},
+		});
+		return {
+			content: [
+				{
+					type: "text",
+					text: `${pending.preflightError}\n\n🛑 Batch not applied: the host edit refused the matched edits as well, so nothing was written. Rebuild the edit from a fresh read.`,
+				},
+				...content,
+			],
+			isError: true,
+			structuredContent,
+		};
+	}
+	const count = pending.applied.length;
+	const indices = formatBoundedEditIndexes(
+		boundedEditIndexes(pending.applied.map((edit) => edit.originalIndex)),
+	);
+	const committed = `⚠️ PARTIAL APPLY — ${count} edit${count === 1 ? "" : "s"} committed (${indices}).`;
+	const parts = [
+		result?.isError === true
+			? `${committed} Post-edit analysis failed after the commit; the committed bytes stand and were not reverted. Do NOT resubmit the applied edits.`
+			: `${committed} Do NOT resubmit the applied edits.`,
+	];
+	if (pending.preflightDetails && pending.preflightDetails.length > 0)
+		parts.push(pending.preflightDetails.join("\n\n"));
+	const alreadyNotes = formatAlreadyAppliedNotes(pending.alreadyAppliedEdits);
+	if (alreadyNotes) parts.push(alreadyNotes.trimStart());
+	return {
+		content: [{ type: "text", text: parts.join("\n\n") }, ...content],
+		isError: true,
+		structuredContent,
+	};
+}
+
+export async function handleToolResult(
+	deps: ToolResultDeps,
+): Promise<ToolResultReturn> {
+	// #5120: a call whose tool_call rewrote a partly matching batch to its
+	// matched subset is found here by its own input object. The handler runs
+	// it as the edit it is, and the partial-apply message wraps its result. A
+	// re-entry (the debounce) already carries it.
+	if (deps._partialApply === undefined) {
+		const partialApply = (
+			deps.runtime as Partial<RuntimeCoordinator>
+		).toolCallPartialApply?.call(deps.runtime, deps.event.input);
+		if (partialApply)
+			return composePartialApplyResult(
+				partialApply,
+				deps.event,
+				await handleToolResult({
+					...deps,
+					_partialApply: partialApply,
+					_mutationSourceOverride: "partial-apply",
+				}),
+			);
+	}
 	const {
 		event,
 		getFlag,
@@ -2038,6 +2301,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// the turn and write counters; a capture taken there would name session 2.
 	const writeSession =
 		deps._sessionGeneration ?? runtime.captureSessionGeneration();
+	const advisoryScope = deps.advisoryScope ?? writeSession;
 	// #3650: the tool_result path question has one owner
 	// (`readToolResultPathField`); no fallback cascade is open-coded here.
 	const rawFilePath = readToolResultPathField(event);
@@ -2154,6 +2418,49 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		});
 	}
 
+	// Search tools reveal specific lines (file:line) the agent then edits — register
+	// those shown lines (± context) as reads so the follow-up edit isn't blocked (#169).
+	// Our tools attach locations as `details.searchReads`; bash grep is parsed from
+	// `grep -n` output. Only shown lines are registered, never the whole file.
+	//
+	// #1884: this runs BEFORE the `path_attribution_missing` refusal below, because
+	// the two answer different questions. The refusal answers for the call's NAMED
+	// path, which no attribution can resolve, and keeps every path-keyed step
+	// closed; a `searchReads` entry carries its own path, so the lines a
+	// relative-path `lsp_navigation` result showed are delivered evidence either
+	// way. Registered after the refusal, they were dropped, and the agent's
+	// follow-up edit to a line it had just been shown was blocked.
+	if (deps.readGuard && event.isError !== true && !getFlag("no-read-guard")) {
+		const searchReads: SearchReadLocation[] = [];
+		const detailSearchReads = (
+			event.details as { searchReads?: SearchReadLocation[] }
+		)?.searchReads;
+		if (Array.isArray(detailSearchReads))
+			searchReads.push(...detailSearchReads);
+		if (
+			event.toolName === "bash" &&
+			typeof (event.input as { command?: unknown }).command === "string"
+		) {
+			const command = (event.input as { command: string }).command;
+			const output = event.content
+				.map((part) => (typeof part.text === "string" ? part.text : ""))
+				.join("\n");
+			searchReads.push(
+				...extractGrepSearchReadsFromOutput(command, workspaceRoot, output),
+			);
+		}
+		if (searchReads.length > 0) {
+			registerSearchReads(deps.readGuard, searchReads, {
+				projectRoot: workspaceRoot,
+				turnIndex: runtime.turnIndex,
+				writeIndex: runtime.peekWriteIndex(),
+				...(readEvidenceToolCallId !== undefined && {
+					toolCallId: readEvidenceToolCallId,
+				}),
+			});
+		}
+	}
+
 	let resolutionBasis: string;
 	if (attribution) {
 		resolutionBasis = attribution.originCwd;
@@ -2186,7 +2493,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			durationMs: 0,
 			metadata: { toolCallId, rawFilePath, guessedPath },
 		});
-		if (!opaqueNonBash)
+		// #5239, #5248 r5: an admitted pi-lens writer (`appliedFilesOfOwnTool`)
+		// reports the ABSOLUTE files it wrote, so the refused relative path
+		// stays refused as a path (`filePath` unset below, every step keyed on it
+		// closed) while the applied-files feed still dispatches what was written.
+		if (!opaqueNonBash && appliedFilesOfOwnTool(event).length === 0)
 			return readNote.length > 0
 				? {
 						content: [...readNote, ...event.content],
@@ -2373,7 +2684,13 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					unknownPairs: number;
 			  }
 			| { root: string; verdict: "unknown"; reason: string };
-		if (shouldRunOpaqueRecovery(event.toolName, workspaceRoot)) {
+		// #5162 r3: a provider replay took no baseline (its window holds another
+		// writer's change), so its recognized writes dispatch unauthored, as in
+		// a session with no scan root.
+		if (
+			shouldRunOpaqueRecovery(event.toolName, workspaceRoot) &&
+			!isProviderReplayCall(event)
+		) {
 			const started = Date.now();
 			const unknownRoots = new Set<string>();
 			let unknownReason: string | undefined;
@@ -3060,41 +3377,6 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		}
 	}
 
-	// Search tools reveal specific lines (file:line) the agent then edits — register
-	// those shown lines (± context) as reads so the follow-up edit isn't blocked (#169).
-	// Our tools attach locations as `details.searchReads`; bash grep is parsed from
-	// `grep -n` output. Only shown lines are registered, never the whole file.
-	if (deps.readGuard && event.isError !== true && !getFlag("no-read-guard")) {
-		const searchReads: SearchReadLocation[] = [];
-		const detailSearchReads = (
-			event.details as { searchReads?: SearchReadLocation[] }
-		)?.searchReads;
-		if (Array.isArray(detailSearchReads))
-			searchReads.push(...detailSearchReads);
-		if (
-			event.toolName === "bash" &&
-			typeof (event.input as { command?: unknown }).command === "string"
-		) {
-			const command = (event.input as { command: string }).command;
-			const output = event.content
-				.map((part) => (typeof part.text === "string" ? part.text : ""))
-				.join("\n");
-			searchReads.push(
-				...extractGrepSearchReadsFromOutput(command, workspaceRoot, output),
-			);
-		}
-		if (searchReads.length > 0) {
-			registerSearchReads(deps.readGuard, searchReads, {
-				projectRoot: workspaceRoot,
-				turnIndex: runtime.turnIndex,
-				writeIndex: runtime.peekWriteIndex(),
-				...(readEvidenceToolCallId !== undefined && {
-					toolCallId: readEvidenceToolCallId,
-				}),
-			});
-		}
-	}
-
 	// A read whose host call errored delivered nothing: its tool_call capture
 	// is released by `handleToolExecutionEnd`, which pi emits right after this
 	// handler, keyed by the call (#4185 round 4).
@@ -3151,7 +3433,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				}
 				logReadGuardEvent({
 					event: "read_pattern",
-					sessionId: runtime.telemetrySessionId,
+					sessionId: deps.sessionId ?? runtime.telemetrySessionId,
 					filePath: deliveredFilePath,
 					requestedOffset,
 					requestedLimit: requestedLimit ?? deliveredLimit,
@@ -3356,8 +3638,13 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			turnIndex: runtime.turnKey(deps.sessionId),
 			signal: getAmbientAbortSignal(),
 			// #3596: the replay lands after the settle's own awaits.
+			// #4943: and names this turn's session, which owns its deferred pass.
 			record: (entry) =>
-				replayThroughMutationBridge({ ...entry, lineage: writeSession }),
+				replayThroughMutationBridge({
+					...entry,
+					lineage: writeSession,
+					...(deps.sessionId !== undefined && { sessionId: deps.sessionId }),
+				}),
 			getStoredLineHashes: (candidate) =>
 				storedLineHashesFor(deps.readGuard, candidate),
 			isRecordable: (candidate) =>
@@ -3375,6 +3662,21 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				`tool_result: observation for "${event.toolName}" did not settle: ${observed.reason}`,
 			);
 		}
+	}
+	// #5239, #5248: `ast_grep_replace` and `lsp_navigation` are pi-lens-owned
+	// writers the net above never arms (`isPiLensToolName`); the first names
+	// its targets in a `paths` array the classified chain cannot read and the
+	// second writes files its `path` never named (a rename's importers), so an
+	// applied rewrite reached the bridge's bookkeeping and nothing else: no
+	// dispatch, no blocker, no commit-gate verdict. The tool reports the files
+	// the bridge accepted in its result details; they take the SAME dispatch the settle's changed
+	// paths take below (`observedReplayed` / `observedChangedPaths` name that
+	// seam, not a provenance). The tool is never armed, so the settle above
+	// recorded nothing for this call and the two sources cannot both dispatch.
+	const ownApplied = appliedFilesOfOwnTool(event);
+	if (ownApplied.length > 0) {
+		observedReplayed = ownApplied.length;
+		observedChangedPaths = ownApplied;
 	}
 	// #2464 review round 2 (S5): ONE clock, started above BOTH exits, so
 	// `edit_batch_summary.durationMs` and the `tool_result` latency row measure
@@ -3574,8 +3876,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 					const observedWriteIndex = runtime.nextWriteIndex();
 					const observedWriteOrderTurn = runtime.writeOrderTurn;
 					const observedTurnStateCwd = path.resolve(workspaceRoot);
+					const observedDelivery = { abandoned: false };
 					const observedDispatchOutcome = await bounded(
 						dispatchPipelineAnalysis({
+							delivery: observedDelivery,
 							deps,
 							runtime,
 							filePath: observedPath,
@@ -3598,9 +3902,6 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 								observedKind,
 							),
 							requestedEditTotal: getRequestedEditCount(event, observedKind),
-							isPartialApplyResult:
-								((event.details ?? {}) as Record<string, unknown>)
-									.piLensPartialApply === true,
 							participantIds: [observedReadGuardCorrelationId],
 							participantTotal: 1,
 							toolResultStart,
@@ -3627,6 +3928,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							label: "observed-tool-result-analysis",
 						},
 					);
+					observedDelivery.abandoned = !observedDispatchOutcome;
 					if (observedDispatchOutcome?.crashed) {
 						// #2464 review round 2, S6: parity with the classified chain — a
 						// pipeline crash surfaces its notice to the agent instead of being
@@ -3653,6 +3955,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 							getFlag,
 							turnStateCwd: observedTurnStateCwd,
 							analysisRootMode: observedRootMode,
+							sessionId: deps.sessionId,
 						});
 					}
 				}
@@ -3703,7 +4006,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			if (firstOutsideRootEdit) {
 				queueAgentAdvisory(
 					`pi-lens skipped analysis for the edit at ${filePath} because it is outside the session root. Start pi in that directory or add it to the workspace to get analysis.`,
-					writeSession,
+					advisoryScope,
 				);
 			}
 		}
@@ -3723,7 +4026,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			if (firstAdoptedRoot) {
 				queueAgentAdvisory(
 					`pi-lens is analysing ${adoptedRoot} as a separate project (LSP + global or managed php-lint/fish-indent; formatting, autofix, other dispatch runners, and automatic tests are off).`,
-					writeSession,
+					advisoryScope,
 				);
 			}
 		}
@@ -3734,7 +4037,6 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	noteMutationHandled(filePath);
 	const readGuardCorrelationId = getReadGuardCorrelationId(event);
 	const resultDetails = (event.details ?? {}) as Record<string, unknown>;
-	const isPartialApplyResult = resultDetails.piLensPartialApply === true;
 	const requestedEditIndexes = getRequestedEditIndexes(event, mutation.kind);
 	const requestedEditTotal = getRequestedEditCount(event, mutation.kind);
 	const participantIds = [
@@ -3793,7 +4095,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// args (post-autopatch), the same text the preflight resolves against.
 	const nativeAppliedPairs = recordNativeAppliedPairs({
 		runtime,
-		input: event.input,
+		// #5120: a partial apply's host edit ran on the exact span text; an
+		// identical resubmission carries the agent's own pairs.
+		input: deps._partialApply
+			? { edits: deps._partialApply.applied }
+			: event.input,
 		kind: mutation.kind,
 		filePath,
 		stateHash: postWriteStateHash,
@@ -3858,6 +4164,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			writtenContent: executedContent,
 		}),
 		...(toolCallId !== undefined && { toolCallId }),
+		// #5162 r3 (shape 65): a provider replay's tool_call skipped the
+		// pre-write check, so over an existing authorship its credit may only
+		// end it: the bytes may be another writer's.
+		...(isProviderReplayCall(event) && { advanceAuthorship: false }),
 	};
 
 	// Must happen before debounce admission: latestDeps intentionally retains only
@@ -3960,13 +4270,9 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// stays, because the edit did land on disk.
 	const entryLive = writeSession.guardedWrite(filePath, () => true) === true;
 	if (!getFlag("no-read-guard") && bashAuthorshipConfirmed) {
-		const readGuard = (
-			runtime as {
-				readGuard?: {
-					recordWritten?: (writtenPath: string, opts: OwnWriteStamp) => void;
-				};
-			}
-		).readGuard;
+		// #4942: the session's own guard (`deps.readGuard`), the one the write's
+		// other stamps above use; the coordinator's is another session's.
+		const readGuard = deps.readGuard;
 		if (entryLive)
 			readGuard?.recordWritten?.(filePath, {
 				authorship:
@@ -4121,11 +4427,10 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		cwd: turnStateCwd,
 		analysisRootMode,
 		filePath,
-		source:
-			deps._mutationSourceOverride ??
-			sourceForMutation(mutation, event.details),
+		source: deps._mutationSourceOverride ?? sourceForMutation(mutation),
 		changedRange: singleRange(modifiedRanges),
 		dbg,
+		sessionId: deps.sessionId,
 	});
 
 	const turnStateMs = Date.now() - toolResultStart;
@@ -4143,41 +4448,42 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// early return. This call site is otherwise unchanged — same arguments, same
 	// crash-then-return / success-then-continue shape as before the split.
 	if (!classifiedClientsReady || !entryLive) return;
-	const dispatchOutcome = await bounded(
-		dispatchPipelineAnalysis({
-			deps,
-			runtime,
-			filePath,
-			dispatchCwd,
-			turnStateCwd,
-			analysisRootMode,
-			autofixMode,
-			modifiedRanges,
-			writeIndex,
-			writeOrderTurn,
-			initialStateHash,
-			readGuardCorrelationId,
-			requestedEditIndexes,
-			requestedEditTotal,
-			isPartialApplyResult,
-			participantIds,
-			participantTotal,
-			toolResultStart,
-			nativeAppliedPairs,
-			preserveNativeAuthorship: mutation.kind !== "write",
-			allowAutonomousWriters: bashAuthorshipConfirmed,
-			// #3512: one capture for the whole dispatch, the same one the
-			// inline verdict below writes through.
-			sessionGeneration: writeSession,
-			ownFileTimeStamp: ownWriteStamp.stampFileTime,
-		}),
-		{
-			ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
-			signal: deps.signal || undefined,
-			hook: "tool_result_edit",
-			label: "pipeline-analysis",
-		},
-	);
+	const delivery = { abandoned: false };
+	const dispatching = dispatchPipelineAnalysis({
+		delivery,
+		deps,
+		runtime,
+		filePath,
+		dispatchCwd,
+		turnStateCwd,
+		analysisRootMode,
+		autofixMode,
+		modifiedRanges,
+		writeIndex,
+		writeOrderTurn,
+		initialStateHash,
+		readGuardCorrelationId,
+		requestedEditIndexes,
+		requestedEditTotal,
+		partialApply: deps._partialApply,
+		participantIds,
+		participantTotal,
+		toolResultStart,
+		nativeAppliedPairs,
+		preserveNativeAuthorship: mutation.kind !== "write",
+		allowAutonomousWriters: bashAuthorshipConfirmed,
+		// #3512: one capture for the whole dispatch, the same one the
+		// inline verdict below writes through.
+		sessionGeneration: writeSession,
+		ownFileTimeStamp: ownWriteStamp.stampFileTime,
+	});
+	const dispatchOutcome = await bounded(dispatching, {
+		ms: HOOK_WALL_BUDGET_MS.tool_result_edit,
+		signal: deps.signal || undefined,
+		hook: "tool_result_edit",
+		label: "pipeline-analysis",
+	});
+	delivery.abandoned = !dispatchOutcome;
 	if (!dispatchOutcome) return;
 	if (dispatchOutcome.crashed) {
 		return dispatchOutcome.response;
@@ -4194,11 +4500,17 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 	// still reach the change log below, because they landed on disk.
 	const resultLive = writeSession.guardedWrite(filePath, () => true) === true;
 
+	// #4689 item 9: `deferMutation` refuses a root the session may not write
+	// (an adopted project) and queues nothing, so no queue claim (the phase
+	// row, the debug lines, `formatQueued`) is made for a root it refuses. One
+	// predicate serves both blocks.
+	const mayDefer = canWriteAnalysisRoot(analysisRootMode);
 	let autofixNewlyQueued = false;
 	if (
 		resultLive &&
 		!result.isError &&
 		bashAuthorshipConfirmed &&
+		mayDefer &&
 		autofixMode === "deferred" &&
 		nodeFs.existsSync(filePath)
 	) {
@@ -4223,6 +4535,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		resultLive &&
 		!result.isError &&
 		bashAuthorshipConfirmed &&
+		mayDefer &&
 		!getFlag("no-autoformat", filePath) &&
 		(autofixMode === "deferred" || !getFlag("immediate-format")) &&
 		nodeFs.existsSync(filePath)
@@ -4305,6 +4618,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 			filePath: resolvedChanged,
 			source: "autofix",
 			dbg,
+			sessionId: deps.sessionId,
 		});
 		if (!resultLive) continue;
 		// Workspace-edit paths come from fileURLToPath and are normally absolute,
@@ -4390,7 +4704,11 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 		getFlag,
 		turnStateCwd,
 		analysisRootMode,
+		sessionId: deps.sessionId,
 	});
+	if (result.withheldBlockerLine) {
+		deps.withheldNotices?.push(result.withheldBlockerLine);
+	}
 
 	// #2050 AC3 / #2657: `linked-worktree` is a WRITABLE class
 	// (`canWriteAnalysisRoot`), so the pipeline above ran the full set — format,
@@ -4421,7 +4739,7 @@ export async function handleToolResult(deps: ToolResultDeps): Promise<{
 				if (firstSilentRun) {
 					queueAgentAdvisory(
 						`pi-lens analysed the edit at ${filePath} in the linked worktree ${worktreeRoot} (full LSP, formatting, autofix and dispatch) and found nothing to report.`,
-						writeSession,
+						advisoryScope,
 					);
 				}
 			}

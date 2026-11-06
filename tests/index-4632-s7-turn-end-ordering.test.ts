@@ -42,7 +42,7 @@
  * shared fake server, which answers every pull with no findings. A missing
  * server's command points at a path that does not exist. That is why this file
  * runs in the serialized `lsp-spawn-heavy` lane: real children, one of them
- * held 8 s before it answers.
+ * held 2 s before it answers.
  */
 
 import * as fs from "node:fs";
@@ -78,7 +78,7 @@ const DISABLED_CAUSE = "it is disabled in config by lsp.disabledServers";
 const UNSTARTED_CAUSE = "it could not be started, or was still starting";
 
 const cascadeLine = (ids: string, cause: string): string =>
-	`⚠️ Cascade: no language server answered for neighbor files of ${ids} (${cause}), so their cross-file errors were not checked (not a clean result).`;
+	`⚠️ Cascade: no primary language server answered for neighbor files of ${ids} (${cause}), so their cross-file errors were not confirmed (not a clean result).`;
 
 const UNSTARTED_LINE = cascadeLine("typescript", UNSTARTED_CAUSE);
 
@@ -100,6 +100,9 @@ const CASES: readonly Case[] = [
 	// Still starting when b.ts is written: the cascade defers a cold server's
 	// neighbours (clients/lsp/cascade-tier.ts) rather than naming it, so a
 	// session's first edit does not report a server that is only warming up.
+	// The hold is 2 s (#3801): the cascade touch waits 1-2 s, and a 1 ms wait
+	// names the server and reds this case. The former 8 s hold gave the same
+	// verdict 5.5 s slower.
 	{
 		name: "typescript still starting",
 		typescript: "slow",
@@ -191,7 +194,7 @@ function makeWorkspace(testCase: Setup, slug: string): string {
 					command:
 						testCase.typescript === "missing"
 							? missing("typescript-language-server")
-							: shim("typescript", testCase.typescript === "slow" ? 8_000 : 0),
+							: shim("typescript", testCase.typescript === "slow" ? 2_000 : 0),
 				},
 				deno: { command: missing("deno") },
 				typos: {
@@ -353,7 +356,6 @@ async function runTurns(
 	});
 }
 
-const previousConfigPath = process.env.PI_LENS_CONFIG_PATH;
 const previousInstall = process.env.PI_LENS_DISABLE_LSP_INSTALL;
 
 beforeAll(() => {
@@ -379,8 +381,6 @@ afterAll(() => {
 	if (previousInstall === undefined)
 		delete process.env.PI_LENS_DISABLE_LSP_INSTALL;
 	else process.env.PI_LENS_DISABLE_LSP_INSTALL = previousInstall;
-	if (previousConfigPath === undefined) delete process.env.PI_LENS_CONFIG_PATH;
-	else process.env.PI_LENS_CONFIG_PATH = previousConfigPath;
 });
 
 describe("a cascade neighbour no primary answered for, on the real host (#4403 N2)", () => {

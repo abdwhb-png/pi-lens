@@ -14,6 +14,7 @@
  * queue cannot see (#3541's remainder), and the same edit lost silently when
  * the capture itself was already overwritten.
  */
+import { CHECKED_BY_FIXTURE } from "../support/dispatch-verdict.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
 // pi's real per-file queue, the one its `edit`/`write` tools run under.
@@ -26,7 +27,6 @@ import {
 	getDegradationSummary,
 	resetDegradationLedger,
 } from "../../clients/degradation-ledger.js";
-import { MetricsClient } from "../../clients/metrics-client.js";
 import {
 	type PipelineContext,
 	type PipelineDeps,
@@ -230,6 +230,7 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 			resolvedCount: 0,
 			output: "",
 			blockerOutput: "",
+			verdict: CHECKED_BY_FIXTURE,
 			hasBlockers: false,
 		});
 	});
@@ -256,7 +257,6 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 				ensureAvailable: async () => false,
 			} as unknown as RuffClient,
 			testRunnerClient: new TestRunnerClient(),
-			metricsClient: new MetricsClient(),
 			getFormatService: () => ({}) as never,
 			fixedThisTurn: new Set(),
 		} as PipelineDeps;
@@ -365,7 +365,6 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 					biomeClient: {},
 					ruffClient: {},
 					testRunnerClient: {},
-					metricsClient: {},
 					resetLSPService: () => {},
 					agentBehaviorRecord: () => [],
 					formatBehaviorWarnings: () => "",
@@ -685,6 +684,67 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 			consumeAgentNudge(undefined, beginScope({ role: "secondary" })),
 		).toBeUndefined();
 		const nudge = consumeAgentNudge(undefined, runtime.sessionScope);
+		expect(nudge?.messages[0]?.content).toContain("a.rs");
+	});
+
+	// Recurrence: #5114 verify r2 F5. A concurrent secondary (#473) shares the
+	// coordinator, whose scope is the primary's; the drain queued the loss
+	// notice there, so the secondary's own context never carried it. The
+	// caller names the session (`advisoryScope`), as tool_result does.
+	it("tells a concurrent secondary, not the primary, about its own lost edit (#5108 F5)", async () => {
+		const aRs = path.join(srcDir, "a.rs");
+		const started = gate();
+		const proceed = gate();
+		fake.clippy = async () => {
+			started.open();
+			await proceed.p;
+			return 0;
+		};
+		const runtime = new RuntimeCoordinator();
+		runtime.projectRoot = tmpDir;
+		runtime.deferMutation(
+			mainRs,
+			tmpDir,
+			"edit",
+			tmpDir,
+			"autofix",
+			"pi-5108-secondary",
+		);
+		const secondary = beginScope({ role: "secondary" });
+
+		const drain = handleAgentEnd({
+			ctxCwd: tmpDir,
+			getFlag: (name: string) => name === "no-lsp",
+			notify: () => {},
+			dbg: () => {},
+			runtime,
+			cacheManager: { addModifiedRange: vi.fn() } as never,
+			biomeClient: {} as never,
+			ruffClient: {} as never,
+			getFormatService: () =>
+				({
+					recordRead: () => {},
+					formatFile: async (filePath: string) => ({
+						filePath,
+						formatters: [],
+						anyChanged: false,
+						allSucceeded: true,
+					}),
+				}) as never,
+			currentSessionId: "pi-5108-secondary",
+			sessionRole: "concurrent-secondary",
+			advisoryScope: secondary.capture(),
+		} as never);
+		await started.p;
+		const edit = agentEdit(aRs, "let AGENT = 1;");
+		edit.write();
+		fs.writeFileSync(aRs, TOOL_FIXED);
+		await edit.deliver();
+		proceed.open();
+		await drain;
+
+		expect(consumeAgentNudge(undefined, runtime.sessionScope)).toBeUndefined();
+		const nudge = consumeAgentNudge(undefined, secondary);
 		expect(nudge?.messages[0]?.content).toContain("a.rs");
 	});
 
@@ -1460,7 +1520,6 @@ describe("whole-package fixer restores agent edits (#3598)", () => {
 			biomeClient: {},
 			ruffClient: {},
 			testRunnerClient: {},
-			metricsClient: {},
 			resetLSPService: () => {},
 			agentBehaviorRecord: () => [],
 			formatBehaviorWarnings: () => "",

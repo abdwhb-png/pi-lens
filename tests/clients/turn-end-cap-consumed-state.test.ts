@@ -69,9 +69,13 @@ import {
 import {
 	evaluateGitGuard,
 	syncGitGuardRecord,
+	writeGitGuardRecord,
 } from "../../clients/git-guard.js";
 import { getProjectDataDir } from "../../clients/file-utils.js";
-import { consumeTurnEndFindings } from "../../clients/runtime-context.js";
+import {
+	BLOCKER_REPEAT_HEADING,
+	consumeTurnEndFindings,
+} from "../../clients/runtime-context.js";
 import { RuntimeCoordinator } from "../../clients/runtime-coordinator.js";
 import { beginScope, retireScope } from "../../clients/session-scope.js";
 import {
@@ -183,7 +187,11 @@ function nextTurn(rig: Rig, turn: number): void {
  * lands in (fits / partially cut / fully cut) is arithmetic, not luck. The cap
  * keeps 1000 chars and 20 lines; lines are long so the char axis cuts first.
  */
-function fillerBlocker(rig: Rig, chars: number): string {
+/**
+ * `sessionId`: the turn session whose write recorded it (#4921: a turn end
+ * shows only its own session's blockers); omitted, the coordinator's.
+ */
+function fillerBlocker(rig: Rig, chars: number, sessionId?: string): string {
 	const file = touch(rig, "filler.ts");
 	const prefix = "Unresolved from this turn — filler.ts:\n";
 	const header = "🔴 STOP — filler blocker";
@@ -204,6 +212,11 @@ function fillerBlocker(rig: Rig, chars: number): string {
 		rig.runtime.nextWriteIndex(),
 		["eslint"],
 		[1],
+		undefined,
+		undefined,
+		undefined,
+		undefined,
+		sessionId,
 	);
 	return file;
 }
@@ -702,9 +715,18 @@ describe("M3d: the cascade changed-since-checked line vs the cap (#4495)", () =>
 });
 
 describe("M3b: cascade coverage advisories vs the cap (#3813)", () => {
-	it.each(CELLS)(
-		"$cell: an indeterminate run is consumed only when its advisory reached the message",
-		async ({ filler, reached }) => {
+	// #5055 recurrence: each coverage bucket owns its own holdAdvisory call, so a
+	// bucket added without one drops its advisory when the cap cuts it.
+	it.each(
+		CELLS.flatMap((cell) =>
+			["graph_degraded", "unresolved_reference"].map((reason) => ({
+				...cell,
+				reason,
+			})),
+		),
+	)(
+		"$cell: a $reason run is consumed only when its advisory reached the message",
+		async ({ filler, reached, reason }) => {
 			const rig = makeRig("pi-lens-3813-m3b-");
 			try {
 				const fillerFile = fillerBlocker(rig, filler);
@@ -716,7 +738,7 @@ describe("M3b: cascade coverage advisories vs the cap (#3813)", () => {
 					diagnosticCount: 0,
 					skipReason: "indeterminate",
 					indeterminate: {
-						reason: "graph_degraded",
+						reason: reason as "graph_degraded" | "unresolved_reference",
 						detail: `graph unavailable ENDIND`,
 					},
 				});
@@ -1364,7 +1386,9 @@ describe("#4161: a turn whose session was replaced drains nothing of its success
 	it("a secondary that drained the primary's cut run and then ended before settle restores it for the primary", async () => {
 		const rig = makeRig("pi-lens-4161-secondary-s1-");
 		try {
-			fillerBlocker(rig, 1000);
+			// The secondary's own blocker fills its message, so its part cuts the
+			// run (#4921: the primary's would not reach the secondary's turn end).
+			fillerBlocker(rig, 1000, "secondary-4161");
 			rig.runtime.appendCascadeRun(cascadeRun(rig, "primary-built"));
 			const secondary = beginScope({ role: "secondary" });
 			await handleTurnEnd({
@@ -2265,6 +2289,311 @@ describe("F2: an oversized part is reached only when it leads the message (#3813
 			expect(first).not.toContain("Late runner");
 			expect(pendingRunnerFindingsSize()).toBe(1);
 			await drain(rig, fillerFile, () => pendingRunnerFindingsSize() === 0);
+		} finally {
+			rig.cleanup();
+		}
+	});
+});
+
+describe("#4943: the composer addresses its message to its own session", () => {
+	for (const lensGuard of [false, true]) {
+		it(`addresses its message to the host's delivery address when the host names one (--lens-guard ${lensGuard ? "on" : "off"})`, async () => {
+			// RECURRENCE GUARDED: #4943 R2. The MCP host's turn end addressed its
+			// message to its coordinator id, which a session start reassigns, so the
+			// address could not both outlive a server restart and set the MCP host's messages apart
+			// from a pi session's. It now stages to the address the host passes.
+			const rig = makeRig("pi-lens-4943-address-");
+			rig.lensGuard = lensGuard;
+			try {
+				const file = path.join(rig.cwd, "run-a.ts");
+				deferSettled(rig, "run-a.ts", {
+					status: "succeeded",
+					semantic: "warning",
+					diagnostics: [runnerDiagnostic(file, `late ${RUNNER_END}`)],
+				});
+				await handleTurnEnd({
+					...makeDeps(
+						rig.runtime,
+						rig.cacheManager,
+						rig.cwd,
+						undefined,
+						lensGuard,
+					),
+					deliveryAddress: "host-address",
+				});
+				expect(
+					rig.cacheManager.readCache<{ deliverTo?: string }>(
+						"turn-end-findings",
+						rig.cwd,
+						Number.POSITIVE_INFINITY,
+					)?.data?.deliverTo,
+				).toBe("host-address");
+				expect(
+					consumeTurnEndFindings(
+						rig.cacheManager,
+						rig.cwd,
+						rig.runtime,
+						SESSION,
+					),
+				).toBeUndefined();
+				expect(
+					consumeTurnEndFindings(
+						rig.cacheManager,
+						rig.cwd,
+						rig.runtime,
+						"another-process",
+						"host-address",
+					)?.messages[0]?.content,
+				).toContain(RUNNER_END);
+			} finally {
+				rig.cleanup();
+			}
+		});
+	}
+
+	it("hands this session its advisory-only message when the record leads with another session's blocker", async () => {
+		// RECURRENCE GUARDED: #4943 R1. With no blocker of its own, a turn end
+		// that carries another session's blocker writes that session as the
+		// record's owner (`sessionId`), while `content` is this session's own
+		// message. Keyed by the owner, the other session's request took this
+		// session's advisory, and this session's request got nothing.
+		const rig = makeRig("pi-lens-4943-composer-");
+		rig.lensGuard = true;
+		try {
+			const other = "session-other";
+			const theirs = path.join(rig.cwd, "theirs.ts");
+			fs.writeFileSync(theirs, "export const t = 1;\n");
+			const text = `Unresolved from this turn — theirs.ts:\n🔴 STOP — theirs is unsafe`;
+			writeGitGuardRecord(rig.cacheManager, rig.runtime, rig.cwd, {
+				content: text,
+				blockerContent: text,
+				hasBlockers: true,
+				affectedFiles: [theirs],
+				blockingFiles: [theirs],
+				sessionId: other,
+				projectSeqStart: 0,
+				projectSeqEnd: 0,
+				fileSeqByPath: {},
+				fileContentHashes: {},
+				consumed: true,
+				deliverTo: other,
+			});
+			const file = path.join(rig.cwd, "run-a.ts");
+			deferSettled(rig, "run-a.ts", {
+				status: "succeeded",
+				semantic: "warning",
+				diagnostics: [runnerDiagnostic(file, `late ${RUNNER_END}`)],
+			});
+
+			await handleTurnEnd(
+				makeDeps(rig.runtime, rig.cacheManager, rig.cwd, undefined, true),
+			);
+			const stored = rig.cacheManager.readCache<{ sessionId?: string }>(
+				"turn-end-findings",
+				rig.cwd,
+				Number.POSITIVE_INFINITY,
+			)?.data;
+			// The cell: the record leads with the other session's blocker.
+			expect(stored?.sessionId).toBe(other);
+			expect(
+				consumeTurnEndFindings(rig.cacheManager, rig.cwd, rig.runtime, other),
+			).toBeUndefined();
+			expect(
+				consumeTurnEndFindings(rig.cacheManager, rig.cwd, rig.runtime, SESSION)
+					?.messages[0]?.content,
+			).toContain(RUNNER_END);
+		} finally {
+			rig.cleanup();
+		}
+	});
+});
+
+describe("#5240: a duplicate turn end stages a repeat of its live blockers", () => {
+	/** A read-only turn: no write, the blocker still held. */
+	async function readOnlyTurn(rig: Rig, deliveryAddress?: string) {
+		rig.runtime.beginTurn();
+		await handleTurnEnd({
+			...makeDeps(
+				rig.runtime,
+				rig.cacheManager,
+				rig.cwd,
+				undefined,
+				rig.lensGuard,
+			),
+			...(deliveryAddress === undefined ? {} : { deliveryAddress }),
+		});
+	}
+	const take = (rig: Rig, atPromptTail: boolean, blockersLive = true) =>
+		consumeTurnEndFindings(
+			rig.cacheManager,
+			rig.cwd,
+			rig.runtime,
+			undefined,
+			undefined,
+			{ atPromptTail, blockersLive },
+		)?.messages[0]?.content;
+
+	for (const lensGuard of [false, true]) {
+		it(`waits for a request that opens a prompt, gives it once, and stages it again next turn (--lens-guard ${lensGuard ? "on" : "off"})`, async () => {
+			// RECURRENCE GUARDED: #5240. The repeat must not ride a mid-run request
+			// (#4921's one delivery per set inside a prompt), nor be consumed by one.
+			const rig = makeRig("pi-lens-5240-stage-");
+			rig.lensGuard = lensGuard;
+			try {
+				fillerBlocker(rig, 300);
+				expect(await endTurn(rig)).toContain("filler.ts");
+				await readOnlyTurn(rig);
+				expect(take(rig, false)).toBeUndefined();
+				const repeat = take(rig, true);
+				expect(repeat).toContain(BLOCKER_REPEAT_HEADING);
+				expect(repeat).toContain("Unresolved from this turn — filler.ts");
+				// The wording of "the workspace changed" is not borrowed.
+				expect(repeat).not.toContain("Historical finding");
+				expect(take(rig, true)).toBeUndefined();
+				await readOnlyTurn(rig);
+				expect(take(rig, true)).toContain(BLOCKER_REPEAT_HEADING);
+			} finally {
+				rig.cleanup();
+			}
+		});
+	}
+
+	it("stages no repeat for a duplicate turn that holds no blocker", async () => {
+		// RECURRENCE GUARDED: #5240. A drift-demoted blocker is an advisory, not a
+		// blocker part; its identical re-serve is suppressed as before, and a
+		// repeat for it would carry the heading and nothing under it.
+		const rig = makeRig("pi-lens-5240-advisory-");
+		try {
+			const consumer = touch(
+				rig,
+				"consumer.ts",
+				'import { other } from "./dep.js";\nexport const t = other;\n',
+			);
+			const dep = path.join(rig.cwd, "dep.ts");
+			fs.writeFileSync(dep, "export const other = 1;\n");
+			rig.runtime.recordInlineBlockers(
+				consumer,
+				"🔴 L1 a real blocker",
+				rig.runtime.nextWriteIndex(),
+				["lsp"],
+			);
+			const future = new Date(Date.now() + 60_000);
+			fs.utimesSync(dep, future, future);
+			expect(await endTurn(rig)).toContain("[stale — re-run to confirm]");
+			// The same file written again: the count-driven hold keys on the file
+			// set, so an identical turn is the duplicate.
+			rig.runtime.beginTurn();
+			touch(
+				rig,
+				"consumer.ts",
+				'import { other } from "./dep.js";\nexport const t = other;\n',
+			);
+			logLatency.mockClear();
+			await handleTurnEnd(
+				makeDeps(
+					rig.runtime,
+					rig.cacheManager,
+					rig.cwd,
+					undefined,
+					rig.lensGuard,
+				),
+			);
+			const row = logLatency.mock.calls
+				.map(([entry]) => entry)
+				.find((entry) => entry.toolName === "turn_end" && entry.result);
+			expect(row?.metadata?.deliverySuppressed).toBe("duplicate");
+			expect(take(rig, true)).toBeUndefined();
+		} finally {
+			rig.cleanup();
+		}
+	});
+
+	it("drops a staged repeat once no blocker is live, and keeps it while one is", async () => {
+		// RECURRENCE GUARDED: #5240. A mark silences the blocker with no resolved
+		// line to overwrite the staged repeat; delivered, it names a dismissed
+		// blocker at the next prompt. The latch is recomputed from the post-policy
+		// survivors at every turn end.
+		const rig = makeRig("pi-lens-5240-live-");
+		try {
+			fillerBlocker(rig, 300);
+			await endTurn(rig);
+			await readOnlyTurn(rig);
+			expect(take(rig, true, false)).toBeUndefined();
+			// Dropped, not held: the next prompt finds nothing staged.
+			expect(take(rig, true, true)).toBeUndefined();
+			await readOnlyTurn(rig);
+			expect(take(rig, true, true)).toContain(BLOCKER_REPEAT_HEADING);
+		} finally {
+			rig.cleanup();
+		}
+	});
+
+	for (const lensGuard of [false, true]) {
+		it(`leaves the MCP host's duplicate turn suppressed (--lens-guard ${lensGuard ? "on" : "off"})`, async () => {
+			// RECURRENCE GUARDED: #5240. The MCP Stop hook re-prompts on whatever is
+			// staged for it; an identical repeat each stop would loop the agent.
+			const rig = makeRig("pi-lens-5240-mcp-");
+			rig.lensGuard = lensGuard;
+			try {
+				fillerBlocker(rig, 300);
+				await handleTurnEnd({
+					...makeDeps(
+						rig.runtime,
+						rig.cacheManager,
+						rig.cwd,
+						undefined,
+						lensGuard,
+					),
+					deliveryAddress: "host-address",
+				});
+				const read = () =>
+					consumeTurnEndFindings(
+						rig.cacheManager,
+						rig.cwd,
+						rig.runtime,
+						"another-process",
+						"host-address",
+					)?.messages[0]?.content;
+				expect(read()).toContain("filler.ts");
+				await readOnlyTurn(rig, "host-address");
+				expect(read()).toBeUndefined();
+			} finally {
+				rig.cleanup();
+			}
+		});
+	}
+
+	it("reads a record a release before #5240 wrote as an ordinary message", () => {
+		// RECURRENCE GUARDED: #5240 adds `repeat` to the durable record. A record
+		// without it (every shape released before) must be taken by any request.
+		const rig = makeRig("pi-lens-5240-old-");
+		try {
+			const old = JSON.parse(
+				fs.readFileSync(
+					path.join(
+						import.meta.dirname,
+						"../fixtures/turn-end-findings/4.4.8-turn-end-findings.json",
+					),
+					"utf-8",
+				),
+			) as Record<string, unknown> & {
+				affectedFiles: string[];
+				blockingFiles: string[];
+				provenance?: { files: Array<{ path: string }> };
+			};
+			expect(old).not.toHaveProperty("repeat");
+			// The 4.4.8 writer stamps absolute paths; this project stands in for
+			// the one it ran in, holding the bytes the stamp captured.
+			const file = touch(rig, "a.ts");
+			old.affectedFiles = [file];
+			old.blockingFiles = [file];
+			for (const stamped of old.provenance?.files ?? []) stamped.path = file;
+			rig.cacheManager.writeCache("turn-end-findings", old, rig.cwd);
+			const taken = take(rig, false);
+			expect(taken).toContain("OLD-RECORD-BLOCKER");
+			// #5254 r1 F7: the old record's provenance is validated, not skipped:
+			// it matches the file, so the message is not labelled historical.
+			expect(taken).toContain("Address 🔴 blockers before continuing");
 		} finally {
 			rig.cleanup();
 		}

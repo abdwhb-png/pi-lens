@@ -62,6 +62,12 @@
  *   not create or truncate call sites. It separately uses `codeMatches` for
  *   helper calls and mock declarations, while `strings: "keep"` remains only
  *   for the intentional `"vitest"` argv evidence.
+ * - Detector 1's real-module read (#5064) reads an `importActual` call by its
+ *   name and its first argument. A bound copy of the function (`const load =
+ *   vi.importActual; load(...)`), a `require` of child_process, and a zero-
+ *   argument passthrough in a mock factory (`importOriginal()`) are not read.
+ *   No such call exists in the tree today (grep); a binding-following read is
+ *   the follow-up if one appears.
  * - Detector 1 recognizes known spawn-helper names at their test call sites —
  *   the support-module helpers plus the one production seam that wraps the
  *   child, `collectUntrackedIgnoredIds` (#4598) — and ignores calls whose
@@ -239,6 +245,12 @@ const CHILD_PROCESS_IMPORT =
 	/(?:^\s*import\b.*\bfrom\s*["'](?:node:)?child_process["']|\brequire\(\s*["'](?:node:)?child_process["']\s*\))/;
 const SYNC_TRIAD = new Set(["execFileSync", "spawnSync", "execSync"]);
 const VITEST_IN_ARGV = /\bvitest\b/i;
+// #5064: a same-file `vi.mock`/`vi.doMock` of child_process hides the import
+// and the triad above, but `vi.importActual("node:child_process")` returns the
+// REAL module behind that mock, so the spawns started through it are real.
+const CHILD_PROCESS_SPECIFIER = /^(?:node:)?child_process$/;
+const FIRST_STRING_ARGUMENT = /^(["'`])([^"'`]*)\1/;
+const IMPORT_ACTUAL_CALL = /\bimportActual\b\s*(?:<[^;]*?>)?\s*\(/g;
 // These helpers are the test-side routes to real child processes. Keep this
 // list beside the support-module census: matching the CALL in a test catches
 // a helper that hides `node:child_process` behind another module boundary.
@@ -285,17 +297,173 @@ function helperIsMocked(name: string, modules: ReadonlySet<string>): boolean {
 	);
 }
 
+// #3801 (review F2), #5100: the test-side helpers of kits that spawn real
+// children. `fake-lsp-server` exports the real launchLSP boundary.
+// `lane-check-kit` runs the lane-check CLI and real git; the
+// `head-move-resync-kit` runs real git. The names are generic: `git`, `runGit`,
+// `makeRepo` and `runLane` are also local helpers in 34 other test files that
+// import no kit, so a bare-name entry in SUPPORT_SPAWN_HELPER_CALL would count
+// those files too. A call therefore counts only in a file that names its kit
+// module, or imports one of its helpers by name from any module (a barrel that
+// re-exports it). That file also takes a hit on its import line, so an aliased
+// import (`runLane as run`) cannot pass unseen.
+const SPAWNING_KIT_HELPERS: Readonly<Record<string, readonly string[]>> = {
+	"lane-check-kit": ["runLane", "makeLane", "git", "worktreeCount"],
+	"head-move-resync-kit": ["runGit", "makeRepo", "holdWithAuxiliary"],
+	"fake-lsp-server": [
+		...codeMatches(
+			fs.readFileSync(
+				path.join(TESTS_ROOT, "support/fake-lsp-server.ts"),
+				"utf8",
+			),
+			/\bexport\s+(?:async\s+)?function\s+(\w+)\s*\(/g,
+		),
+	].map((match) => match[1]),
+};
+// A kit module named as a whole string: an import, a re-export, a dynamic
+// import or a require. Read over the stripped source, which keeps strings.
+const KIT_MODULE_SPECIFIER =
+	/(["'])(?:[^"'\n]*\/)?(lane-check-kit|head-move-resync-kit|fake-lsp-server)(?:\.[jt]s)?\1/g;
+// An import clause, read whole: a kit helper imported by name from any module
+// (a barrel that re-exports it) names its kit too. Only the six split files
+// import these names, so the clause form reads no other file.
+const IMPORT_CLAUSE = /\bimport\s+(?:type\s+)?\{([^{}]*)\}\s*from\s*["']/g;
+
+function kitIsMocked(kit: string, modules: ReadonlySet<string>): boolean {
+	return [...modules].some(
+		(module) =>
+			module === kit ||
+			module.endsWith(`/${kit}`) ||
+			module.endsWith(`/${kit}.js`) ||
+			module.endsWith(`/${kit}.ts`),
+	);
+}
+
+/**
+ * The kit hits of one file (#3801 F2). A kit is named when the file names its
+ * module or imports one of its helpers by name; each named kit is a hit on that
+ * import line, and each call of one of its helpers is a hit on its call line.
+ * A file that mocks a kit module gets nothing for that kit: its helpers are the
+ * mock's fakes.
+ */
+function kitSpawnHits(
+	source: string,
+	stripped: string,
+	mocks: ReadonlySet<string>,
+): FlakeHit[] {
+	const sourceLines = source.split("\n");
+	const hits = new Map<number, FlakeHit>();
+	const named = new Set<string>();
+	const hitImport = (kit: string, index: number): void => {
+		const lineIdx = stripped.slice(0, index).split("\n").length - 1;
+		hits.set(lineIdx, {
+			line: lineIdx + 1,
+			text: (sourceLines[lineIdx] ?? "").trim(),
+			reason: `${kit} import (its helpers spawn real children)`,
+		});
+	};
+	for (const match of stripped.matchAll(KIT_MODULE_SPECIFIER)) {
+		const kit = match[2];
+		if (kitIsMocked(kit, mocks)) continue;
+		named.add(kit);
+		hitImport(kit, match.index ?? 0);
+	}
+	for (const match of stripped.matchAll(IMPORT_CLAUSE)) {
+		const imported = match[1].split(",").map(
+			(item) =>
+				item
+					.trim()
+					.replace(/^type\s+/, "")
+					.split(/\s+as\s+/)[0],
+		);
+		for (const [kit, helpers] of Object.entries(SPAWNING_KIT_HELPERS)) {
+			if (kitIsMocked(kit, mocks)) continue;
+			if (!imported.some((name) => helpers.includes(name ?? ""))) continue;
+			named.add(kit);
+			// The module quote closes the match, on the `from` line the specifier
+			// rule also reads, so one import statement takes one hit.
+			hitImport(kit, (match.index ?? 0) + match[0].length - 1);
+		}
+	}
+	for (const [kit, names] of Object.entries(SPAWNING_KIT_HELPERS)) {
+		if (!named.has(kit)) continue;
+		const calls = new RegExp(`\\b(${names.join("|")})\\s*\\(`, "g");
+		for (const match of codeMatches(source, calls)) {
+			const lineIdx = source.slice(0, match.index ?? 0).split("\n").length - 1;
+			if (hits.has(lineIdx)) continue;
+			hits.set(lineIdx, {
+				line: lineIdx + 1,
+				text: (sourceLines[lineIdx] ?? "").trim(),
+				reason: `${match[1]}( kit spawn helper (${kit})`,
+			});
+		}
+	}
+	return [...hits.values()];
+}
+
+/**
+ * An `importActual` call (any receiver, optional type arguments) that reads
+ * the real child_process module (#5064): its first argument names
+ * child_process, or is not a plain string literal (an unknown specifier is
+ * refused, not passed). A plain literal is read as the whole specifier only when
+ * it is the whole argument (followed by `,` or `)`) and holds no `${}` and no
+ * escape; a `+` concatenation, a template interpolation or an escape is
+ * unresolved and read (#5064 r3, fail closed). A literal naming another module,
+ * or no argument, is not read. Lexical rather than AST, because tree-sitter
+ * parses the type arguments of `importActual<typeof import("…")>(…)` as an
+ * expression, so the call is no call_expression there.
+ */
+function importActualReadsChildProcess(
+	source: string,
+	match: RegExpMatchArray,
+): boolean {
+	const rest = source.slice((match.index ?? 0) + match[0].length).trimStart();
+	if (rest.startsWith(")")) return false;
+	const literal = FIRST_STRING_ARGUMENT.exec(rest);
+	if (literal === null) return true;
+	const [whole, , name = ""] = literal;
+	if (!/^\s*[,)]/.test(rest.slice(whole.length))) return true;
+	if (name.includes("${") || name.includes("\\")) return true;
+	return CHILD_PROCESS_SPECIFIER.test(name);
+}
+
+// #5100: construction is a hit by default; these files prove no sg child runs.
+export const AST_GREP_SPAWN_EXEMPTIONS: Readonly<Record<string, string>> = {
+	"clients/ast-grep-client-format-diagnostics.test.ts":
+		"Calls formatDiagnostics only; construction and formatting never execute sg.",
+	"clients/ast-grep-client-replace.test.ts":
+		"Every client replaces its SgRunner with exec or validation stubs before use.",
+	"clients/ast-grep-client-rules-health.test.ts":
+		"Constructor health checks only; the one availability scan stubs SgRunner.ensureAvailable.",
+	"clients/ast-grep-mutation-bridge.test.ts":
+		"Every client replaces its runner at the sg process boundary before tool execution.",
+	"clients/ast-grep-rule-regex-budget.test.ts":
+		"The client runner is replaced with deterministic rule-scan output; CPU regex work is real.",
+	"clients/ast-grep-severity-error.test.ts":
+		"safeSpawn and safeSpawnAsync are mocked at the process boundary.",
+	"clients/dispatch/runners/runner-helpers.test.ts":
+		"safeSpawn and safeSpawnAsync are mocked at the process boundary.",
+	"clients/runtime-tool-call.test.ts":
+		"The AstGrepClient runner is replaced before mutation-bridge tool execution.",
+};
+
 /**
  * A real child process: a `child_process` import, a call-shaped
- * `execFileSync`/`spawnSync`/`execSync`, or ANY spawn flavor whose argv
- * mentions `vitest` — a test file re-launching the suite inside itself.
+ * `execFileSync`/`spawnSync`/`execSync`, a call of a spawning kit helper in a
+ * file that names its kit (`SPAWNING_KIT_HELPERS`, #3801 F2), an
+ * AstGrepClient construction unless explicitly exempted (#5100), ANY spawn
+ * flavor whose argv mentions `vitest` — a test file re-launching the suite
+ * inside itself —
+ * or a `vi.importActual` of `child_process` behind a same-file mock (#5064):
+ * the mock hides the first three forms only, so this one is read even in a
+ * mocking file.
  *
  * `strings: "keep"` is required to see `"vitest"` inside an argv array;
  * comments are still blanked so a doc comment naming these calls cannot
  * count (see the module doc's known-limits note for the trade this makes).
  */
 export function scanRealProcessSpawn(
-	_file: string,
+	file: string,
 	source: string,
 	context?: ScanContext,
 ): FlakeHit[] {
@@ -342,6 +510,19 @@ export function scanRealProcessSpawn(
 		}
 	}
 
+	if (/child_process/.test(stripped)) {
+		for (const match of codeMatches(source, IMPORT_ACTUAL_CALL)) {
+			if (!importActualReadsChildProcess(source, match)) continue;
+			const lineIdx = source.slice(0, match.index ?? 0).split("\n").length - 1;
+			if (hits.has(lineIdx)) continue;
+			hits.set(lineIdx, {
+				line: lineIdx + 1,
+				text: (lines[lineIdx] ?? "").trim(),
+				reason: "importActual( reaches the real child_process module",
+			});
+		}
+	}
+
 	for (const match of codeMatches(source, SUPPORT_SPAWN_HELPER_CALL)) {
 		if (childProcessMocked || helperIsMocked(match[1], mocks)) continue;
 		const lineIdx = source.slice(0, match.index ?? 0).split("\n").length - 1;
@@ -351,6 +532,22 @@ export function scanRealProcessSpawn(
 				text: source.split("\n")[lineIdx]?.trim() ?? "",
 				reason: `${match[1]}( support spawn helper`,
 			});
+		}
+	}
+	// #5100: do not guess which client methods will reach sg.
+	if (!Object.hasOwn(AST_GREP_SPAWN_EXEMPTIONS, file)) {
+		for (const match of codeMatches(source, /\bnew\s+AstGrepClient\s*\(/g)) {
+			const lineIdx = source.slice(0, match.index ?? 0).split("\n").length - 1;
+			hits.set(lineIdx, {
+				line: lineIdx + 1,
+				text: lines[lineIdx]?.trim() ?? "",
+				reason: "AstGrepClient construction (potential real sg child)",
+			});
+		}
+	}
+	if (!childProcessMocked) {
+		for (const hit of kitSpawnHits(source, stripped, mocks)) {
+			if (!hits.has(hit.line - 1)) hits.set(hit.line - 1, hit);
 		}
 	}
 	return [...hits.values()].sort((a, b) => a.line - b.line);

@@ -10,9 +10,11 @@ import path from "node:path";
 import { URL } from "node:url";
 import {
 	isUnderDir,
+	kernelPathIdentityAsync,
 	normalizeEphemeralMapKey,
 	normalizeMapKey,
 	pathsEqual,
+	realpathOrResolveAsync,
 	uriToDiskPath,
 	uriToPath,
 } from "./path-utils.js";
@@ -33,6 +35,7 @@ import {
 	normalizeToLF,
 	restoreLineEndings,
 } from "../host-edit-normalize.js";
+import { toPosix, walkUpDirs } from "../path-utils.js";
 
 interface LSPPosition {
 	line: number;
@@ -1169,7 +1172,7 @@ export function __planWorkspaceEditForTest(edit: {
 
 function relativeToCwd(filePath: string, cwd: string): string {
 	const rel = path.relative(cwd, filePath) || path.basename(filePath);
-	return rel.replace(/\\/g, "/");
+	return toPosix(rel);
 }
 
 // Matches an import declaration or a re-export-from declaration — the two
@@ -1302,43 +1305,45 @@ async function assertParentIsUsable(
 	filePath: string,
 	stateFor: (filePath: string) => Promise<VirtualFile>,
 ): Promise<void> {
-	let current = path.dirname(filePath);
-	while (true) {
+	// `filePath` is the confined identity and `stateFor` keys its overlay by it,
+	// so the climb takes the names as given: a second resolution would look up
+	// a directory the overlay never recorded.
+	for (const current of walkUpDirs(path.dirname(filePath), {
+		spelling: true,
+	})) {
 		const known = await stateFor(current);
 		if (known.exists) {
 			if (!known.directory)
 				throw new Error(`resource parent is not a directory: ${current}`);
 			return;
 		}
-		const parent = path.dirname(current);
-		if (parent === current)
-			throw new Error(`resource parent does not exist: ${filePath}`);
-		current = parent;
-	}
+	} // The walk ran off the filesystem root: no ancestor exists.
+	throw new Error(`resource parent does not exist: ${filePath}`);
 }
 
-async function resolveExistingAncestor(filePath: string): Promise<string> {
-	let current = path.resolve(filePath);
-	const tail: string[] = [];
-	while (true) {
-		try {
-			const resolved = await fs.realpath(current);
-			return path.join(resolved, ...tail.reverse());
-		} catch (err) {
-			const code = (err as { code?: string }).code;
-			if (code !== "ENOENT" && code !== "ENOTDIR") throw err;
-			const parent = path.dirname(current);
-			if (parent === current) throw err;
-			tail.push(path.basename(current));
-			current = parent;
-		}
-	}
+/**
+ * The identity a workspace edit may act on: a name the kernel answered for.
+ * `realpathOrResolveAsync` falls back to the spelling when a component refuses
+ * for a reason other than absence (`EACCES`, `ELOOP`), which is the right key
+ * for a queue and the wrong answer at a trust boundary: the confiner would
+ * prove containment for a path whose real name it never learned, where this
+ * file's former `resolveExistingAncestor` rethrew every errno that is not
+ * `ENOENT`/`ENOTDIR` and refused the whole edit (#4689 r2 F-CR2).
+ */
+async function requireKernelIdentity(
+	filePath: string,
+	subject: string,
+): Promise<string> {
+	const identity = await kernelPathIdentityAsync(filePath);
+	if (identity === undefined || !identity.kernelConfirmed)
+		throw new Error(`workspace edit path identity is unresolvable: ${subject}`);
+	return identity.identity;
 }
 
 async function createWorkspaceUriConfiner(
 	cwd: string,
 ): Promise<(uri: string) => Promise<string>> {
-	const root = await resolveExistingAncestor(cwd);
+	const root = await requireKernelIdentity(cwd, cwd);
 	return async (uri: string): Promise<string> => {
 		let filePath = "";
 		try {
@@ -1357,7 +1362,7 @@ async function createWorkspaceUriConfiner(
 		}
 		if (!path.isAbsolute(filePath))
 			throw new Error(`workspace edit path escapes workspace: ${uri}`);
-		const resolved = await resolveExistingAncestor(filePath);
+		const resolved = await requireKernelIdentity(filePath, uri);
 		if (!isUnderDir(resolved, root))
 			throw new Error(`workspace edit path escapes workspace: ${uri}`);
 		return filePath;
@@ -1472,9 +1477,9 @@ async function preflightWorkspaceEdit(
 		if (!physicalPath)
 			throw new Error(`text edit target does not exist: ${filePath}`);
 		const content = await fs.readFile(physicalPath, "utf-8");
-		// `?.` skips the realpath when no caller passed expected content.
+		// `?.` skips the identity lookup when no caller passed expected content.
 		const expected = options.expectedContent?.get(
-			await fs.realpath(physicalPath),
+			await realpathOrResolveAsync(physicalPath),
 		);
 		if (expected !== undefined && expected !== content) {
 			refuseStaleWorkspaceEdit(
@@ -1562,10 +1567,7 @@ async function preflightWorkspaceEdit(
 			// treat a same-key-different-case pair as a real rename below.
 			const oldDisk = uriToDiskPath(op.oldUri);
 			const newDisk = uriToDiskPath(op.newUri);
-			if (
-				path.resolve(oldDisk).replace(/\\/g, "/") ===
-				path.resolve(newDisk).replace(/\\/g, "/")
-			) {
+			if (toPosix(path.resolve(oldDisk)) === toPosix(path.resolve(newDisk))) {
 				throw new Error("rename source and destination must differ");
 			}
 			const source = await stateFor(oldPath);

@@ -48,6 +48,7 @@ import {
 	readInstanceRegistry,
 } from "../clients/instance-registry.js";
 import { _resetProcessSingletonsForTests } from "../clients/process-singletons.js";
+import { endMockSessions } from "./support/mock-session-teardown.js";
 import { createPiMock, makeCtx, STALE_CTX_MESSAGE } from "./support/pi-mock.js";
 import { makeLspServiceDouble } from "./support/lsp-service-double.js";
 import { aliveServerHolder } from "./support/lsp-status-repaint.js";
@@ -56,14 +57,6 @@ import {
 	drainBackgroundWritesForTests,
 	setupTestEnvironment,
 } from "./clients/test-utils.js";
-
-const FLAGS = {
-	"no-opengrep": true,
-	"no-autofix": true,
-	"no-autoformat": true,
-	"no-tests": true,
-	"no-delta": true,
-} as const;
 
 /** The phase record the last-member teardown leaves when it runs for a
  *  session whose own classification is secondary (#4554). */
@@ -97,7 +90,7 @@ async function bootActivation(): Promise<{
 		resetLSPService,
 	}));
 	const { default: registerExtension } = await import("../index.js");
-	const pi = createPiMock({ "no-lsp": false, ...FLAGS });
+	const pi = createPiMock();
 	registerExtension(pi.asExtensionAPI());
 	return { pi, resetLSPService };
 }
@@ -271,6 +264,8 @@ beforeEach(async () => {
 
 afterEach(async () => {
 	try {
+		// #5146: end the case's sessions first, then settle what they wrote.
+		await endMockSessions();
 		await drainBackgroundWritesForTests();
 		await settleRegistryWrites();
 		deregisterInstance();
@@ -901,5 +896,87 @@ describe("#4554 one activation, four live sessions", () => {
 		await shutdown(pi, sibling);
 		await shutdown(pi, successor);
 		expect(teardownResets(resetLSPService)).toHaveLength(1);
+	}, 45_000);
+});
+
+/**
+ * #4965 verify V1: the session-id lookup (`clients/session-scope.ts`) is a
+ * process-wide index, so a key a session never gives back holds that
+ * session's scope and its cells for the life of the process. Before this, an
+ * activation released a key only when its LAST live member left, so a
+ * sibling that left first, or a primary that left before its sibling, stayed
+ * reachable by id after its session ended. Each case drives the production
+ * handlers and reads the index the stores read.
+ *
+ * While a sibling is live the departed member's key goes and its scope
+ * stays: the coordinator's scope runs every member's coordinator work, and
+ * `turn_start` hands each member's turn the activation's last-started scope
+ * (index.ts `turnStartScope`), whose late dead-code scan a retired scope
+ * drops as `session-ended` (clients/runtime-turn.ts). So each case also
+ * pins that the departed member's scope is still live.
+ */
+describe("#4965 a session's id lookup ends with its session", () => {
+	it("unbinds a sibling that leaves before the primary at its own leave", async () => {
+		const { pi } = await bootActivation();
+		const primary = makeCtx({ cwd: project, sessionId: "m-stays" });
+		const sibling = makeCtx({ cwd: project, sessionId: "s-leaves-first" });
+		await start(pi, primary);
+		await start(pi, sibling);
+		const { scopeOfSession } = await import("../clients/session-scope.js");
+		const leaverScope = scopeOfSession("s-leaves-first");
+		expect(leaverScope?.isLive()).toBe(true);
+
+		await shutdown(pi, sibling);
+
+		expect(scopeOfSession("s-leaves-first")).toBeUndefined();
+		expect(leaverScope?.isLive()).toBe(true);
+		expect(scopeOfSession("m-stays")?.isLive()).toBe(true);
+		await shutdown(pi, primary);
+		expect(scopeOfSession("m-stays")).toBeUndefined();
+	}, 45_000);
+
+	it("unbinds a primary that leaves before its sibling at its own leave", async () => {
+		const { pi } = await bootActivation();
+		const primary = makeCtx({ cwd: project, sessionId: "m-leaves-first" });
+		const sibling = makeCtx({ cwd: project, sessionId: "s-stays" });
+		await start(pi, primary);
+		await start(pi, sibling);
+		const { scopeOfSession } = await import("../clients/session-scope.js");
+		const coordinatorScope = scopeOfSession("m-leaves-first");
+
+		await shutdown(pi, primary);
+
+		expect(scopeOfSession("m-leaves-first")).toBeUndefined();
+		expect(coordinatorScope?.isLive()).toBe(true);
+		expect(scopeOfSession("s-stays")?.isLive()).toBe(true);
+		await shutdown(pi, sibling);
+		expect(scopeOfSession("s-stays")).toBeUndefined();
+	}, 45_000);
+
+	it("unbinds a member pi disposed beside a live sibling at the next start", async () => {
+		const { pi } = await bootActivation();
+		const primary = makeCtx({ cwd: project, sessionId: "m-live" });
+		const disposed = makeCtx({ cwd: project, sessionId: "s-disposed" });
+		await start(pi, primary);
+		await start(pi, disposed);
+		const { scopeOfSession } = await import("../clients/session-scope.js");
+		const disposedScope = scopeOfSession("s-disposed");
+		Object.defineProperty(disposed, "isIdle", {
+			get() {
+				throw new Error(STALE_CTX_MESSAGE);
+			},
+		});
+
+		const next = makeCtx({ cwd: project, sessionId: "s-next" });
+		await start(pi, next);
+
+		expect(scopeOfSession("s-disposed")).toBeUndefined();
+		expect({
+			disposed: disposedScope?.isLive(),
+			primary: scopeOfSession("m-live")?.isLive(),
+			next: scopeOfSession("s-next")?.isLive(),
+		}).toEqual({ disposed: true, primary: true, next: true });
+		await shutdown(pi, next);
+		await shutdown(pi, primary);
 	}, 45_000);
 });

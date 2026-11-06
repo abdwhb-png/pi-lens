@@ -78,7 +78,6 @@ function toolResultDeps(args: {
 		cacheManager: args.cacheManager,
 		biomeClient: {},
 		ruffClient: {},
-		metricsClient: {},
 		resetLSPService: () => {},
 		agentBehaviorRecord: () => [],
 		formatBehaviorWarnings: () => "",
@@ -728,7 +727,7 @@ const DECLARED_EXCLUSIONS: Array<{ file: string; reason: string }> = [
 	{
 		file: path.join(CLIENTS_DIR, "format-events-publish.ts"),
 		reason:
-			'published v1 bus payload: `tool: "write" | "edit"` is the DECLARED type of pilens:format:queued, pinned by tests/config/files-touched-bus-conformance.test.ts. Widening it is #2421.',
+			'published v1 bus payload: `tool: "write" | "edit"` is the DECLARED type of pilens:format:queued. Widening it is #2421.',
 	},
 ];
 
@@ -1084,6 +1083,30 @@ describe("#3650 adapter-declared mutation path", () => {
 		expect(
 			readToolResultPathField({ toolName: "read", input: { path: ["/a.ts"] } }),
 		).toBe(undefined);
+	});
+
+	/**
+	 * RECURRENCE GUARDED (#5047 r1 F4): `file` is a declared alias of `path` on
+	 * `lsp_navigation` (#5041), but the tool_result reader and the arming
+	 * predicate read `path` only, so a rename sent with `file` resolved to no
+	 * path at either seam. `path` still wins when both are sent.
+	 */
+	it("reads the `file` alias of `path` at both host readers", async () => {
+		const { readMutationPathField, readToolResultPathField } =
+			await import("../../clients/mutating-tool.js");
+		const event = (input: Record<string, unknown>) => ({
+			toolName: "lsp_navigation",
+			input,
+		});
+		expect(readToolResultPathField(event({ file: "src/a.ts" }))).toBe(
+			"src/a.ts",
+		);
+		expect(readMutationPathField(event({ file: "src/a.ts" }))).toBe("src/a.ts");
+		expect(
+			readToolResultPathField(event({ path: "src/a.ts", file: "src/b.ts" })),
+		).toBe("src/a.ts");
+		expect(readToolResultPathField(event({ file: "" }))).toBe(undefined);
+		expect(readToolResultPathField(event({ file: 42 }))).toBe(undefined);
 	});
 
 	/**

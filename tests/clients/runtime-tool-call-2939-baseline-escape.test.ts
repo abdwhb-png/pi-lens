@@ -69,7 +69,6 @@ const LOADED_CLIENTS = {
 	},
 	biomeClient: {},
 	ruffClient: {},
-	metricsClient: {},
 };
 
 vi.mock("../../clients/bootstrap.js", async () => {
@@ -127,7 +126,6 @@ function deps(signal: AbortSignal) {
 		cacheManager: new CacheManager(false),
 		ensureLSPConfigInitialized: async () => {},
 		updateLspStatus: () => {},
-		resetLSPService: () => {},
 	} as unknown as Parameters<typeof handleToolCall>[0];
 }
 

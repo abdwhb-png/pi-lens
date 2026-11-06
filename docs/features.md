@@ -2,7 +2,7 @@
 
 ### LSP Support
 
-pi-lens includes **49 language server definitions** (including four cross-cutting *auxiliary* scanners that attach alongside the file's language server — Opengrep, ast-grep, zizmor, and typos — see below). LSP is **enabled by default**; use `--no-lsp` to disable it for a session. Servers are auto-discovered from PATH, project `node_modules`, and managed installs. When a server with a managed installer is not installed, pi-lens offers an interactive install prompt; toolchain-bundled servers, such as Lean's `lake`, are PATH-only, and pi-lens never installs or manages them.
+pi-lens includes **51 language server definitions** (including four cross-cutting *auxiliary* scanners that attach alongside the file's language server — Opengrep, ast-grep, zizmor, and typos — and one opt-in, JS/TS-only auxiliary, fallow, off unless `fallow.enabled` is set; see below). LSP is **enabled by default**; use `--no-lsp` to disable it for a session. Servers are auto-discovered from PATH, project `node_modules`, and managed installs. When a server with a managed installer is not installed, pi-lens offers an interactive install prompt; toolchain-bundled servers, such as Lean's `lake`, are PATH-only, and pi-lens never installs or manages them.
 
 **LSP Idle Management:** LSP servers shut down after 240 seconds of inactivity (no files modified) to free resources. The timer resets when you resume editing, preventing cold-start penalties during active development.
 
@@ -19,8 +19,20 @@ pi-lens includes **49 language server definitions** (including four cross-cuttin
 - **`capabilities`** — shows which operations are supported by the active LSP server(s) for a file, read directly from the cached `initialize` response (no round-trip).
 - **Symbol column resolution** — passing `symbol: "myFunc"` instead of an exact `character` position resolves the correct column automatically. Use `symbol: "foo#2"` for the second occurrence of `foo` on the line.
 
-LSP servers for: TypeScript, Deno, Python (pyright/basedpyright + jedi), Go, Rust, Ruby (ruby-lsp + solargraph), PHP, PowerShell, C# (omnisharp), F#, Java (JDT LS, with Lombok javaagent support when a Lombok jar is available), Kotlin, Lean, Swift, Dart, Lua, C/C++, Zig, Haskell, Elixir, Gleam, Typst (tinymist), Markdown (marksman), OCaml, Clojure, CUE (syntax and parse diagnostics; evaluation errors via the cue-vet auxiliary runner), Terraform, Nix, Bash, Shuck (zsh-aware shell language server), Fish, CMake, Docker, YAML, JSON, HTML, TOML, Prisma, Vue, Svelte, CSS.
+`lsp_navigation` answers with Neovim-style text by default: a `path:line:col` location list, `hover` markdown, an indented `start-end kind name` symbol tree, and `path:line:col: severity: message` diagnostic rows. Pass `view: "json"` for the structured envelope the pre-text default returned (refs #1449).
 
+LSP servers for: TypeScript, Deno, Python (pyright/basedpyright + jedi), Go, Rust, Ruby (ruby-lsp + solargraph), PHP, PowerShell, C# (omnisharp), F#, Java (JDT LS, with Lombok javaagent support when a Lombok jar is available), Kotlin, Groovy (groovy-language-server, from PATH or `GROOVY_LANGUAGE_SERVER_JAR`), Lean, Swift, Dart, Lua, C/C++, Zig, Haskell, Elixir, Gleam, Typst (tinymist), Markdown (marksman), OCaml, Clojure, CUE (syntax and parse diagnostics; evaluation errors via the cue-vet auxiliary runner), Terraform, Nix, Bash, Shuck (zsh-aware shell language server), Fish, CMake, Docker, YAML, JSON, HTML, TOML, Prisma, Vue, Svelte, CSS.
+
+
+### TypeScript and JavaScript server
+
+pi-lens picks the launch for JS/TS files in this order. The first two steps use only the project's own `node_modules`:
+
+1. **Effect language service** — when the nearest `node_modules/typescript` is version 7 or newer and the same `node_modules` holds `@effect/tsgo`, pi-lens runs the project's `effect-tsgo tsc --lsp --stdio`. Installing the package is the opt-in; there is no pi-lens setting. A malformed `@effect/tsgo` (no readable version, no `bin`) or a failure to start the process falls back to the next step; a server that starts and then fails to initialize does not fall back, and pi-lens never installs `@effect/tsgo`.
+2. **Native TypeScript 7** — the project's `node_modules/.bin/tsc --lsp --stdio`.
+3. **Classic** — `typescript-language-server` with a `tsserver.js`, when the nearest TypeScript is version 6 or older or no step above applies. This step can also use a server and TypeScript found on `PATH` or installed by pi-lens.
+
+The nearest installed `typescript` decides: an ancestor's TypeScript 7 never replaces a nearer, older or malformed install. The project's own compiler and launcher run only when pi has marked the project trusted (see [Configuring pi-lens](configuration.md)); otherwise the launch falls through to the next step.
 
 ### Python: interpreter and syntax level
 
@@ -139,6 +151,8 @@ pi-lens enforces a **read-before-edit** policy on all file writes and edits. Bef
 
 Coverage is tracked across multiple reads: two reads of lines 1–100 and 101–200 together satisfy a full-file write. Symbol-expanded reads (small reads widened to the enclosing symbol via tree-sitter, labelled with a leading note) count toward coverage at the symbol level. Markdown files generate a warning instead of blocking (edits outside the section-expanded read range are warned, not silently passed). Plain-text (`.txt`) and log (`.log`) files remain fully exempt.
 
+A provider extension's display-only replay of work that already ran is not guarded. pi-cursor-sdk replays Cursor's native edits as tool calls whose ids start with `cursor-replay-`; the files were written before the replay arrived, so an "Edit without read" refusal would protect nothing and only turn the replayed card into an error. Such a call is never checked by the read guard and never taught to pi-lens as a mutating tool name. A real `edit` or `write` call and Cursor's real bridged executions (`cursor-pi-bridge-*`) are checked as usual.
+
 Override for a single edit: `/lens-allow-edit <path>`
 
 Configure behavior with `--no-read-guard` to disable it entirely, or use the
@@ -154,7 +168,7 @@ instead of a flat blob of source. See
 [`module-report-read-symbol.md`](module-report-read-symbol.md)
 for the full design and token-efficiency numbers.
 
-**`module_report(filePath, maxRefsPerSymbol?, focus?, view?, blastRadius?, blastRadiusDepth?)`** —
+**`module_report(path, maxRefsPerSymbol?, focus?, view?, blastRadius?, blastRadiusDepth?)`** —
 returns a structured outline: every symbol's name/kind/startLine/endLine/signature
 (plus a first-line `doc` summary when a doc comment is attached — #512),
 exported vs internal split (with class/interface members nested under their
@@ -168,13 +182,16 @@ path since they point at a different file. Pass `blastRadius: true` to also get
 the cross-file **blast radius** — transitive dependents aggregated to ranked
 file `read` args ("if you change this, verify these files"); read-only over
 the cached graph, omitted when cold (this replaced the standalone
-`pilens_impact` tool). `view: "compact"` returns a line-oriented text
-rendering (one line per symbol/callback, roughly a quarter of the JSON cost)
-instead of JSON — same data, opt-in. Tree-sitter extract + cached review-graph
+`pilens_impact` tool). `view` selects an output preset, projection × format
+(`"summary-text"` default = metrics off, text; `"summary-json"`; `"full-text"`;
+`"full-json"` = every field, JSON) — the text cell is lossless against the
+JSON payload; the default leaves out `usedBy`, `fanout` and `complexity`, at
+roughly half the byte
+size. Tree-sitter extract + cached review-graph
 lookup; never builds the graph, never calls LSP on this path.
 `semantic.source` reports what backed the data (`review-graph` | `none`).
 
-**`read_symbol(filePath, symbol)`** — returns the verbatim body of one
+**`read_symbol(path, symbol)`** — returns the verbatim body of one
 named symbol plus a one-line header (`<kind> <name>  <basename>:<startLine>-<endLine>`).
 Records the read against the read-guard so a follow-up edit anywhere in
 that symbol's range passes the read-before-edit check (an outline from

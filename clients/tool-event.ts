@@ -44,14 +44,14 @@
  *    `isError`/`usage` (`dist/core/agent-session.js:243-256`, source
  *    `src/core/agent-session.ts:502-516`), so the branch reading them was dead
  *    code. The standing reason not to narrow is point 3: pi-lens also
- *    synthesizes its OWN `tool_result` payloads (bash-derived writes,
- *    partial-apply) that no host discriminator would admit.
+ *    synthesizes its OWN `tool_result` payloads (bash-derived writes) that
+ *    no host discriminator would admit. A partial apply no longer does
+ *    (#5120): the host edit writes the rewritten subset.
  *
  * What IS consolidated is the part that costs nothing: the host's `details`
  * SHAPES are type-only exports, so `EditToolDetails` & co. are imported as
  * types rather than re-declared ad hoc. Genuinely pi-lens-specific `details`
- * payloads (`searchReads`, `piLensPartialApply`) stay hand-declared — no host
- * type describes them.
+ * payloads (`searchReads`) stay hand-declared — no host type describes them.
  */
 import { sanitizeCorrelationId } from "./read-guard-logger.js";
 
@@ -115,7 +115,8 @@ export function resolveToolCallCorrelationId(
 /**
  * Resolve the identity that owns read evidence. Nested codemode calls are
  * visible in the live event stream with their own ids, but their tool result
- * is carried by the parent codemode result on a conversation branch. Using
+ * is carried by the parent tool result (codemode is one example) on a
+ * conversation branch. Using
  * the parent when present keeps the same branch-retention rule for top-level
  * and nested reads (#3831).
  */

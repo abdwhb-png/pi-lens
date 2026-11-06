@@ -37,6 +37,8 @@ type Fixture = (typeof LSP_FIXTURES)[number] & {
 	lspGateExempt?: string;
 	lensFull?: boolean;
 	createdModuleWitness?: unknown;
+	bornAfterStartConfig?: unknown;
+	venvInstall?: unknown;
 	setup?: string | string[];
 	serverId?: string;
 	expectServerId?: string;
@@ -224,6 +226,29 @@ describe("LSP clean-gate population (#3217)", () => {
 	it("pins the created-module witness to the gated python fixture", () => {
 		const witnessed = fixtures.filter(
 			(fixture) => fixture.createdModuleWitness !== undefined,
+		);
+		expect(witnessed.map((fixture) => fixture.lang)).toEqual(["python"]);
+		expect(witnessed[0].lspGate).toBe(true);
+	});
+
+	// #4521/#4532: the config-file and root-marker phases run inside the same
+	// gate on the same fixture. Dropping the flag would retire the nightly's only
+	// end-to-end check that a config created after pyright answered is read.
+	it("pins the born-after-start config witness to the gated python fixture", () => {
+		const witnessed = fixtures.filter(
+			(fixture) => fixture.bornAfterStartConfig !== undefined,
+		);
+		expect(witnessed.map((fixture) => fixture.lang)).toEqual(["python"]);
+		expect(witnessed[0].lspGate).toBe(true);
+	});
+
+	// #4532 gap 3: the lockfile-less venv install phase runs inside the same gate
+	// on the same fixture. Dropping the flag would retire the nightly's only
+	// end-to-end check that a `pip install` into a project `.venv` clears the
+	// importer's cached missing import.
+	it("pins the venv install witness to the gated python fixture", () => {
+		const witnessed = fixtures.filter(
+			(fixture) => fixture.venvInstall !== undefined,
 		);
 		expect(witnessed.map((fixture) => fixture.lang)).toEqual(["python"]);
 		expect(witnessed[0].lspGate).toBe(true);

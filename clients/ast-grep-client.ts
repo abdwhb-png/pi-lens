@@ -10,7 +10,6 @@
 
 import { createSubsystemLogger } from "./extension-log.js";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import {
 	AstGrepRuleManager,
@@ -30,6 +29,7 @@ import { getMutationBridge } from "./mutation-bridge.js";
 import type { LineageHandle } from "./session-scope.js";
 import { normalizeFilePath } from "./path-utils.js";
 import { resolvePackagePath } from "./package-root.js";
+import { scannerReportParentDir } from "./scanner-temp-root.js";
 import { getAstGrepRuleFingerprint } from "./sgconfig.js";
 import { truncatedByOutputCap } from "./spawn-output-cap.js";
 import {
@@ -83,16 +83,19 @@ function reportAstGrepRulesHealth(bundledRuleDir: string): void {
  * range that file's matches covered, because the bridge's contract is
  * per-file — the same shape a multi-hunk edit produces.
  *
+ * Returns the files the bridge ACCEPTED (#5239): the tool reports them in its
+ * result details so the `tool_result` handler dispatches exactly those, never a
+ * path the bridge refused (out of scope, ignored, or no bridge mounted).
+ *
  * Exported for tests: they drive it against a registered bridge instead of
  * spawning ast-grep.
  */
 function recordAstGrepApply(
 	matches: AstGrepMatch[],
-	lineage: LineageHandle | undefined,
-	toolCallId: string | undefined,
-): void {
+	{ lineage, toolCallId, sessionId }: AstGrepApplyProvenance = {},
+): string[] {
 	const bridge = getMutationBridge();
-	if (!bridge || matches.length === 0) return;
+	if (!bridge || matches.length === 0) return [];
 	const rangesByFile = new Map<string, Array<[number, number]>>();
 	for (const match of matches) {
 		const start = (match.range?.start?.line ?? 0) + 1;
@@ -101,12 +104,14 @@ function recordAstGrepApply(
 		if (existing) existing.push([start, end]);
 		else rangesByFile.set(match.file, [[start, end]]);
 	}
+	const accepted: string[] = [];
 	for (const [filePath, editRanges] of rangesByFile) {
-		bridge.recordMutation({
-			// ast-grep echoes the spelling passed to its CLI. Resolve that
-			// tool-relative spelling at the producer boundary, then use the
-			// existing canonical path seam before recordability is checked (#4140).
-			filePath: normalizeFilePath(path.resolve(process.cwd(), filePath)),
+		// ast-grep echoes the spelling passed to its CLI. Resolve that
+		// tool-relative spelling at the producer boundary, then use the
+		// existing canonical path seam before recordability is checked (#4140).
+		const resolved = normalizeFilePath(path.resolve(process.cwd(), filePath));
+		const recorded = bridge.recordMutation({
+			filePath: resolved,
 			kind: "edit",
 			editRanges,
 			consumer: "ast_grep_replace",
@@ -119,8 +124,21 @@ function recordAstGrepApply(
 			// call's own id lets the guard advance exactly the paths that call
 			// checked, and end the authorship of every other file it rewrote.
 			...(toolCallId !== undefined && { toolCallId }),
+			// #4943: the calling session owns the deferred pass of what it rewrote.
+			...(sessionId !== undefined && { sessionId }),
 		});
+		if (recorded) accepted.push(resolved);
 	}
+	return accepted;
+}
+
+/** Who an apply ran for: the call's session scope, its id, and its session. */
+interface AstGrepApplyProvenance {
+	lineage?: LineageHandle | undefined;
+	/** #4187 R4-1: the call whose `tool_call` licensed the paths it named. */
+	toolCallId?: string | undefined;
+	/** #4943: pi's stable id of the session that called the tool. */
+	sessionId?: string | undefined;
 }
 
 // --- Client ---
@@ -346,19 +364,22 @@ export class AstGrepClient {
 		ruleYaml: string,
 		paths: string[],
 		apply: boolean,
-		options?: {
-			lineage?: LineageHandle | undefined;
-			/** #4187 R4-1: the call whose `tool_call` licensed the paths it named. */
-			toolCallId?: string | undefined;
-		},
+		options?: AstGrepApplyProvenance,
 	): Promise<{
 		matches: AstGrepMatch[];
 		totalMatches: number;
 		applied: boolean;
 		stalePreview?: boolean;
 		error?: string;
+		/** #5239: the files an apply rewrote and the bridge accepted. */
+		appliedFiles?: string[];
 	}> {
 		const allMatches: AstGrepMatch[] = [];
+		// #5244 r4: each path is written as its own scan finishes, so a later
+		// path that is stale or fails still leaves the earlier ones on disk. Every
+		// exit records what was rewritten so far, never only the loop's last one.
+		const recordWritten = (): string[] =>
+			apply ? recordAstGrepApply(allMatches, options) : [];
 		for (const scanPath of paths) {
 			if (apply) {
 				// Stale-preview check: dry-run first. Preserve CLI failures instead of
@@ -370,6 +391,7 @@ export class AstGrepClient {
 						totalMatches: allMatches.length,
 						applied: false,
 						error: preCheck.error ?? "ast-grep preview failed",
+						appliedFiles: recordWritten(),
 					};
 				}
 				if (preCheck.matches.length === 0) {
@@ -378,6 +400,7 @@ export class AstGrepClient {
 						totalMatches: 0,
 						applied: false,
 						stalePreview: true,
+						appliedFiles: recordWritten(),
 					};
 				}
 			}
@@ -393,6 +416,7 @@ export class AstGrepClient {
 					totalMatches: allMatches.length,
 					applied: false,
 					error: result.error,
+					appliedFiles: recordWritten(),
 				};
 			}
 			allMatches.push(...result.matches);
@@ -400,12 +424,11 @@ export class AstGrepClient {
 		// #4140 (F9): the structural apply rewrites files with `--update-all`
 		// exactly as the pattern apply does, and no tool_result describes it, so
 		// it reaches the same bridge with the matches captured before the write.
-		if (apply)
-			recordAstGrepApply(allMatches, options?.lineage, options?.toolCallId);
 		return {
 			matches: allMatches,
 			totalMatches: allMatches.length,
 			applied: apply,
+			appliedFiles: recordWritten(),
 		};
 	}
 
@@ -502,7 +525,9 @@ export class AstGrepClient {
 		lang: string,
 		options: { includeAnonymous?: boolean } = {},
 	): Promise<{ output?: string; error?: string }> {
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-ast-dump-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(scannerReportParentDir(), "pi-lens-ast-dump-"),
+		);
 		const tmpFile = path.join(
 			tmpDir,
 			`snippet.${lang.replace(/[^a-z0-9_-]/gi, "") || "txt"}`,
@@ -551,7 +576,7 @@ export class AstGrepClient {
 
 		const snippet = validationSnippetFor(lang);
 		const tmpDir = fs.mkdtempSync(
-			path.join(os.tmpdir(), "pi-lens-sg-validate-"),
+			path.join(scannerReportParentDir(), "pi-lens-sg-validate-"),
 		);
 		const tmpFile = path.join(tmpDir, `snippet.${snippet.ext}`);
 		try {
@@ -612,7 +637,9 @@ export class AstGrepClient {
 
 		const language = extractRuleLanguage(ruleYaml) ?? "typescript";
 		const snippet = validationSnippetFor(language);
-		const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-sg-rule-"));
+		const tmpDir = fs.mkdtempSync(
+			path.join(scannerReportParentDir(), "pi-lens-sg-rule-"),
+		);
 		try {
 			fs.writeFileSync(
 				path.join(tmpDir, `snippet.${snippet.ext}`),
@@ -737,12 +764,7 @@ export class AstGrepClient {
 		lang: string,
 		paths: string[],
 		apply = false,
-		options?: {
-			strictness?: string;
-			lineage?: LineageHandle;
-			/** #4187 R4-1: the call whose `tool_call` licensed the paths it named. */
-			toolCallId?: string;
-		},
+		options?: AstGrepApplyProvenance & { strictness?: string },
 	): Promise<{
 		matches: AstGrepMatch[];
 		totalMatches: number;
@@ -750,6 +772,8 @@ export class AstGrepClient {
 		applied: boolean;
 		stalePreview?: boolean;
 		error?: string;
+		/** #5239: the files an apply rewrote and the bridge accepted. */
+		appliedFiles?: string[];
 	}> {
 		const baseArgs = ["run", "-p", pattern, "-r", rewrite, "--lang", lang];
 		if (options?.strictness) {
@@ -824,13 +848,14 @@ export class AstGrepClient {
 		// the same seam an extension would use. Fire-and-forget: the bridge never
 		// throws, and a missing bridge (pi-lens not activated, guard disabled) is
 		// a silent no-op.
-		recordAstGrepApply(preCheck.matches, options?.lineage, options?.toolCallId);
+		const appliedFiles = recordAstGrepApply(preCheck.matches, options);
 		return {
 			matches: preCheck.matches,
 			totalMatches: preCheck.totalMatches,
 			truncated: preCheck.truncated,
 			applied: true,
 			error: undefined,
+			appliedFiles,
 		};
 	}
 
