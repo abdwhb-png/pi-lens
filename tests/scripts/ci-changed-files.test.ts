@@ -269,9 +269,10 @@ describe("classifyChangedFiles: the Install test lane (#5112)", () => {
 			const command = pkg.scripts[name];
 			if (command === undefined || seen.has(name)) return [];
 			seen.add(name);
-			const chained = [...command.matchAll(/npm run ([\w:-]+)/g)].flatMap(
-				(match) => lifecycle(match[1] ?? "", seen),
-			);
+			// The fork pins npm identity under Bun with --loglevel=notice.
+			const chained = [
+				...command.matchAll(/npm(?: --loglevel=notice)? run ([\w:-]+)/g),
+			].flatMap((match) => lifecycle(match[1] ?? "", seen));
 			return [command, ...chained];
 		};
 		const imports = (file: string): string[] => {
